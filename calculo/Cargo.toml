@@ -1,0 +1,23 @@
+[package]
+name = "calculo"
+version = "0.3.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Numeric types and operations for high-performance scientific computing."
+
+[features]
+default = []
+
+rug = ["dep:rug", "rug/rational", "rug/float", "rug/std"]
+dashu = ["dep:dashu-base", "dep:dashu-float", "dep:dashu-int", "dep:dashu-ratio"]
+simd = ["dep:pulp"]
+
+[dependencies]
+ahash = "0.8"
+derive_more = { version = "2", features = ["add", "mul", "not", "display"] }
+pulp = { version = "0.22", optional = true }
+rug = { version = "1", optional = true, default-features = false }
+dashu-ratio = { version = "0.4", optional = true }
+dashu-float = { version = "0.4", optional = true }
+dashu-base = { version = "0.4", optional = true }
+dashu-int = { version = "0.4", optional = true }

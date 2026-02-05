@@ -1,0 +1,11 @@
+[package]
+name = "clikeys"
+version = "0.3.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Namespace-aware KEY=VALUE overrides for nested configuration structs."
+readme = "README.md"
+
+[dependencies]
+thiserror = "2"
+itertools = "0.14"

@@ -1,0 +1,15 @@
+[package]
+name = "clikeys-derive"
+version = "0.3.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Derive macro for clikeys::CliKeys."
+readme = "README.md"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

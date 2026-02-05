@@ -1,0 +1,11 @@
+[package]
+name = "syntheon"
+version = "0.3.0"
+edition = "2024"
+license = "GPL-2.0-or-later"
+description = "Build script utilities shared across sys crates."
+publish = false
+
+[dependencies]
+flate2 = "1"
+tar = "0.4"

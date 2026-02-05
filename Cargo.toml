@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = [
+    "calculo",
+    "clikeys",
+    "clikeys-derive",
+    "syntheon",
+]
+
+[profile.release-debug]
+inherits = "release"
+debug = true
+
+[profile.release-lto]
+inherits = "release"
+codegen-units = 1
+lto = "fat"
+debug = false
+panic = "abort"
+
+[profile.release-lto-debug]
+inherits = "release"
+codegen-units = 1
+lto = "fat"
+debug = true
