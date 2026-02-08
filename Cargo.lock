@@ -660,3 +660,27 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[patch.unused]]
+name = "cddlib-rs"
+version = "0.3.0"
+
+[[patch.unused]]
+name = "graphum"
+version = "0.3.0"
+
+[[patch.unused]]
+name = "howzat"
+version = "0.3.0"
+
+[[patch.unused]]
+name = "howzat-kit"
+version = "0.3.0"
+
+[[patch.unused]]
+name = "hullabaloo"
+version = "0.3.0"
+
+[[patch.unused]]
+name = "lrslib-rs"
+version = "0.3.0"
