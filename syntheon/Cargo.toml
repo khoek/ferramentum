@@ -2,8 +2,10 @@
 name = "syntheon"
 version = "0.3.0"
 edition = "2024"
-license = "GPL-2.0-or-later"
+license = "AGPL-3.0-only"
 description = "Build script utilities shared across sys crates."
+readme = "README.md"
+repository = "https://github.com/khoek/ferramentum"
 
 [dependencies]
 flate2 = "1"

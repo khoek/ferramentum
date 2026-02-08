@@ -47,7 +47,7 @@ checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
 
 [[package]]
 name = "calculo"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ahash",
  "dashu-base",
@@ -67,7 +67,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "clikeys"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "itertools",
  "thiserror",
@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "clikeys-derive"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -200,9 +200,9 @@ dependencies = [
 
 [[package]]
 name = "flate2"
-version = "1.1.8"
+version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b375d6465b98090a5f25b1c7703f3859783755aa9a80433b36e0379a3ec2f369"
+checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
@@ -643,18 +643,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.37"
+version = "0.8.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7456cf00f0685ad319c5b1693f291a650eaf345e941d082fc4e03df8a03996ac"
+checksum = "db6d35d663eadb6c932438e763b262fe1a70987f9ae936e60158176d710cae4a"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.37"
+version = "0.8.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1328722bbf2115db7e19d69ebcc15e795719e2d66b60827c6a69a117365e37a0"
+checksum = "4122cd3169e94605190e77839c9a40d40ed048d305bfdc146e7df40ab0f3e517"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -663,24 +663,24 @@ dependencies = [
 
 [[patch.unused]]
 name = "cddlib-rs"
-version = "0.3.0"
+version = "0.3.1"
 
 [[patch.unused]]
 name = "graphum"
-version = "0.3.0"
+version = "0.3.1"
 
 [[patch.unused]]
 name = "howzat"
-version = "0.3.0"
+version = "0.3.1"
 
 [[patch.unused]]
 name = "howzat-kit"
-version = "0.3.0"
+version = "0.3.1"
 
 [[patch.unused]]
 name = "hullabaloo"
-version = "0.3.0"
+version = "0.3.1"
 
 [[patch.unused]]
 name = "lrslib-rs"
-version = "0.3.0"
+version = "0.3.1"
