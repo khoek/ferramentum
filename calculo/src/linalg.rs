@@ -200,12 +200,41 @@ impl LinAlgOps<crate::num::RugRat> for RugRatOps {
 
     #[inline(always)]
     fn dot(lhs: &[crate::num::RugRat], rhs: &[crate::num::RugRat]) -> crate::num::RugRat {
-        use rug::Complete;
-
         debug_assert_eq!(lhs.len(), rhs.len(), "dot product dimension mismatch");
-        let dot =
-            rug::Rational::dot(lhs.iter().map(|x| &x.0).zip(rhs.iter().map(|x| &x.0))).complete();
-        crate::num::RugRat(dot)
+        use rug::Assign;
+
+        let one = rug::Integer::from(1);
+        let mut acc_i = rug::Integer::new();
+        acc_i.assign(0);
+        let mut mul_i = rug::Integer::new();
+        let mut all_integral = true;
+        for (a, b) in lhs.iter().zip(rhs.iter()) {
+            if a.0.is_zero() || b.0.is_zero() {
+                continue;
+            }
+            if a.0.denom() != &one || b.0.denom() != &one {
+                all_integral = false;
+                break;
+            }
+            mul_i.assign(a.0.numer());
+            mul_i *= b.0.numer();
+            acc_i += &mul_i;
+        }
+        if all_integral {
+            return crate::num::RugRat(rug::Rational::from(acc_i));
+        }
+
+        let mut acc = rug::Rational::new();
+        acc.assign(0);
+        let mut mul = rug::Rational::new();
+        for (a, b) in lhs.iter().zip(rhs.iter()) {
+            if a.0.is_zero() || b.0.is_zero() {
+                continue;
+            }
+            mul.assign(&a.0 * &b.0);
+            acc += &mul;
+        }
+        crate::num::RugRat(acc)
     }
 
     #[inline(always)]
@@ -214,7 +243,75 @@ impl LinAlgOps<crate::num::RugRat> for RugRatOps {
         rhs_a: &[crate::num::RugRat],
         rhs_b: &[crate::num::RugRat],
     ) -> (crate::num::RugRat, crate::num::RugRat) {
-        (Self::dot(lhs, rhs_a), Self::dot(lhs, rhs_b))
+        debug_assert_eq!(
+            lhs.len(),
+            rhs_a.len(),
+            "dot product dimension mismatch (lhs vs rhs_a)"
+        );
+        debug_assert_eq!(
+            lhs.len(),
+            rhs_b.len(),
+            "dot product dimension mismatch (lhs vs rhs_b)"
+        );
+        use rug::Assign;
+
+        let one = rug::Integer::from(1);
+        let mut acc_a_i = rug::Integer::new();
+        acc_a_i.assign(0);
+        let mut acc_b_i = rug::Integer::new();
+        acc_b_i.assign(0);
+        let mut mul_i = rug::Integer::new();
+        let mut all_integral = true;
+        'integral: for (a, (b, c)) in lhs.iter().zip(rhs_a.iter().zip(rhs_b.iter())) {
+            if a.0.is_zero() {
+                continue;
+            }
+            if a.0.denom() != &one {
+                all_integral = false;
+                break;
+            }
+            if !b.0.is_zero() {
+                if b.0.denom() != &one {
+                    all_integral = false;
+                    break 'integral;
+                }
+                mul_i.assign(a.0.numer());
+                mul_i *= b.0.numer();
+                acc_a_i += &mul_i;
+            }
+            if !c.0.is_zero() {
+                if c.0.denom() != &one {
+                    all_integral = false;
+                    break 'integral;
+                }
+                mul_i.assign(a.0.numer());
+                mul_i *= c.0.numer();
+                acc_b_i += &mul_i;
+            }
+        }
+        if all_integral {
+            return (
+                crate::num::RugRat(rug::Rational::from(acc_a_i)),
+                crate::num::RugRat(rug::Rational::from(acc_b_i)),
+            );
+        }
+
+        let mut acc_a = rug::Rational::new();
+        acc_a.assign(0);
+        let mut acc_b = rug::Rational::new();
+        acc_b.assign(0);
+        let mut mul = rug::Rational::new();
+        for (a, (b, c)) in lhs.iter().zip(rhs_a.iter().zip(rhs_b.iter())) {
+            if !a.0.is_zero() && !b.0.is_zero() {
+                mul.assign(&a.0 * &b.0);
+                acc_a += &mul;
+            }
+            if !a.0.is_zero() && !c.0.is_zero() {
+                mul.assign(&a.0 * &c.0);
+                acc_b += &mul;
+            }
+        }
+        (crate::num::RugRat(acc_a), crate::num::RugRat(acc_b))
     }
 
     #[inline(always)]
@@ -292,11 +389,69 @@ impl LinAlgOps<crate::num::RugRat> for RugRatOps {
         debug_assert_eq!(out.len(), lhs.len(), "lin_comb2 dimension mismatch");
         debug_assert_eq!(out.len(), rhs.len(), "lin_comb2 dimension mismatch");
 
+        let one = rug::Integer::from(1);
+        if lhs_factor.0.denom() == &one && rhs_factor.0.denom() == &one {
+            let mut acc_i = rug::Integer::new();
+            acc_i.assign(0);
+            let mut mul_i = rug::Integer::new();
+            let lhsf = lhs_factor.0.numer();
+            let rhsf = rhs_factor.0.numer();
+            let mut all_integral = true;
+            for ((out_i, lhs_i), rhs_i) in out.iter_mut().zip(lhs.iter()).zip(rhs.iter()) {
+                if lhs_i.0.denom() != &one || rhs_i.0.denom() != &one {
+                    all_integral = false;
+                    break;
+                }
+                acc_i.assign(0);
+                if !lhs_i.0.is_zero() {
+                    mul_i.assign(lhs_i.0.numer());
+                    mul_i *= lhsf;
+                    acc_i += &mul_i;
+                }
+                if !rhs_i.0.is_zero() {
+                    mul_i.assign(rhs_i.0.numer());
+                    mul_i *= rhsf;
+                    acc_i += &mul_i;
+                }
+                out_i.0.assign(&acc_i);
+            }
+            if all_integral {
+                return;
+            }
+        }
+
+        let lhs_is_one = lhs_factor.0 == 1;
+        let rhs_is_one = rhs_factor.0 == 1;
+        let lhs_is_zero = lhs_factor.0.is_zero();
+        let rhs_is_zero = rhs_factor.0.is_zero();
         let mut mul = rug::Rational::new();
         for ((out_i, lhs_i), rhs_i) in out.iter_mut().zip(lhs.iter()).zip(rhs.iter()) {
-            out_i.0.assign(&lhs_i.0 * &lhs_factor.0);
-            mul.assign(&rhs_i.0 * &rhs_factor.0);
-            out_i.0 += &mul;
+            if lhs_is_zero || lhs_i.0.is_zero() {
+                if rhs_is_zero || rhs_i.0.is_zero() {
+                    out_i.0.assign(0);
+                } else if rhs_is_one {
+                    out_i.0.assign(&rhs_i.0);
+                } else {
+                    out_i.0.assign(&rhs_i.0 * &rhs_factor.0);
+                }
+                continue;
+            }
+
+            if lhs_is_one {
+                out_i.0.assign(&lhs_i.0);
+            } else {
+                out_i.0.assign(&lhs_i.0 * &lhs_factor.0);
+            }
+
+            if rhs_is_zero || rhs_i.0.is_zero() {
+                continue;
+            }
+            if rhs_is_one {
+                out_i.0 += &rhs_i.0;
+            } else {
+                mul.assign(&rhs_i.0 * &rhs_factor.0);
+                out_i.0 += &mul;
+            }
         }
     }
 }

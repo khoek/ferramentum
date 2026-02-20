@@ -706,6 +706,7 @@ impl<N: Rat> Normalizer<N> for GcdNormalizer<N> {
         N::Int::assign_from(&mut self.lcm, &self.one);
 
         let mut any_nonzero = false;
+        let mut all_integral = true;
         for v in vector.iter_mut() {
             let (mut numer, mut denom) = std::mem::replace(v, N::zero()).into_parts();
             if denom.is_negative() {
@@ -718,9 +719,14 @@ impl<N: Rat> Normalizer<N> for GcdNormalizer<N> {
             }
             if !numer.is_zero() {
                 any_nonzero = true;
-                self.lcm
-                    .lcm_assign(&denom)
-                    .expect("gcd normalization requires LCM");
+                if denom != self.one {
+                    all_integral = false;
+                    self.lcm
+                        .lcm_assign(&denom)
+                        .expect("gcd normalization requires LCM");
+                }
+            } else if denom != self.one {
+                all_integral = false;
             }
             self.parts.push((numer, denom));
         }
@@ -730,6 +736,43 @@ impl<N: Rat> Normalizer<N> for GcdNormalizer<N> {
                 *v = N::zero();
             }
             return false;
+        }
+
+        if all_integral {
+            N::Int::assign_from(&mut self.gcd, &self.zero);
+            for (numer, _) in self.parts.iter() {
+                if numer.is_zero() {
+                    continue;
+                }
+                N::Int::assign_from(&mut self.tmp_abs, numer);
+                self.tmp_abs
+                    .abs_mut()
+                    .expect("gcd normalization requires abs");
+                if self.gcd.is_zero() {
+                    N::Int::assign_from(&mut self.gcd, &self.tmp_abs);
+                } else {
+                    self.gcd
+                        .gcd_assign(&self.tmp_abs)
+                        .expect("gcd normalization requires gcd");
+                }
+            }
+
+            let gcd_is_one = self.gcd == self.one;
+            for (dest, (numer, _)) in vector.iter_mut().zip(self.parts.iter_mut()) {
+                if numer.is_zero() {
+                    *dest = N::zero();
+                    continue;
+                }
+                if !gcd_is_one {
+                    numer
+                        .div_assign_exact(&self.gcd)
+                        .expect("gcd normalization requires exact division");
+                }
+                let numer = std::mem::replace(numer, N::Int::zero());
+                *dest = N::from_frac(numer, N::Int::one());
+            }
+
+            return true;
         }
 
         N::Int::assign_from(&mut self.gcd, &self.zero);
