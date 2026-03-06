@@ -7,6 +7,7 @@ license = "AGPL-3.0-only"
 readme = "README.md"
 repository = "https://github.com/khoek/ferramentum/tree/master/ocular-tool"
 keywords = ["vpn", "openconnect", "anyconnect", "sso", "cli"]
+exclude = [".cargo/**"]
 default-run = "ocular"
 autobins = false
 
@@ -30,7 +31,3 @@ toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 which = "8"
-
-[patch.crates-io]
-openconnect-core = { path = "vendor/openconnect-rs/crates/openconnect-core" }
-openconnect-sys = { path = "vendor/openconnect-rs/crates/openconnect-sys" }

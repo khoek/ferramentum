@@ -1,2 +1,6 @@
+[patch.crates-io]
+openconnect-core = { path = "vendor/openconnect-rs/crates/openconnect-core" }
+openconnect-sys = { path = "vendor/openconnect-rs/crates/openconnect-sys" }
+
 [env]
 OPENCONNECT_USE_PREBUILT = "true"

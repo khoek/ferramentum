@@ -1,6 +1,6 @@
 [package]
 name = "kai-tool"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "CLI helpers for AI coding workflows, file bundling, and git worktree management."
 repository = "https://github.com/khoek/ferramentum/tree/master/kai-tool"
