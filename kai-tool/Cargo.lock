@@ -878,3 +878,51 @@ name = "zmij"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4de98dfa5d5b7fef4ee834d0073d560c9ca7b6c46a71d058c48db7960f8cfaf7"
+
+[[patch.unused]]
+name = "calculo"
+version = "0.3.3"
+
+[[patch.unused]]
+name = "cddlib-rs"
+version = "0.3.4"
+
+[[patch.unused]]
+name = "clikeys"
+version = "0.3.3"
+
+[[patch.unused]]
+name = "clikeys-derive"
+version = "0.3.3"
+
+[[patch.unused]]
+name = "graphum"
+version = "0.3.2"
+
+[[patch.unused]]
+name = "howzat"
+version = "0.3.8"
+
+[[patch.unused]]
+name = "howzat-kit"
+version = "0.3.8"
+
+[[patch.unused]]
+name = "hullabaloo"
+version = "0.3.3"
+
+[[patch.unused]]
+name = "hullabaloo-core"
+version = "0.3.3"
+
+[[patch.unused]]
+name = "hullabaloo-geom"
+version = "0.3.3"
+
+[[patch.unused]]
+name = "lrslib-rs"
+version = "0.3.3"
+
+[[patch.unused]]
+name = "syntheon"
+version = "0.3.2"
