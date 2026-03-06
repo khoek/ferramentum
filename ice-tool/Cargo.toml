@@ -1,0 +1,31 @@
+[package]
+name = "ice-tool"
+version = "0.1.2"
+edition = "2024"
+description = "CLI for managing cloud VM instances and marketplace offers."
+license = "AGPL-3.0-only"
+repository = "https://github.com/khoek/ferramentum"
+keywords = ["cli", "cloud", "vm", "aws", "gcp"]
+
+[[bin]]
+name = "ice"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+dialoguer = "0.12"
+dirs = "6"
+indicatif = "0.18"
+names = { version = "0.14", default-features = false }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.0"
+webbrowser = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

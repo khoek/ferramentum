@@ -1,0 +1,18 @@
+[package]
+name = "openconnect-oidc"
+authors = ["hlhr202"]
+version = "0.1.5"
+edition = "2021"
+license = "MIT"
+documentation = "https://docs.rs/openconnect-oidc"
+
+[dependencies]
+openidconnect = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+reqwest = { workspace = true }
+
+[lib]
+crate-type = ["lib"]

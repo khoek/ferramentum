@@ -1,0 +1,50 @@
+name: Linux x64 Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - v*
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Package
+        uses: ConorMacBride/install-package@v1.1.0
+        with:
+          apt: libxml2 zlib1g zlib1g-dev openssl libssl-dev liblz4-dev liblzma-dev pkg-config automake libtool gettext
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4.0.2
+        with:
+          node-version: ">=20"
+
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@v3
+        with:
+          run_install: false
+          package_json_file: ./crates/openconnect-gui/package.json
+          version: 8
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-unknown-linux-gnu
+          cache: true
+
+      - name: Build CLI
+        run: |
+          cargo build --release -p openconnect-cli
+
+      - name: Upload
+        uses: actions/upload-artifact@v4.3.1
+        with:
+          name: openconnect-linux-x64
+          path: ./target/release/openconnect-cli

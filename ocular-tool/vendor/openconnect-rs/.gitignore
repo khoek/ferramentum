@@ -1,0 +1,7 @@
+/target
+.env.local
+.vscode/
+._*
+.DS_Store
+*.example.json
+artifacts/

@@ -1,0 +1,109 @@
+name: Windows x64 Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - v*
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { sys: mingw64 }
+    name: ${{ matrix.sys }}
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Install webview2 runtime
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile 'setup.exe'
+          Start-Process -FilePath setup.exe -Verb RunAs -Wait
+          
+      - uses: msys2/setup-msys2@v2
+        name: Setup MinGW64
+        with:
+          msystem: ${{matrix.sys}}
+          update: true
+          path-type: inherit
+          install: >-
+            git
+            curl
+            make
+            zip
+            base-devel
+            mingw-w64-x86_64-toolchain
+            automake
+            libtool
+            gettext
+            autotools
+            pkg-config
+            openssl
+            openssl-devel
+            mingw-w64-x86_64-openssl
+            libxml2
+            libxml2-devel
+            mingw-w64-x86_64-libxml2
+            libiconv
+            libiconv-devel
+            mingw-w64-x86_64-libiconv
+            zlib
+            zlib-devel
+            mingw-w64-x86_64-zlib
+            liblz4
+            liblz4-devel
+            mingw-w64-x86_64-lz4
+            liblzma
+            liblzma-devel
+            mingw-w64-x86_64-xz
+            icu
+            icu-devel
+            mingw-w64-x86_64-icu
+          pacboy: >-
+            toolchain:p
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4.0.2
+        with:
+          node-version: ">=20"
+
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@v3
+        with:
+          run_install: false
+          package_json_file: ./crates/openconnect-gui/package.json
+          version: 8
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-pc-windows-gnu
+          cache: true
+
+      - name: Build
+        run: |
+          rustup override set stable-x86_64-pc-windows-gnu
+          cd ./crates/openconnect-gui
+          pnpm install
+          pnpm tauri build
+
+      - name: Upload
+        uses: actions/upload-artifact@v4.3.1
+        with:
+          name: openconnect-win
+          path: ./target/release/bundle/

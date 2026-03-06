@@ -1,0 +1,32 @@
+[package]
+name = "kai-tool"
+version = "0.1.1"
+edition = "2024"
+description = "CLI helpers for AI coding workflows, file bundling, and git worktree management."
+repository = "https://github.com/khoek/ferramentum"
+license = "AGPL-3.0-only"
+readme = "README.md"
+keywords = ["cli", "git", "worktree", "automation", "llm"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "kai"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
+indicatif = "0.18"
+libc = "0.2"
+pathdiff = "0.2"
+rand = "0.10"
+tempfile = "3"
+walkdir = "2"
+which = "8"
+toml = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
