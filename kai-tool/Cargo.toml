@@ -2,6 +2,7 @@
 name = "kai-tool"
 version = "0.1.2"
 edition = "2024"
+publish.workspace = true
 description = "CLI helpers for AI coding workflows, file bundling, and git worktree management."
 repository = "https://github.com/khoek/ferramentum/tree/master/kai-tool"
 license = "AGPL-3.0-only"
@@ -25,8 +26,3 @@ tempfile = "3"
 walkdir = "2"
 which = "8"
 toml = "0.9"
-
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1

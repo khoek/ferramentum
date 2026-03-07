@@ -773,12 +773,8 @@ fn handle_invalid_cert(
 }
 
 fn cert_hash_matches_any(client: &VpnClient, expected_hashes: &[String]) -> bool {
-    expected_hashes.iter().any(|expected| {
-        client
-            .check_peer_cert_hash(expected)
-            .map(|matched| matched)
-            .unwrap_or(false)
-    })
+    let actual_hash = normalize_hash(&client.get_peer_cert_hash());
+    expected_hashes.iter().any(|expected| expected == &actual_hash)
 }
 
 fn is_probably_auth_failure(err: &OpenconnectError) -> bool {

@@ -2,6 +2,7 @@
 name = "arca-tool"
 version = "0.1.0"
 edition = "2024"
+publish.workspace = true
 description = "CLI for building and publishing containerized Rust crate artifacts."
 license = "AGPL-3.0-only"
 readme = "README.md"
@@ -29,8 +30,3 @@ tempfile = "3"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 toml = "1"
 webbrowser = "1"
-
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1

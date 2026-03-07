@@ -2,6 +2,7 @@
 name = "ocular-tool"
 version = "0.1.1"
 edition = "2024"
+publish.workspace = true
 description = "CLI bridge for SSO authentication with OpenConnect/AnyConnect VPNs"
 license = "AGPL-3.0-only"
 readme = "README.md"
