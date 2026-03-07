@@ -1,0 +1,36 @@
+[package]
+name = "arca-tool"
+version = "0.1.0"
+edition = "2024"
+description = "CLI for building and publishing containerized Rust crate artifacts."
+license = "AGPL-3.0-only"
+readme = "README.md"
+repository = "https://github.com/khoek/ferramentum/tree/master/arca-tool"
+keywords = ["cli", "containers", "docker", "podman", "gcp"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "arca"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dialoguer = "0.12"
+dirs = "6"
+indicatif = "0.18"
+libc = "0.2"
+rand = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+toml = "1"
+webbrowser = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
