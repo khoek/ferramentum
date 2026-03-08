@@ -595,46 +595,17 @@ fn prompt_yes_no_with_noninteractive_message(
     prompt: &str,
     non_interactive_message: &str,
 ) -> Result<bool> {
-    if !io::stdin().is_terminal() {
-        bail!("{non_interactive_message}");
-    }
-
-    eprint!("{prompt}");
-    io::stderr().flush().context("Failed to flush stderr")?;
-
-    let mut answer = String::new();
-    io::stdin()
-        .read_line(&mut answer)
-        .context("Failed to read confirmation from stdin")?;
-    let confirmed = parse_yes_no_answer(&answer, false);
-    if confirmed {
-        eprintln!();
-    }
-    Ok(confirmed)
+    capulus::ui::prompt_confirm_with_message(prompt, false, non_interactive_message)
 }
 
 fn prompt_yes_no_default_yes_with_noninteractive_message(
     prompt: &str,
     non_interactive_message: &str,
 ) -> Result<bool> {
-    if !io::stdin().is_terminal() {
-        bail!("{non_interactive_message}");
-    }
-
-    eprint!("{prompt}");
-    io::stderr().flush().context("Failed to flush stderr")?;
-
-    let mut answer = String::new();
-    io::stdin()
-        .read_line(&mut answer)
-        .context("Failed to read confirmation from stdin")?;
-    let confirmed = parse_yes_no_answer(&answer, true);
-    if confirmed {
-        eprintln!();
-    }
-    Ok(confirmed)
+    capulus::ui::prompt_confirm_with_message(prompt, true, non_interactive_message)
 }
 
+#[cfg(test)]
 fn parse_yes_no_answer(answer: &str, default_yes: bool) -> bool {
     let answer = answer.trim().to_ascii_lowercase();
     if answer.is_empty() {
@@ -661,9 +632,7 @@ fn parse_pointer_commit_prompt_choice(answer: &str) -> PointerCommitPromptChoice
 fn prompt_submodule_pointer_commit_choice(
     non_interactive_message: &str,
 ) -> Result<PointerCommitPromptChoice> {
-    if !io::stdin().is_terminal() {
-        bail!("{non_interactive_message}");
-    }
+    capulus::ui::require_interactive(non_interactive_message)?;
 
     eprint!("Stage and commit these submodule pointer updates now, then continue? [y/N/!] ");
     io::stderr().flush().context("Failed to flush stderr")?;

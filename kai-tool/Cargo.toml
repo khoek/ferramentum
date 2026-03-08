@@ -15,6 +15,8 @@ name = "kai"
 path = "src/main.rs"
 
 [dependencies]
+capulus = { path = "../../caudex/capulus" }
+
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
