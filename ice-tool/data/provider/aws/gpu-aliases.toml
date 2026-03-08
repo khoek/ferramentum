@@ -1,0 +1,100 @@
+[[aliases]]
+raw_name = "Tesla T4"
+canonical_name = "Tesla T4"
+search_name = "t4"
+
+[[aliases]]
+raw_name = "T4"
+canonical_name = "Tesla T4"
+search_name = "t4"
+
+[[aliases]]
+raw_name = "NVIDIA T4 Tensor Core"
+canonical_name = "Tesla T4"
+search_name = "t4"
+
+[[aliases]]
+raw_name = "Tesla V100"
+canonical_name = "Tesla V100"
+search_name = "v100"
+
+[[aliases]]
+raw_name = "V100"
+canonical_name = "Tesla V100"
+search_name = "v100"
+
+[[aliases]]
+raw_name = "NVIDIA V100"
+canonical_name = "Tesla V100"
+search_name = "v100"
+
+[[aliases]]
+raw_name = "A10"
+canonical_name = "A10"
+search_name = "a10g"
+
+[[aliases]]
+raw_name = "A10G"
+canonical_name = "A10"
+search_name = "a10g"
+
+[[aliases]]
+raw_name = "NVIDIA A10G Tensor Core"
+canonical_name = "A10"
+search_name = "a10g"
+
+[[aliases]]
+raw_name = "A100 PCIE"
+canonical_name = "A100 PCIE"
+search_name = "a100"
+
+[[aliases]]
+raw_name = "A100 SXM4"
+canonical_name = "A100 SXM4"
+search_name = "a100"
+
+[[aliases]]
+raw_name = "A100"
+canonical_name = "A100 SXM4"
+search_name = "a100"
+
+[[aliases]]
+raw_name = "NVIDIA A100 Tensor Core"
+canonical_name = "A100 SXM4"
+search_name = "a100"
+
+[[aliases]]
+raw_name = "L4"
+canonical_name = "L4"
+search_name = "l4"
+
+[[aliases]]
+raw_name = "NVIDIA L4"
+canonical_name = "L4"
+search_name = "l4"
+
+[[aliases]]
+raw_name = "L40S"
+canonical_name = "L40S"
+search_name = "l40s"
+
+[[aliases]]
+raw_name = "NVIDIA L40S"
+canonical_name = "L40S"
+search_name = "l40s"
+
+[[aliases]]
+raw_name = "H100 SXM"
+canonical_name = "H100 SXM"
+search_name = "h100"
+
+[[aliases]]
+raw_name = "H100"
+canonical_name = "H100 SXM"
+search_name = "h100"
+
+[[aliases]]
+raw_name = "NVIDIA H100 80GB HBM3"
+canonical_name = "H100 SXM"
+search_name = "h100"
+

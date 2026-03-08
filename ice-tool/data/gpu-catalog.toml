@@ -1,0 +1,471 @@
+reference_model = "RTX PRO 6000 WS"
+
+[[entries]]
+name = "A10"
+vram_gb = 24.0
+fp32_tflops = 31.2
+
+[[entries]]
+name = "A100 PCIE"
+vram_gb = 40.0
+fp32_tflops = 19.5
+
+[[entries]]
+name = "A100 SXM4"
+vram_gb = 80.0
+fp32_tflops = 19.5
+
+[[entries]]
+name = "A100X"
+vram_gb = 80.0
+fp32_tflops = 19.5
+
+[[entries]]
+name = "A40"
+vram_gb = 48.0
+fp32_tflops = 37.4
+
+[[entries]]
+name = "A800 PCIE"
+vram_gb = 80.0
+fp32_tflops = 19.5
+
+[[entries]]
+name = "B200"
+vram_gb = 180.0
+fp32_tflops = 75.0
+
+[[entries]]
+name = "CMP 50HX"
+vram_gb = 10.0
+fp32_tflops = 10.0
+
+[[entries]]
+name = "GTX 1050"
+vram_gb = 2.0
+fp32_tflops = 1.8
+
+[[entries]]
+name = "GTX 1050 Ti"
+vram_gb = 4.0
+fp32_tflops = 2.1
+
+[[entries]]
+name = "GTX 1060"
+vram_gb = 6.0
+fp32_tflops = 4.4
+
+[[entries]]
+name = "GTX 1070"
+vram_gb = 8.0
+fp32_tflops = 6.5
+
+[[entries]]
+name = "GTX 1070 Ti"
+vram_gb = 8.0
+fp32_tflops = 8.2
+
+[[entries]]
+name = "GTX 1080"
+vram_gb = 8.0
+fp32_tflops = 8.9
+
+[[entries]]
+name = "GTX 1080 Ti"
+vram_gb = 11.0
+fp32_tflops = 11.3
+
+[[entries]]
+name = "GTX 1650"
+vram_gb = 4.0
+fp32_tflops = 3.0
+
+[[entries]]
+name = "GTX 1650 S"
+vram_gb = 4.0
+fp32_tflops = 4.4
+
+[[entries]]
+name = "GTX 1660"
+vram_gb = 6.0
+fp32_tflops = 5.0
+
+[[entries]]
+name = "GTX 1660 S"
+vram_gb = 6.0
+fp32_tflops = 5.0
+
+[[entries]]
+name = "GTX 1660 Ti"
+vram_gb = 6.0
+fp32_tflops = 5.4
+
+[[entries]]
+name = "H100 NVL"
+vram_gb = 94.0
+fp32_tflops = 60.0
+
+[[entries]]
+name = "H100 PCIE"
+vram_gb = 80.0
+fp32_tflops = 51.0
+
+[[entries]]
+name = "H100 SXM"
+vram_gb = 80.0
+fp32_tflops = 67.0
+
+[[entries]]
+name = "H200"
+vram_gb = 141.0
+fp32_tflops = 67.0
+
+[[entries]]
+name = "H200 NVL"
+vram_gb = 141.0
+fp32_tflops = 60.0
+
+[[entries]]
+name = "L4"
+vram_gb = 24.0
+fp32_tflops = 30.3
+
+[[entries]]
+name = "L40"
+vram_gb = 48.0
+fp32_tflops = 90.5
+
+[[entries]]
+name = "L40S"
+vram_gb = 48.0
+fp32_tflops = 91.6
+
+[[entries]]
+name = "Q RTX 4000"
+vram_gb = 8.0
+fp32_tflops = 7.1
+
+[[entries]]
+name = "Q RTX 6000"
+vram_gb = 24.0
+fp32_tflops = 16.3
+
+[[entries]]
+name = "Q RTX 8000"
+vram_gb = 48.0
+fp32_tflops = 16.3
+
+[[entries]]
+name = "Quadro P2000"
+vram_gb = 5.0
+fp32_tflops = 3.0
+
+[[entries]]
+name = "Quadro P4000"
+vram_gb = 8.0
+fp32_tflops = 5.3
+
+[[entries]]
+name = "RTX 2000Ada"
+vram_gb = 16.0
+fp32_tflops = 12.0
+
+[[entries]]
+name = "RTX 2060"
+vram_gb = 6.0
+fp32_tflops = 6.5
+
+[[entries]]
+name = "RTX 2060S"
+vram_gb = 8.0
+fp32_tflops = 7.2
+
+[[entries]]
+name = "RTX 2070"
+vram_gb = 8.0
+fp32_tflops = 7.5
+
+[[entries]]
+name = "RTX 2070S"
+vram_gb = 8.0
+fp32_tflops = 9.1
+
+[[entries]]
+name = "RTX 2080"
+vram_gb = 8.0
+fp32_tflops = 10.1
+
+[[entries]]
+name = "RTX 2080 Ti"
+vram_gb = 11.0
+fp32_tflops = 13.4
+
+[[entries]]
+name = "RTX 3050"
+vram_gb = 8.0
+fp32_tflops = 9.1
+
+[[entries]]
+name = "RTX 3060"
+vram_gb = 12.0
+fp32_tflops = 12.7
+
+[[entries]]
+name = "RTX 3060 Ti"
+vram_gb = 8.0
+fp32_tflops = 16.2
+
+[[entries]]
+name = "RTX 3060 laptop"
+vram_gb = 6.0
+fp32_tflops = 13.0
+
+[[entries]]
+name = "RTX 3070"
+vram_gb = 8.0
+fp32_tflops = 20.3
+
+[[entries]]
+name = "RTX 3070 Ti"
+vram_gb = 8.0
+fp32_tflops = 21.8
+
+[[entries]]
+name = "RTX 3070 laptop"
+vram_gb = 8.0
+fp32_tflops = 20.3
+
+[[entries]]
+name = "RTX 3080"
+vram_gb = 10.0
+fp32_tflops = 29.8
+
+[[entries]]
+name = "RTX 3080 Ti"
+vram_gb = 12.0
+fp32_tflops = 34.1
+
+[[entries]]
+name = "RTX 3090"
+vram_gb = 24.0
+fp32_tflops = 35.6
+
+[[entries]]
+name = "RTX 3090 Ti"
+vram_gb = 24.0
+fp32_tflops = 40.0
+
+[[entries]]
+name = "RTX 4000Ada"
+vram_gb = 20.0
+fp32_tflops = 26.7
+
+[[entries]]
+name = "RTX 4060"
+vram_gb = 8.0
+fp32_tflops = 15.1
+
+[[entries]]
+name = "RTX 4060 Ti"
+vram_gb = 16.0
+fp32_tflops = 22.1
+
+[[entries]]
+name = "RTX 4070"
+vram_gb = 12.0
+fp32_tflops = 29.1
+
+[[entries]]
+name = "RTX 4070 Ti"
+vram_gb = 12.0
+fp32_tflops = 40.1
+
+[[entries]]
+name = "RTX 4070 laptop"
+vram_gb = 8.0
+fp32_tflops = 28.0
+
+[[entries]]
+name = "RTX 4070S"
+vram_gb = 12.0
+fp32_tflops = 35.5
+
+[[entries]]
+name = "RTX 4070S Ti"
+vram_gb = 16.0
+fp32_tflops = 44.0
+
+[[entries]]
+name = "RTX 4080"
+vram_gb = 16.0
+fp32_tflops = 48.7
+
+[[entries]]
+name = "RTX 4080S"
+vram_gb = 16.0
+fp32_tflops = 52.2
+
+[[entries]]
+name = "RTX 4090"
+vram_gb = 24.0
+fp32_tflops = 82.6
+
+[[entries]]
+name = "RTX 4090D"
+vram_gb = 24.0
+fp32_tflops = 73.0
+
+[[entries]]
+name = "RTX 4500Ada"
+vram_gb = 24.0
+fp32_tflops = 39.6
+
+[[entries]]
+name = "RTX 5000Ada"
+vram_gb = 32.0
+fp32_tflops = 65.3
+
+[[entries]]
+name = "RTX 5060"
+vram_gb = 8.0
+fp32_tflops = 19.0
+
+[[entries]]
+name = "RTX 5060 Ti"
+vram_gb = 16.0
+fp32_tflops = 24.0
+
+[[entries]]
+name = "RTX 5070"
+vram_gb = 12.0
+fp32_tflops = 30.9
+
+[[entries]]
+name = "RTX 5070 Ti"
+vram_gb = 16.0
+fp32_tflops = 43.9
+
+[[entries]]
+name = "RTX 5080"
+vram_gb = 16.0
+fp32_tflops = 56.3
+
+[[entries]]
+name = "RTX 5090"
+vram_gb = 32.0
+fp32_tflops = 104.8
+
+[[entries]]
+name = "RTX 5880Ada"
+vram_gb = 48.0
+fp32_tflops = 69.0
+
+[[entries]]
+name = "RTX 6000Ada"
+vram_gb = 48.0
+fp32_tflops = 91.1
+
+[[entries]]
+name = "RTX A2000"
+vram_gb = 12.0
+fp32_tflops = 8.0
+
+[[entries]]
+name = "RTX A4000"
+vram_gb = 16.0
+fp32_tflops = 19.2
+
+[[entries]]
+name = "RTX A4500"
+vram_gb = 20.0
+fp32_tflops = 23.7
+
+[[entries]]
+name = "RTX A5000"
+vram_gb = 24.0
+fp32_tflops = 27.8
+
+[[entries]]
+name = "RTX A6000"
+vram_gb = 48.0
+fp32_tflops = 38.7
+
+[[entries]]
+name = "RTX PRO 4000"
+vram_gb = 24.0
+fp32_tflops = 50.0
+
+[[entries]]
+name = "RTX PRO 4500"
+vram_gb = 32.0
+fp32_tflops = 70.0
+
+[[entries]]
+name = "RTX PRO 5000"
+vram_gb = 48.0
+fp32_tflops = 95.0
+
+[[entries]]
+name = "RTX PRO 6000"
+vram_gb = 96.0
+fp32_tflops = 125.0
+
+[[entries]]
+name = "RTX PRO 6000 S"
+vram_gb = 96.0
+fp32_tflops = 125.0
+
+[[entries]]
+name = "RTX PRO 6000 WS"
+vram_gb = 96.0
+fp32_tflops = 125.0
+
+[[entries]]
+name = "RX 6950 XT"
+vram_gb = 16.0
+fp32_tflops = 23.6
+
+[[entries]]
+name = "Radeon VII"
+vram_gb = 16.0
+fp32_tflops = 13.4
+
+[[entries]]
+name = "Tesla P100"
+vram_gb = 16.0
+fp32_tflops = 10.6
+
+[[entries]]
+name = "Tesla P4"
+vram_gb = 8.0
+fp32_tflops = 5.5
+
+[[entries]]
+name = "Tesla P40"
+vram_gb = 24.0
+fp32_tflops = 12.0
+
+[[entries]]
+name = "Tesla T4"
+vram_gb = 16.0
+fp32_tflops = 8.1
+
+[[entries]]
+name = "Tesla V100"
+vram_gb = 16.0
+fp32_tflops = 15.7
+
+[[entries]]
+name = "Titan RTX"
+vram_gb = 24.0
+fp32_tflops = 16.3
+
+[[entries]]
+name = "Titan V"
+vram_gb = 12.0
+fp32_tflops = 13.8
+
+[[entries]]
+name = "Titan Xp"
+vram_gb = 12.0
+fp32_tflops = 12.1

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 
-use crate::cli::{DeployArgs, DownloadArgs, LogsArgs, ShellArgs};
+use crate::cli::{CreateArgs, DownloadArgs, LogsArgs, ShellArgs};
 use crate::listing::{
     ListedInstance, display_name_or_fallback, display_state, list_state_color, listed_instance,
     present_field, push_field, show_health_field,
@@ -192,21 +192,21 @@ impl CommandProvider for Provider {
 }
 
 impl CreateProvider for Provider {
-    fn create(config: &mut IceConfig, args: &DeployArgs) -> Result<()> {
+    fn create(config: &mut IceConfig, args: &CreateArgs) -> Result<()> {
         if args.custom {
-            bail!("`ice deploy --cloud local` does not support `--custom`.");
+            bail!("`ice create --cloud local` does not support `--custom`.");
         }
         if let Some(machine) = args.machine.as_deref()
             && !machine.trim().is_empty()
         {
-            bail!("`ice deploy --cloud local` does not support `--machine`.");
+            bail!("`ice create --cloud local` does not support `--machine`.");
         }
 
         let hours = resolve_deploy_hours(config, args.hours)?;
         let workload = resolve_deploy_workload(&args.target_request())?;
         if matches!(workload, InstanceWorkload::Shell) {
             bail!(
-                "`ice deploy --cloud local` requires `--container`, `--unpack`, or `--arca`; there is no host VM for `--ssh`."
+                "`ice create --cloud local` requires `--container`, `--unpack`, or `--arca`; there is no host VM for `--ssh`."
             );
         }
         let context = local_context();

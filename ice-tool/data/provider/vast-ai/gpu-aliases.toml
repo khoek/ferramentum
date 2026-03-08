@@ -1,0 +1,416 @@
+[[aliases]]
+raw_name = "A10"
+canonical_name = "A10"
+
+[[aliases]]
+raw_name = "A100 PCIE"
+canonical_name = "A100 PCIE"
+
+[[aliases]]
+raw_name = "A100 SXM4"
+canonical_name = "A100 SXM4"
+
+[[aliases]]
+raw_name = "A100X"
+canonical_name = "A100X"
+
+[[aliases]]
+raw_name = "A40"
+canonical_name = "A40"
+
+[[aliases]]
+raw_name = "A800 PCIE"
+canonical_name = "A800 PCIE"
+
+[[aliases]]
+raw_name = "B200"
+canonical_name = "B200"
+
+[[aliases]]
+raw_name = "CMP 50HX"
+canonical_name = "CMP 50HX"
+
+[[aliases]]
+raw_name = "GTX 1050"
+canonical_name = "GTX 1050"
+
+[[aliases]]
+raw_name = "GTX 1050 Ti"
+canonical_name = "GTX 1050 Ti"
+
+[[aliases]]
+raw_name = "GTX 1060"
+canonical_name = "GTX 1060"
+
+[[aliases]]
+raw_name = "GTX 1070"
+canonical_name = "GTX 1070"
+
+[[aliases]]
+raw_name = "GTX 1070 Ti"
+canonical_name = "GTX 1070 Ti"
+
+[[aliases]]
+raw_name = "GTX 1080"
+canonical_name = "GTX 1080"
+
+[[aliases]]
+raw_name = "GTX 1080 Ti"
+canonical_name = "GTX 1080 Ti"
+
+[[aliases]]
+raw_name = "GTX 1650"
+canonical_name = "GTX 1650"
+
+[[aliases]]
+raw_name = "GTX 1650 S"
+canonical_name = "GTX 1650 S"
+
+[[aliases]]
+raw_name = "GTX 1660"
+canonical_name = "GTX 1660"
+
+[[aliases]]
+raw_name = "GTX 1660 S"
+canonical_name = "GTX 1660 S"
+
+[[aliases]]
+raw_name = "GTX 1660 Ti"
+canonical_name = "GTX 1660 Ti"
+
+[[aliases]]
+raw_name = "H100 NVL"
+canonical_name = "H100 NVL"
+
+[[aliases]]
+raw_name = "H100 PCIE"
+canonical_name = "H100 PCIE"
+
+[[aliases]]
+raw_name = "H100 SXM"
+canonical_name = "H100 SXM"
+
+[[aliases]]
+raw_name = "H200"
+canonical_name = "H200"
+
+[[aliases]]
+raw_name = "H200 NVL"
+canonical_name = "H200 NVL"
+
+[[aliases]]
+raw_name = "L4"
+canonical_name = "L4"
+
+[[aliases]]
+raw_name = "L40"
+canonical_name = "L40"
+
+[[aliases]]
+raw_name = "L40S"
+canonical_name = "L40S"
+
+[[aliases]]
+raw_name = "Q RTX 4000"
+canonical_name = "Q RTX 4000"
+
+[[aliases]]
+raw_name = "Q RTX 6000"
+canonical_name = "Q RTX 6000"
+
+[[aliases]]
+raw_name = "Q RTX 8000"
+canonical_name = "Q RTX 8000"
+
+[[aliases]]
+raw_name = "Quadro P2000"
+canonical_name = "Quadro P2000"
+
+[[aliases]]
+raw_name = "Quadro P4000"
+canonical_name = "Quadro P4000"
+
+[[aliases]]
+raw_name = "Radeon VII"
+canonical_name = "Radeon VII"
+
+[[aliases]]
+raw_name = "RTX 2000Ada"
+canonical_name = "RTX 2000Ada"
+
+[[aliases]]
+raw_name = "RTX 2060"
+canonical_name = "RTX 2060"
+
+[[aliases]]
+raw_name = "RTX 2060S"
+canonical_name = "RTX 2060S"
+
+[[aliases]]
+raw_name = "RTX 2070"
+canonical_name = "RTX 2070"
+
+[[aliases]]
+raw_name = "RTX 2070S"
+canonical_name = "RTX 2070S"
+
+[[aliases]]
+raw_name = "RTX 2080"
+canonical_name = "RTX 2080"
+
+[[aliases]]
+raw_name = "RTX 2080 Ti"
+canonical_name = "RTX 2080 Ti"
+
+[[aliases]]
+raw_name = "RTX 3050"
+canonical_name = "RTX 3050"
+
+[[aliases]]
+raw_name = "RTX 3060"
+canonical_name = "RTX 3060"
+
+[[aliases]]
+raw_name = "RTX 3060 laptop"
+canonical_name = "RTX 3060 laptop"
+
+[[aliases]]
+raw_name = "RTX 3060 Ti"
+canonical_name = "RTX 3060 Ti"
+
+[[aliases]]
+raw_name = "RTX 3070"
+canonical_name = "RTX 3070"
+
+[[aliases]]
+raw_name = "RTX 3070 laptop"
+canonical_name = "RTX 3070 laptop"
+
+[[aliases]]
+raw_name = "RTX 3070 Ti"
+canonical_name = "RTX 3070 Ti"
+
+[[aliases]]
+raw_name = "RTX 3080"
+canonical_name = "RTX 3080"
+
+[[aliases]]
+raw_name = "RTX 3080 Ti"
+canonical_name = "RTX 3080 Ti"
+
+[[aliases]]
+raw_name = "RTX 3090"
+canonical_name = "RTX 3090"
+
+[[aliases]]
+raw_name = "RTX 3090 Ti"
+canonical_name = "RTX 3090 Ti"
+
+[[aliases]]
+raw_name = "RTX 4000Ada"
+canonical_name = "RTX 4000Ada"
+
+[[aliases]]
+raw_name = "RTX 4060"
+canonical_name = "RTX 4060"
+
+[[aliases]]
+raw_name = "RTX 4060 Ti"
+canonical_name = "RTX 4060 Ti"
+
+[[aliases]]
+raw_name = "RTX 4070"
+canonical_name = "RTX 4070"
+
+[[aliases]]
+raw_name = "RTX 4070 laptop"
+canonical_name = "RTX 4070 laptop"
+
+[[aliases]]
+raw_name = "RTX 4070S"
+canonical_name = "RTX 4070S"
+
+[[aliases]]
+raw_name = "RTX 4070S Ti"
+canonical_name = "RTX 4070S Ti"
+
+[[aliases]]
+raw_name = "RTX 4070 Ti"
+canonical_name = "RTX 4070 Ti"
+
+[[aliases]]
+raw_name = "RTX 4080"
+canonical_name = "RTX 4080"
+
+[[aliases]]
+raw_name = "RTX 4080S"
+canonical_name = "RTX 4080S"
+
+[[aliases]]
+raw_name = "RTX 4090"
+canonical_name = "RTX 4090"
+
+[[aliases]]
+raw_name = "RTX 4090D"
+canonical_name = "RTX 4090D"
+
+[[aliases]]
+raw_name = "RTX 4500Ada"
+canonical_name = "RTX 4500Ada"
+
+[[aliases]]
+raw_name = "RTX 5000Ada"
+canonical_name = "RTX 5000Ada"
+
+[[aliases]]
+raw_name = "RTX 5060"
+canonical_name = "RTX 5060"
+
+[[aliases]]
+raw_name = "RTX 5060 Ti"
+canonical_name = "RTX 5060 Ti"
+
+[[aliases]]
+raw_name = "RTX 5070"
+canonical_name = "RTX 5070"
+
+[[aliases]]
+raw_name = "RTX 5070 Ti"
+canonical_name = "RTX 5070 Ti"
+
+[[aliases]]
+raw_name = "RTX 5080"
+canonical_name = "RTX 5080"
+
+[[aliases]]
+raw_name = "RTX 5090"
+canonical_name = "RTX 5090"
+
+[[aliases]]
+raw_name = "RTX 5880Ada"
+canonical_name = "RTX 5880Ada"
+
+[[aliases]]
+raw_name = "RTX 6000Ada"
+canonical_name = "RTX 6000Ada"
+
+[[aliases]]
+raw_name = "RTX A2000"
+canonical_name = "RTX A2000"
+
+[[aliases]]
+raw_name = "RTX A4000"
+canonical_name = "RTX A4000"
+
+[[aliases]]
+raw_name = "RTX A4500"
+canonical_name = "RTX A4500"
+
+[[aliases]]
+raw_name = "RTX A5000"
+canonical_name = "RTX A5000"
+
+[[aliases]]
+raw_name = "RTX A6000"
+canonical_name = "RTX A6000"
+
+[[aliases]]
+raw_name = "RTX PRO 4000"
+canonical_name = "RTX PRO 4000"
+
+[[aliases]]
+raw_name = "RTX PRO 4500"
+canonical_name = "RTX PRO 4500"
+
+[[aliases]]
+raw_name = "RTX PRO 5000"
+canonical_name = "RTX PRO 5000"
+
+[[aliases]]
+raw_name = "RTX PRO 6000 S"
+canonical_name = "RTX PRO 6000 S"
+
+[[aliases]]
+raw_name = "RTX PRO 6000 WS"
+canonical_name = "RTX PRO 6000 WS"
+
+[[aliases]]
+raw_name = "RX 6950 XT"
+canonical_name = "RX 6950 XT"
+
+[[aliases]]
+raw_name = "Tesla P100"
+canonical_name = "Tesla P100"
+
+[[aliases]]
+raw_name = "Tesla P4"
+canonical_name = "Tesla P4"
+
+[[aliases]]
+raw_name = "Tesla P40"
+canonical_name = "Tesla P40"
+
+[[aliases]]
+raw_name = "Tesla T4"
+canonical_name = "Tesla T4"
+
+[[aliases]]
+raw_name = "Tesla V100"
+canonical_name = "Tesla V100"
+
+[[aliases]]
+raw_name = "Titan RTX"
+canonical_name = "Titan RTX"
+
+[[aliases]]
+raw_name = "Titan V"
+canonical_name = "Titan V"
+
+[[aliases]]
+raw_name = "Titan Xp"
+canonical_name = "Titan Xp"
+
+[[aliases]]
+raw_name = "A10G"
+canonical_name = "A10"
+
+[[aliases]]
+raw_name = "RTX 2000 Ada"
+canonical_name = "RTX 2000Ada"
+
+[[aliases]]
+raw_name = "RTX 4000 Ada"
+canonical_name = "RTX 4000Ada"
+
+[[aliases]]
+raw_name = "RTX 4500 Ada"
+canonical_name = "RTX 4500Ada"
+
+[[aliases]]
+raw_name = "RTX 5000 Ada"
+canonical_name = "RTX 5000Ada"
+
+[[aliases]]
+raw_name = "RTX 5880 Ada"
+canonical_name = "RTX 5880Ada"
+
+[[aliases]]
+raw_name = "RTX 6000 Ada"
+canonical_name = "RTX 6000Ada"
+
+[[aliases]]
+raw_name = "RTX Pro 6000 Workstation Edition"
+canonical_name = "RTX PRO 6000 WS"
+
+[[aliases]]
+raw_name = "RTX Pro 6000 Server Edition"
+canonical_name = "RTX PRO 6000 S"
+
+[[aliases]]
+raw_name = "NVIDIA RTX 4090"
+canonical_name = "RTX 4090"
+
+[[aliases]]
+raw_name = "NVIDIA RTX 5090"
+canonical_name = "RTX 5090"
+

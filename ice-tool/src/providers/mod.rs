@@ -1,11 +1,12 @@
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 
 use crate::cache::CloudCacheModel;
-use crate::cli::{DeployArgs, DownloadArgs, LogsArgs, ShellArgs};
+use crate::cli::{CreateArgs, DownloadArgs, LogsArgs, ShellArgs};
 use crate::listing::ListedInstance;
 use crate::model::{Cloud, CloudMachineCandidate, IceConfig};
 use crate::support::{VAST_WAIT_TIMEOUT_SECS, ensure_provider_cli_installed, prompt_confirm};
@@ -19,6 +20,49 @@ pub(crate) mod aws;
 pub(crate) mod gcp;
 pub(crate) mod local;
 pub(crate) mod vast;
+
+pub(crate) fn load_cached_arc<T, F>(
+    cache: &LazyLock<Mutex<Option<Arc<T>>>>,
+    load: F,
+    cache_name: &str,
+) -> Result<Arc<T>>
+where
+    T: Send + Sync + 'static,
+    F: FnOnce() -> Result<T>,
+{
+    if let Some(value) = cache
+        .lock()
+        .map_err(|_| anyhow!("{cache_name} cache mutex is poisoned."))?
+        .as_ref()
+        .cloned()
+    {
+        return Ok(value);
+    }
+
+    let value = Arc::new(load()?);
+    let mut guard = cache
+        .lock()
+        .map_err(|_| anyhow!("{cache_name} cache mutex is poisoned."))?;
+    if let Some(existing) = guard.as_ref() {
+        return Ok(existing.clone());
+    }
+    *guard = Some(value.clone());
+    Ok(value)
+}
+
+pub(crate) fn clear_cached_arc<T>(
+    cache: &LazyLock<Mutex<Option<Arc<T>>>>,
+    cache_name: &str,
+) -> Result<()>
+where
+    T: Send + Sync + 'static,
+{
+    let mut guard = cache
+        .lock()
+        .map_err(|_| anyhow!("{cache_name} cache mutex is poisoned."))?;
+    *guard = None;
+    Ok(())
+}
 
 pub(crate) trait CloudInstance {
     type ListContext;
@@ -108,7 +152,7 @@ pub(crate) trait CommandProvider: CloudProvider {
 }
 
 pub(crate) trait CreateProvider: CommandProvider {
-    fn create(config: &mut IceConfig, args: &DeployArgs) -> Result<()>;
+    fn create(config: &mut IceConfig, args: &CreateArgs) -> Result<()>;
 }
 
 pub(crate) trait RemoteSshProvider: RemoteCloudProvider {
@@ -144,6 +188,12 @@ pub(crate) trait RemoteSshProvider: RemoteCloudProvider {
         allocate_tty: bool,
     ) -> Result<()>;
     fn remote_unpack_dir(instance: &Self::Instance) -> String;
+    fn refresh_machine_offer(
+        _config: &IceConfig,
+        candidate: &CloudMachineCandidate,
+    ) -> Result<CloudMachineCandidate> {
+        Ok(candidate.clone())
+    }
 
     fn stream_unpack_logs(
         config: &IceConfig,
@@ -262,6 +312,10 @@ pub(crate) trait MarketCreateProvider: CommandProvider {
         follow: bool,
     ) -> Result<()>;
     fn open_instance_shell(config: &IceConfig, instance: &Self::Instance) -> Result<()>;
+    fn refresh_machine_offer(
+        config: &IceConfig,
+        candidate: &CloudMachineCandidate,
+    ) -> Result<CloudMachineCandidate>;
 }
 
 impl<T: RemoteSshProvider> MarketCreateProvider for T {
@@ -289,5 +343,12 @@ impl<T: RemoteSshProvider> MarketCreateProvider for T {
 
     fn open_instance_shell(config: &IceConfig, instance: &Self::Instance) -> Result<()> {
         <T as RemoteSshProvider>::open_instance_shell(config, instance)
+    }
+
+    fn refresh_machine_offer(
+        config: &IceConfig,
+        candidate: &CloudMachineCandidate,
+    ) -> Result<CloudMachineCandidate> {
+        <T as RemoteSshProvider>::refresh_machine_offer(config, candidate)
     }
 }

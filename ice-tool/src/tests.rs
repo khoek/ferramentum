@@ -2,25 +2,32 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
+use clap::Parser;
 use serde_json::json;
 
+use crate::cli::{Cli, Commands};
 use crate::config_store::{
     get_config_value, normalize_config_key, parse_cloud, set_config_value, unset_config_value,
 };
+use crate::gpu::{gpu_quality_score, gpu_selector_label};
 use crate::listing::{listed_instance, missing_remote_cached_instance, render_listed_instance};
 use crate::local::{
     local_instance_is_managed, local_instance_labels, local_workload_display,
     parse_local_instance_row,
 };
-use crate::model::{Cloud, DeployTargetRequest, IceConfig, PrefixLookup};
+use crate::model::{
+    Cloud, CloudMachineCandidate, CreateSearchRequirements, DeployTargetRequest, IceConfig,
+    PrefixLookup, RuntimeCostEstimate,
+};
+use crate::providers::gcp::GcpMachineCatalogEntry;
 use crate::providers::vast::{
     VastInstance, VastScheduledJob, infer_workload, instance_supports_ssh, job_termination_unix,
     nearest_scheduled_termination_by_instance, remaining_contract_hours_at, runtype_for_workload,
     ssh_args,
 };
 use crate::provision::{
-    apply_vast_autostop_cost_estimate, build_vast_autostop_plan, estimate_runtime_cost,
-    gpu_quality_score, gpu_selector_label, load_gpu_options,
+    apply_vast_autostop_cost_estimate, build_search_requirements, build_vast_autostop_plan,
+    estimate_runtime_cost, load_gpu_options,
 };
 use crate::support::{
     ICE_WORKLOAD_CONTAINER_METADATA_KEY, ICE_WORKLOAD_KIND_METADATA_KEY,
@@ -247,6 +254,218 @@ fn gcp_cost_estimate_rounds_to_second_granularity() {
     let expected_billed = required_runtime_seconds(requested) as f64 / 3600.0;
     assert!((cost.billed_hours - expected_billed).abs() < 1e-9);
     assert!(cost.billed_hours >= requested);
+}
+
+#[test]
+fn gcp_search_requirements_allow_missing_gpu_filter() {
+    let mut config = IceConfig::default();
+    config.default.gcp.min_cpus = Some(1);
+    config.default.gcp.min_ram_gb = Some(1.0);
+    config.default.gcp.max_price_per_hr = Some(0.05);
+
+    let req = build_search_requirements(&config, Cloud::Gcp).expect("gcp requirements");
+    assert!(req.allowed_gpus.is_empty());
+}
+
+#[test]
+fn gcp_create_summary_includes_project_before_region_and_zone() {
+    let mut config = IceConfig::default();
+    config.auth.gcp.project = Some("test-project".to_owned());
+    let candidate = CloudMachineCandidate {
+        machine: "g2-standard-4".to_owned(),
+        vcpus: 4,
+        ram_mb: 16_384,
+        gpus: vec!["L4".to_owned()],
+        hourly_usd: 0.71,
+        region: "us-central1".to_owned(),
+        zone: Some("us-central1-a".to_owned()),
+    };
+    let cost = RuntimeCostEstimate {
+        requested_hours: 1.0,
+        billed_hours: 1.0,
+        hourly_usd: 0.71,
+        total_usd: 0.71,
+    };
+    let req = CreateSearchRequirements {
+        min_cpus: 1,
+        min_ram_gb: 1.0,
+        allowed_gpus: Vec::new(),
+        max_price_per_hr: 1.0,
+    };
+
+    let lines = crate::app::machine_candidate_summary_display_lines(
+        &config,
+        Cloud::Gcp,
+        &candidate,
+        &cost,
+        &req,
+        None,
+    )
+    .expect("summary lines");
+    let project_index = lines
+        .iter()
+        .position(|line| line == "  Project: test-project")
+        .expect("project line");
+    let region_index = lines
+        .iter()
+        .position(|line| line == "  Region: us-central1")
+        .expect("region line");
+    let zone_index = lines
+        .iter()
+        .position(|line| line == "  Zone: us-central1-a")
+        .expect("zone line");
+
+    assert!(project_index < region_index);
+    assert!(project_index < zone_index);
+}
+
+#[test]
+fn aws_search_requirements_allow_missing_gpu_filter() {
+    let mut config = IceConfig::default();
+    config.default.aws.min_cpus = Some(1);
+    config.default.aws.min_ram_gb = Some(1.0);
+    config.default.aws.max_price_per_hr = Some(0.05);
+
+    let req = build_search_requirements(&config, Cloud::Aws).expect("aws requirements");
+    assert!(req.allowed_gpus.is_empty());
+}
+
+#[test]
+fn gcp_catalog_selection_prefers_cpu_only_when_gpu_filter_is_empty() {
+    let req = CreateSearchRequirements {
+        min_cpus: 1,
+        min_ram_gb: 1.0,
+        allowed_gpus: Vec::new(),
+        max_price_per_hr: 1.0,
+    };
+    let catalog = vec![
+        GcpMachineCatalogEntry {
+            machine: "g2-standard-4".to_owned(),
+            zone: "us-central1-a".to_owned(),
+            region: "us-central1".to_owned(),
+            vcpus: 4,
+            billable_vcpus: 4.0,
+            ram_mb: 16_384,
+            accelerators: Vec::new(),
+            bundled_local_ssd_partitions: 0,
+            gpus: vec!["L4".to_owned()],
+            hourly_usd: 0.71,
+        },
+        GcpMachineCatalogEntry {
+            machine: "e2-micro".to_owned(),
+            zone: "us-central1-a".to_owned(),
+            region: "us-central1".to_owned(),
+            vcpus: 2,
+            billable_vcpus: 2.0,
+            ram_mb: 1_024,
+            accelerators: Vec::new(),
+            bundled_local_ssd_partitions: 0,
+            gpus: Vec::new(),
+            hourly_usd: 0.0076,
+        },
+    ];
+
+    let candidate = crate::providers::gcp::select_cheapest_machine_candidate(
+        &catalog,
+        &req,
+        None,
+        Some("us-central1"),
+        Some("us-central1-a"),
+    )
+    .expect("candidate");
+    assert_eq!(candidate.machine, "e2-micro");
+}
+
+#[test]
+fn gcp_catalog_selection_honors_gpu_filter() {
+    let req = CreateSearchRequirements {
+        min_cpus: 1,
+        min_ram_gb: 1.0,
+        allowed_gpus: vec!["L4".to_owned()],
+        max_price_per_hr: 1.0,
+    };
+    let catalog = vec![
+        GcpMachineCatalogEntry {
+            machine: "g2-standard-4".to_owned(),
+            zone: "us-central1-a".to_owned(),
+            region: "us-central1".to_owned(),
+            vcpus: 4,
+            billable_vcpus: 4.0,
+            ram_mb: 16_384,
+            accelerators: Vec::new(),
+            bundled_local_ssd_partitions: 0,
+            gpus: vec!["Nvidia L4".to_owned()],
+            hourly_usd: 0.71,
+        },
+        GcpMachineCatalogEntry {
+            machine: "e2-micro".to_owned(),
+            zone: "us-central1-a".to_owned(),
+            region: "us-central1".to_owned(),
+            vcpus: 2,
+            billable_vcpus: 2.0,
+            ram_mb: 1_024,
+            accelerators: Vec::new(),
+            bundled_local_ssd_partitions: 0,
+            gpus: Vec::new(),
+            hourly_usd: 0.0076,
+        },
+    ];
+
+    let candidate = crate::providers::gcp::select_cheapest_machine_candidate(
+        &catalog,
+        &req,
+        None,
+        Some("us-central1"),
+        Some("us-central1-a"),
+    )
+    .expect("candidate");
+    assert_eq!(candidate.machine, "g2-standard-4");
+}
+
+#[test]
+fn gcp_catalog_selection_treats_614mb_as_point_six_gb() {
+    let req = CreateSearchRequirements {
+        min_cpus: 1,
+        min_ram_gb: 0.6,
+        allowed_gpus: Vec::new(),
+        max_price_per_hr: 1.0,
+    };
+    let catalog = vec![
+        GcpMachineCatalogEntry {
+            machine: "f1-micro".to_owned(),
+            zone: "us-central1-a".to_owned(),
+            region: "us-central1".to_owned(),
+            vcpus: 1,
+            billable_vcpus: 1.0,
+            ram_mb: 614,
+            accelerators: Vec::new(),
+            bundled_local_ssd_partitions: 0,
+            gpus: Vec::new(),
+            hourly_usd: 0.0076,
+        },
+        GcpMachineCatalogEntry {
+            machine: "e2-micro".to_owned(),
+            zone: "us-central1-a".to_owned(),
+            region: "us-central1".to_owned(),
+            vcpus: 2,
+            billable_vcpus: 2.0,
+            ram_mb: 1_024,
+            accelerators: Vec::new(),
+            bundled_local_ssd_partitions: 0,
+            gpus: Vec::new(),
+            hourly_usd: 0.0084,
+        },
+    ];
+
+    let candidate = crate::providers::gcp::select_cheapest_machine_candidate(
+        &catalog,
+        &req,
+        None,
+        Some("us-central1"),
+        Some("us-central1-a"),
+    )
+    .expect("candidate");
+    assert_eq!(candidate.machine, "f1-micro");
 }
 
 #[test]
@@ -656,6 +875,96 @@ fn unset_config_value_clears_values() {
         get_config_value(&config, "auth.aws.access_key_id").expect("access key"),
         "<unset>"
     );
+}
+
+#[test]
+fn config_accepts_fractional_market_ram_filters() {
+    let mut config = IceConfig::default();
+    assert_eq!(
+        set_config_value(&mut config, "default.aws.min_ram_gb", "0.5").expect("aws min ram"),
+        "0.5"
+    );
+    assert_eq!(
+        set_config_value(&mut config, "default.gcp.min_ram_gb", "0.6").expect("gcp min ram"),
+        "0.6"
+    );
+    assert_eq!(
+        get_config_value(&config, "default.aws.min_ram_gb").expect("aws min ram value"),
+        "0.5"
+    );
+    assert_eq!(
+        get_config_value(&config, "default.gcp.min_ram_gb").expect("gcp min ram value"),
+        "0.6"
+    );
+}
+
+#[test]
+fn create_cli_parses_aws_dry_run_flags_without_custom_mode() {
+    let cli = Cli::parse_from([
+        "ice",
+        "create",
+        "--cloud",
+        "aws",
+        "--ssh",
+        "--dry-run",
+        "--hours",
+        "1",
+    ]);
+    let Commands::Create(args) = cli.command else {
+        panic!("expected create command");
+    };
+    assert_eq!(args.cloud, Some(Cloud::Aws));
+    assert!(args.ssh);
+    assert!(args.dry_run);
+    assert!(!args.custom);
+}
+
+#[test]
+fn create_cli_parses_search_override_flags() {
+    let cli = Cli::parse_from([
+        "ice",
+        "create",
+        "--cloud",
+        "gcp",
+        "--ssh",
+        "--dry-run",
+        "--min-cpus",
+        "1",
+        "--min-ram-gb",
+        "0.6",
+        "--no-gpu",
+        "--max-price-per-hr",
+        "1",
+    ]);
+    let Commands::Create(args) = cli.command else {
+        panic!("expected create command");
+    };
+    assert_eq!(args.cloud, Some(Cloud::Gcp));
+    assert_eq!(args.min_cpus, Some(1));
+    assert_eq!(args.min_ram_gb, Some(0.6));
+    assert!(args.no_gpu);
+    assert_eq!(args.max_price_per_hr, Some(1.0));
+}
+
+#[test]
+fn create_cli_parses_repeated_gpu_override_flags() {
+    let cli = Cli::parse_from([
+        "ice",
+        "create",
+        "--cloud",
+        "aws",
+        "--ssh",
+        "--dry-run",
+        "--gpu",
+        "L4",
+        "--gpu",
+        "H100 SXM",
+    ]);
+    let Commands::Create(args) = cli.command else {
+        panic!("expected create command");
+    };
+    assert_eq!(args.gpus, vec!["L4".to_owned(), "H100 SXM".to_owned()]);
+    assert!(!args.no_gpu);
 }
 
 #[test]

@@ -1,8 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
 use anyhow::Result;
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
 use serde::{Deserialize, Serialize};
 
 use crate::cache::{load_cached_list_rows_for, persist_instances, persist_instances_with_context};
@@ -13,7 +12,12 @@ use crate::support::{
     ensure_provider_cli_installed, now_unix_secs, resolve_cloud, visible_instance_name,
 };
 use crate::ui::{
-    Color, RenderTarget, StderrRenderTarget, StdoutRenderTarget, TextEffect, stderr_is_interactive,
+    Color, RenderTarget, StderrRenderTarget, StdoutRenderTarget, TextEffect, print_warning,
+    stderr_is_interactive,
+};
+use capulus::ui::{
+    activate_list_row_spinner, clear_progress_bar, finish_list_row, finish_list_spacer,
+    new_list_row_spinner, new_list_spacer,
 };
 
 const FIELD_SEPARATOR: &str = " · ";
@@ -241,10 +245,10 @@ where
             }
             list.finish_cached_rows_after_remote_error(&rows, &cached_rows);
             list.clear_footer();
-            eprintln!(
-                "Warning: failed to initialize {} provider: {err:#}",
+            print_warning(&format!(
+                "Failed to initialize {} provider: {err:#}",
                 P::CLOUD
-            );
+            ));
             return Ok(());
         }
     };
@@ -259,7 +263,7 @@ where
                 }
                 list.finish_cached_rows_after_remote_error(&rows, &cached_rows);
                 list.clear_footer();
-                eprintln!("Warning: failed to load {} instances: {err:#}", P::CLOUD);
+                print_warning(&format!("Failed to load {} instances: {err:#}", P::CLOUD));
                 return Ok(());
             }
         };
@@ -305,7 +309,10 @@ where
                 finish_remote_rows(&list, &rows, &instances, &empty_list_context);
                 list.finish_missing_cached_rows(&rows, &cached_rows, &seen);
                 list.clear_footer();
-                eprintln!("Warning: failed to load {} detail state: {err:#}", P::CLOUD);
+                print_warning(&format!(
+                    "Failed to load {} detail state: {err:#}",
+                    P::CLOUD
+                ));
                 return Ok(());
             }
         };
@@ -335,7 +342,10 @@ where
                 persist_instances_with_context::<P::CacheModel>(&instances, &resolved);
                 list_context = resolved;
             }
-            Err(err) => eprintln!("Warning: failed to load {} detail state: {err:#}", P::CLOUD),
+            Err(err) => print_warning(&format!(
+                "Failed to load {} detail state: {err:#}",
+                P::CLOUD
+            )),
         }
     }
 
@@ -508,50 +518,15 @@ fn cache_age_text(observed_at_unix: u64) -> String {
     }
 }
 
-fn new_list_row_spinner() -> ProgressBar {
-    let row = ProgressBar::new_spinner();
-    let style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
-        .unwrap_or_else(|_| ProgressStyle::default_spinner())
-        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
-    row.set_style(style);
-    row
-}
-
-fn new_list_spacer() -> ProgressBar {
-    let spacer = ProgressBar::new_spinner();
-    let style =
-        ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_spinner());
-    spacer.set_style(style);
-    spacer
-}
-
-fn activate_list_row_spinner(row: &ProgressBar) {
-    row.enable_steady_tick(Duration::from_millis(90));
-}
-
-fn finish_list_spacer(spacer: &ProgressBar) {
-    spacer.finish_with_message(" ".to_owned());
-}
-
-fn finish_list_row(row: &ProgressBar, message: &str) {
-    let style =
-        ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_spinner());
-    row.set_style(style);
-    row.finish_with_message(message.to_owned());
-}
-
 fn clear_list_spacer(progress: &MultiProgress, spacer: &ProgressBar) {
-    spacer.finish_and_clear();
-    progress.remove(spacer);
+    clear_progress_bar(progress, spacer);
 }
 
 fn clear_list_footer(progress: &MultiProgress, spacer: Option<&ProgressBar>, footer: &ProgressBar) {
     if let Some(spacer) = spacer {
-        spacer.finish_and_clear();
-        progress.remove(spacer);
+        clear_progress_bar(progress, spacer);
     }
-    footer.finish_and_clear();
-    progress.remove(footer);
+    clear_progress_bar(progress, footer);
 }
 
 pub(crate) fn display_name_or_fallback(name: &str, fallback: String) -> String {

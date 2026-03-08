@@ -6,6 +6,7 @@ mod cache;
 mod cli;
 mod commands;
 mod config_store;
+mod gpu;
 mod http_retry;
 mod listing;
 mod local;

@@ -7,6 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use capulus::containers::{ContainerRuntime, DetectionMode};
 use serde_json::Value;
 
 use crate::config_store::ice_root_dir;
@@ -16,7 +17,7 @@ use crate::support::{
     ICE_RUNTIME_SECONDS_LABEL_KEY, ICE_UNPACK_EXIT_CODE_FILE, ICE_UNPACK_LOG_FILE,
     ICE_UNPACK_PID_FILE, ICE_UNPACK_ROOTFS_DIR, ICE_UNPACK_RUN_SCRIPT, ICE_UNPACK_SHELL_SCRIPT,
     ICE_WORKLOAD_CONTAINER_METADATA_KEY, ICE_WORKLOAD_KIND_METADATA_KEY,
-    ICE_WORKLOAD_REGISTRY_METADATA_KEY, ICE_WORKLOAD_SOURCE_METADATA_KEY,
+    ICE_WORKLOAD_REGISTRY_METADATA_KEY, ICE_WORKLOAD_SOURCE_METADATA_KEY, PROVIDER_DIR_NAME,
     build_cloud_instance_name, elapsed_hours_from_rfc3339, now_rfc3339, prefix_lookup_indices,
     required_runtime_seconds, run_command_json, run_command_status, run_command_status_with_stdin,
     run_command_text, shell_quote_single, spinner, truncate_ellipsis, visible_instance_name,
@@ -30,8 +31,7 @@ use crate::workload::{
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LocalContainerRuntime {
-    pub(crate) binary: &'static str,
-    pub(crate) use_sudo: bool,
+    runtime: ContainerRuntime,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -72,25 +72,15 @@ struct LocalUnpackMetadata {
 
 impl LocalContainerRuntime {
     pub(crate) fn command(&self) -> Command {
-        if self.use_sudo {
-            let mut command = Command::new("sudo");
-            command.arg("-n").arg(self.binary);
-            command
-        } else {
-            Command::new(self.binary)
-        }
+        self.runtime.command()
     }
 
-    pub(crate) fn shell_prefix(&self) -> &'static str {
-        if self.use_sudo {
-            match self.binary {
-                "docker" => "sudo -n docker",
-                "podman" => "sudo -n podman",
-                _ => unreachable!(),
-            }
-        } else {
-            self.binary
-        }
+    pub(crate) fn binary(&self) -> &'static str {
+        self.runtime.name()
+    }
+
+    pub(crate) fn shell_prefix(&self) -> String {
+        self.runtime.shell_prefix()
     }
 }
 
@@ -98,7 +88,7 @@ impl LocalContext {
     pub(crate) fn require_runtime(self) -> Result<LocalContainerRuntime> {
         self.runtime.ok_or_else(|| {
             anyhow!(
-                "Missing supported local container runtime. Install `docker` or `podman`, or use `ice deploy --unpack ...`."
+                "Missing supported local container runtime. Install `docker` or `podman`, or use `ice create --unpack ...`."
             )
         })
     }
@@ -152,48 +142,16 @@ pub(crate) fn local_context() -> LocalContext {
 }
 
 pub(crate) fn detect_local_container_runtime() -> Result<LocalContainerRuntime> {
-    for runtime in [
-        LocalContainerRuntime {
-            binary: "docker",
-            use_sudo: false,
-        },
-        LocalContainerRuntime {
-            binary: "podman",
-            use_sudo: false,
-        },
-        LocalContainerRuntime {
-            binary: "docker",
-            use_sudo: true,
-        },
-        LocalContainerRuntime {
-            binary: "podman",
-            use_sudo: true,
-        },
-    ] {
-        if local_container_runtime_available(runtime) {
-            return Ok(runtime);
-        }
-    }
-
-    bail!(
-        "Missing supported local container runtime. Install `docker` or `podman`, or make it usable without an interactive sudo prompt."
-    );
-}
-
-fn local_container_runtime_available(runtime: LocalContainerRuntime) -> bool {
-    let mut command = runtime.command();
-    command.arg("version");
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::null());
-    command.stderr(Stdio::null());
-    command
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    Ok(LocalContainerRuntime {
+        runtime: ContainerRuntime::detect_with_mode(DetectionMode::UserOrSudo)?,
+    })
 }
 
 fn local_unpack_root_dir() -> Result<PathBuf> {
-    Ok(ice_root_dir()?.join("local").join("unpack"))
+    Ok(ice_root_dir()?
+        .join(PROVIDER_DIR_NAME)
+        .join("local")
+        .join("unpack"))
 }
 
 fn local_unpack_instance_dir(name: &str) -> Result<PathBuf> {
@@ -396,14 +354,14 @@ fn load_local_unpack_metadata_from_dir(dir: &Path) -> Result<LocalUnpackMetadata
     let path = dir.join(ICE_LOCAL_UNPACK_METADATA_FILE);
     let content =
         fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
-    serde_json::from_str::<LocalUnpackMetadata>(&content)
+    toml::from_str::<LocalUnpackMetadata>(&content)
         .with_context(|| format!("Failed to parse {}", path.display()))
 }
 
 fn save_local_unpack_metadata_to_dir(dir: &Path, metadata: &LocalUnpackMetadata) -> Result<()> {
     let path = dir.join(ICE_LOCAL_UNPACK_METADATA_FILE);
-    let content = serde_json::to_string_pretty(metadata)
-        .context("Failed to serialize local unpack metadata")?;
+    let content =
+        toml::to_string_pretty(metadata).context("Failed to serialize local unpack metadata")?;
     fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))
 }
 
@@ -473,7 +431,7 @@ pub(crate) fn local_backend_display(context: &LocalContext, instance: &LocalInst
     match instance.backend {
         LocalInstanceBackend::Container => context
             .runtime
-            .map(|runtime| runtime.binary.to_owned())
+            .map(|runtime| runtime.binary().to_owned())
             .unwrap_or_else(|| "container".to_owned()),
         LocalInstanceBackend::Unpack => "host".to_owned(),
     }
@@ -672,7 +630,7 @@ pub(crate) fn local_create_instance(
             local_create_unpack_instance(config, context, hours, source)
         }
         InstanceWorkload::Shell => bail!(
-            "`ice deploy --cloud local` requires `--container`, `--unpack`, or `--arca`; there is no host VM for `--ssh`."
+            "`ice create --cloud local` requires `--container`, `--unpack`, or `--arca`; there is no host VM for `--ssh`."
         ),
     }
 }

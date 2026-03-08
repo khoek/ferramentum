@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
 use anyhow::{Context, Result, anyhow, bail};
 use dialoguer::console::{Key, Term};
@@ -7,123 +7,23 @@ use dialoguer::{Input, Select};
 use serde_json::json;
 
 use crate::config_store::save_config;
+use crate::gpu::{
+    canonicalize_gpu_name, canonicalize_gpu_name_for_cloud, gpu_fp32_tflops, gpu_quality_score,
+    gpu_reference_model, gpu_selector_label, provider_gpu_options,
+};
 use crate::model::{
-    Cloud, CloudMachineCandidate, CreateSearchRequirements, IceConfig, MachineTypeSpec,
-    OfferDecision, RuntimeCostEstimate, VastAutoStopPlan,
+    Cloud, CloudMachineCandidate, CreateSearchRequirements, IceConfig, OfferDecision,
+    RuntimeCostEstimate, VastAutoStopPlan,
 };
-use crate::providers::vast::{VastClient, VastOffer};
+use crate::providers::{aws, gcp, vast::VastClient, vast::VastOffer};
 use crate::support::{
-    KNOWN_VAST_GPU_MODELS, now_unix_secs, prompt_f64, prompt_theme, prompt_u32,
-    require_interactive, required_runtime_seconds, spinner,
+    now_unix_secs, prompt_f64, prompt_theme, prompt_u32, require_interactive,
+    required_runtime_seconds, spinner,
 };
+use crate::ui::print_notice;
 
 const VAST_DEFAULT_DISK_GB: f64 = 32.0;
 const VAST_DEFAULT_SEARCH_LIMIT: u64 = 200;
-
-pub(crate) const GCP_MACHINE_SPECS: &[MachineTypeSpec] = &[
-    MachineTypeSpec {
-        cloud: Cloud::Gcp,
-        machine: "g2-standard-4",
-        vcpus: 4,
-        ram_gb: 16,
-        gpus: &["L4"],
-        hourly_usd: 0.71,
-        regions: &["us-central1", "us-east1", "us-west4", "europe-west4"],
-    },
-    MachineTypeSpec {
-        cloud: Cloud::Gcp,
-        machine: "g2-standard-8",
-        vcpus: 8,
-        ram_gb: 32,
-        gpus: &["L4"],
-        hourly_usd: 1.42,
-        regions: &["us-central1", "us-east1", "us-west4", "europe-west4"],
-    },
-    MachineTypeSpec {
-        cloud: Cloud::Gcp,
-        machine: "a2-highgpu-1g",
-        vcpus: 12,
-        ram_gb: 85,
-        gpus: &["A100 PCIE"],
-        hourly_usd: 2.93,
-        regions: &["us-central1", "us-east1", "us-west4"],
-    },
-    MachineTypeSpec {
-        cloud: Cloud::Gcp,
-        machine: "a3-highgpu-1g",
-        vcpus: 26,
-        ram_gb: 234,
-        gpus: &["H100 SXM"],
-        hourly_usd: 7.20,
-        regions: &["us-central1", "us-east1", "us-west4"],
-    },
-    MachineTypeSpec {
-        cloud: Cloud::Gcp,
-        machine: "n2-standard-8",
-        vcpus: 8,
-        ram_gb: 32,
-        gpus: &[],
-        hourly_usd: 0.38,
-        regions: &["us-central1", "us-east1", "us-west4", "europe-west4"],
-    },
-];
-
-pub(crate) const AWS_MACHINE_SPECS: &[MachineTypeSpec] = &[
-    MachineTypeSpec {
-        cloud: Cloud::Aws,
-        machine: "g4dn.xlarge",
-        vcpus: 4,
-        ram_gb: 16,
-        gpus: &["Tesla T4"],
-        hourly_usd: 0.526,
-        regions: &["us-east-1", "us-west-2", "eu-west-1"],
-    },
-    MachineTypeSpec {
-        cloud: Cloud::Aws,
-        machine: "g5.xlarge",
-        vcpus: 4,
-        ram_gb: 16,
-        gpus: &["A10"],
-        hourly_usd: 1.006,
-        regions: &["us-east-1", "us-west-2", "eu-west-1"],
-    },
-    MachineTypeSpec {
-        cloud: Cloud::Aws,
-        machine: "g6.xlarge",
-        vcpus: 4,
-        ram_gb: 16,
-        gpus: &["L4"],
-        hourly_usd: 0.89,
-        regions: &["us-east-1", "us-west-2"],
-    },
-    MachineTypeSpec {
-        cloud: Cloud::Aws,
-        machine: "p3.2xlarge",
-        vcpus: 8,
-        ram_gb: 61,
-        gpus: &["Tesla V100"],
-        hourly_usd: 3.06,
-        regions: &["us-east-1", "us-west-2"],
-    },
-    MachineTypeSpec {
-        cloud: Cloud::Aws,
-        machine: "p4d.24xlarge",
-        vcpus: 96,
-        ram_gb: 1152,
-        gpus: &["A100 SXM4"],
-        hourly_usd: 32.77,
-        regions: &["us-east-1", "us-west-2"],
-    },
-    MachineTypeSpec {
-        cloud: Cloud::Aws,
-        machine: "c7i.2xlarge",
-        vcpus: 8,
-        ram_gb: 16,
-        gpus: &[],
-        hourly_usd: 0.34,
-        regions: &["us-east-1", "us-west-2", "eu-west-1"],
-    },
-];
 
 fn cloud_search_key_prefix(cloud: Cloud) -> &'static str {
     match cloud {
@@ -139,7 +39,7 @@ fn cloud_search_defaults_mut(
     cloud: Cloud,
 ) -> (
     &mut Option<u32>,
-    &mut Option<u32>,
+    &mut Option<f64>,
     &mut Option<Vec<String>>,
     &mut Option<f64>,
 ) {
@@ -171,7 +71,7 @@ fn cloud_search_defaults(
     cloud: Cloud,
 ) -> (
     &Option<u32>,
-    &Option<u32>,
+    &Option<f64>,
     &Option<Vec<String>>,
     &Option<f64>,
 ) {
@@ -217,17 +117,18 @@ pub(crate) fn ensure_default_create_config(
         }
 
         if min_ram_gb.is_none() {
-            let value = prompt_u32(&format!("Minimum RAM (GB) ({cloud})"), Some(32), 1)?;
+            let value = prompt_f64(&format!("Minimum RAM (GB) ({cloud})"), Some(32.0), 0.001)?;
             *min_ram_gb = Some(value);
             changed = true;
         }
 
-        if allowed_gpus
-            .as_ref()
-            .map(|items| items.is_empty())
-            .unwrap_or(true)
+        if cloud == Cloud::VastAi
+            && allowed_gpus
+                .as_ref()
+                .map(|items| items.is_empty())
+                .unwrap_or(true)
         {
-            let selected = prompt_gpu_checklist(gpu_options, &[])?;
+            let selected = prompt_gpu_checklist(gpu_options, &[], false)?;
             *allowed_gpus = Some(selected);
             changed = true;
         }
@@ -245,7 +146,10 @@ pub(crate) fn ensure_default_create_config(
 
     if changed {
         let path = save_config(config)?;
-        eprintln!("Updated {key_prefix} search defaults in {}", path.display());
+        print_notice(&format!(
+            "Updated {key_prefix} search defaults in {}",
+            path.display()
+        ));
     }
 
     Ok(())
@@ -262,12 +166,19 @@ pub(crate) fn build_search_requirements(
     let min_cpus = (*min_cpus_ref).ok_or_else(|| anyhow!("{key_prefix}.min_cpus is not set"))?;
     let min_ram_gb =
         (*min_ram_gb_ref).ok_or_else(|| anyhow!("{key_prefix}.min_ram_gb is not set"))?;
-    let allowed_gpus = allowed_gpus_ref
-        .clone()
-        .ok_or_else(|| anyhow!("{key_prefix}.allowed_gpus is not set"))?;
-    if allowed_gpus.is_empty() {
-        bail!("{key_prefix}.allowed_gpus cannot be empty");
-    }
+    let allowed_gpus = match cloud {
+        Cloud::VastAi => {
+            let values = allowed_gpus_ref
+                .clone()
+                .ok_or_else(|| anyhow!("{key_prefix}.allowed_gpus is not set"))?;
+            if values.is_empty() {
+                bail!("{key_prefix}.allowed_gpus cannot be empty");
+            }
+            values
+        }
+        Cloud::Gcp | Cloud::Aws => allowed_gpus_ref.clone().unwrap_or_default(),
+        Cloud::Local => Vec::new(),
+    };
 
     let max_price_per_hr = (*max_price_per_hr_ref)
         .ok_or_else(|| anyhow!("{key_prefix}.max_price_per_hr is not set"))?;
@@ -288,7 +199,7 @@ pub(crate) fn find_cheapest_offer(
     excluded_offer_ids: &HashSet<u64>,
 ) -> Result<VastOffer> {
     let duration_seconds = required_runtime_seconds(hours) as f64;
-    let min_ram_mb = (req.min_ram_gb as f64) * 1000.0;
+    let min_ram_mb = req.min_ram_gb * 1000.0;
 
     let allowed_gpus = req
         .allowed_gpus
@@ -480,18 +391,26 @@ pub(crate) fn build_accept_prompt(cost: &RuntimeCostEstimate) -> String {
     }
 }
 
-fn gpu_relative_to_rtx_pro_6000(gpu_model: &str, gpu_count: u32) -> String {
-    let baseline = gpu_fp32_tflops_estimate("RTX PRO 6000 WS");
+fn gpu_relative_to_reference_model(gpu_model: &str, gpu_count: u32) -> String {
+    let Some(reference_model) = gpu_reference_model() else {
+        return String::new();
+    };
+    let Some(baseline) = gpu_fp32_tflops(reference_model) else {
+        return String::new();
+    };
     if !(baseline.is_finite() && baseline > 0.0) {
         return String::new();
     }
 
-    let total = gpu_fp32_tflops_estimate(gpu_model) * f64::from(gpu_count.max(1));
+    let Some(total_per_gpu) = gpu_fp32_tflops(gpu_model) else {
+        return String::new();
+    };
+    let total = total_per_gpu * f64::from(gpu_count.max(1));
     if !(total.is_finite() && total > 0.0) {
         return String::new();
     }
 
-    format!(" (x{:.3} RTX Pro 6000)", total / baseline)
+    format!(" (x{:.3} {})", total / baseline, reference_model)
 }
 
 fn print_two_column_stats(entries: &[(String, String)]) {
@@ -536,7 +455,7 @@ pub(crate) fn print_offer_summary(
     let num_gpus = offer.num_gpus.unwrap_or(1);
     let reliability_pct = offer.reliability.unwrap_or(0.0) * 100.0;
     let duration_hours = offer.duration.unwrap_or(0.0) / 3600.0;
-    let gpu_relative = gpu_relative_to_rtx_pro_6000(gpu, num_gpus);
+    let gpu_relative = gpu_relative_to_reference_model(gpu, num_gpus);
 
     println!();
     println!("Best matching offer:");
@@ -611,57 +530,23 @@ pub(crate) fn prompt_offer_decision(prompt: &str) -> Result<OfferDecision> {
 }
 
 pub(crate) fn prompt_adjust_search_filters(
+    cloud: Cloud,
     req: &mut CreateSearchRequirements,
     gpu_choices: &[String],
 ) -> Result<()> {
-    require_interactive("Filter adjustment requires interactive stdin.")?;
-
-    let options = [
-        "Minimum vCPUs",
-        "Minimum RAM (GB)",
-        "Allowed GPU models",
-        "Max price per hour (USD)",
-        "Back",
-    ];
-    let choice = Select::with_theme(prompt_theme())
-        .with_prompt("Change a filter")
-        .items(options)
-        .default(0)
-        .interact()
-        .context("Failed to read selection")?;
-
-    match options[choice] {
-        "Minimum vCPUs" => {
-            req.min_cpus = prompt_u32("Minimum vCPUs", Some(req.min_cpus), 1)?;
-        }
-        "Minimum RAM (GB)" => {
-            req.min_ram_gb = prompt_u32("Minimum RAM (GB)", Some(req.min_ram_gb), 1)?;
-        }
-        "Allowed GPU models" => {
-            req.allowed_gpus = prompt_gpu_checklist(gpu_choices, &req.allowed_gpus)?;
-        }
-        "Max price per hour (USD)" => {
-            req.max_price_per_hr = prompt_f64(
-                "Max price per hour (USD)",
-                Some(req.max_price_per_hr),
-                0.0001,
-            )?;
-        }
-        "Back" => {}
-        _ => unreachable!(),
-    }
-
-    Ok(())
+    prompt_create_search_filters(cloud, req, gpu_choices)
 }
 
 pub(crate) fn prompt_create_search_filters(
+    cloud: Cloud,
     req: &mut CreateSearchRequirements,
     gpu_choices: &[String],
 ) -> Result<()> {
-    require_interactive("`ice deploy --custom` requires interactive stdin.")?;
+    require_interactive("`ice create --custom` requires interactive stdin.")?;
     req.min_cpus = prompt_u32("Minimum vCPUs", Some(req.min_cpus), 1)?;
-    req.min_ram_gb = prompt_u32("Minimum RAM (GB)", Some(req.min_ram_gb), 1)?;
-    req.allowed_gpus = prompt_gpu_checklist(gpu_choices, &req.allowed_gpus)?;
+    req.min_ram_gb = prompt_f64("Minimum RAM (GB)", Some(req.min_ram_gb), 0.001)?;
+    req.allowed_gpus =
+        prompt_gpu_checklist(gpu_choices, &req.allowed_gpus, cloud != Cloud::VastAi)?;
     req.max_price_per_hr = prompt_f64(
         "Max price per hour (USD)",
         Some(req.max_price_per_hr),
@@ -670,7 +555,11 @@ pub(crate) fn prompt_create_search_filters(
     Ok(())
 }
 
-fn prompt_gpu_checklist(options: &[String], current_values: &[String]) -> Result<Vec<String>> {
+fn prompt_gpu_checklist(
+    options: &[String],
+    current_values: &[String],
+    allow_empty: bool,
+) -> Result<Vec<String>> {
     require_interactive("Interactive GPU checklist requires stdin terminal.")?;
 
     if options.is_empty() {
@@ -827,7 +716,7 @@ fn prompt_gpu_checklist(options: &[String], current_values: &[String]) -> Result
                     .enumerate()
                     .filter_map(|(index, value)| selected_flags[index].then_some(value.clone()))
                     .collect::<Vec<_>>();
-                if selected.is_empty() {
+                if selected.is_empty() && !allow_empty {
                     continue;
                 }
                 selected.sort();
@@ -847,453 +736,42 @@ fn prompt_gpu_checklist(options: &[String], current_values: &[String]) -> Result
 }
 
 pub(crate) fn load_gpu_options(cloud: Cloud, vast_client: Option<&VastClient>) -> Vec<String> {
-    let mut all = BTreeSet::new();
-
-    if cloud == Cloud::VastAi {
-        for value in KNOWN_VAST_GPU_MODELS {
-            all.insert((*value).to_owned());
-        }
-    }
-
-    for spec in all_machine_specs_for_cloud(cloud) {
-        for gpu in spec.gpus {
-            all.insert((*gpu).to_owned());
-        }
-    }
+    let mut all = provider_gpu_options(cloud)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
 
     if cloud == Cloud::VastAi
         && let Some(client) = vast_client
         && let Ok(remote) = client.fetch_gpu_names()
     {
         for gpu in remote {
-            if !gpu.trim().is_empty() {
-                all.insert(gpu.trim().to_owned());
+            let raw = gpu.trim();
+            if raw.is_empty() {
+                continue;
             }
+            all.insert(
+                canonicalize_gpu_name_for_cloud(cloud, raw).unwrap_or_else(|| raw.to_owned()),
+            );
         }
     }
 
     let mut options = all.into_iter().collect::<Vec<_>>();
     options.sort_by(|a, b| {
-        gpu_quality_score(a)
-            .cmp(&gpu_quality_score(b))
+        gpu_fp32_tflops(a)
+            .is_none()
+            .cmp(&gpu_fp32_tflops(b).is_none())
+            .then_with(|| gpu_quality_score(a).cmp(&gpu_quality_score(b)))
             .then_with(|| a.cmp(b))
     });
     options
 }
 
-pub(crate) fn gpu_quality_score(model: &str) -> i64 {
-    (gpu_fp32_tflops_estimate(model) * 1000.0).round() as i64
-}
-
-pub(crate) fn gpu_selector_label(model: &str) -> String {
-    if let Some(vram_gb) = gpu_vram_gb(model) {
-        let rendered = if (vram_gb.fract()).abs() < 1e-9 {
-            format!("{:.0}", vram_gb)
-        } else {
-            format!("{vram_gb:.1}")
-        };
-        format!("{model} ({rendered} GB)")
-    } else {
-        model.to_owned()
-    }
-}
-
-fn gpu_vram_gb(model: &str) -> Option<f64> {
-    let token = normalize_gpu_name_token(model);
-    if let Some(value) = known_gpu_vram_gb_lookup().get(&token) {
-        return Some(*value);
-    }
-    gpu_vram_gb_fallback(&token)
-}
-
-fn known_gpu_vram_gb_lookup() -> &'static HashMap<String, f64> {
-    static LOOKUP: std::sync::LazyLock<HashMap<String, f64>> = std::sync::LazyLock::new(|| {
-        let mut map = HashMap::new();
-        for (model, gb) in [
-            ("A10", 24.0),
-            ("A100 PCIE", 40.0),
-            ("A100 SXM4", 80.0),
-            ("A100X", 80.0),
-            ("A40", 48.0),
-            ("A800 PCIE", 80.0),
-            ("B200", 180.0),
-            ("CMP 50HX", 10.0),
-            ("GTX 1050", 2.0),
-            ("GTX 1050 Ti", 4.0),
-            ("GTX 1060", 6.0),
-            ("GTX 1070", 8.0),
-            ("GTX 1070 Ti", 8.0),
-            ("GTX 1080", 8.0),
-            ("GTX 1080 Ti", 11.0),
-            ("GTX 1650", 4.0),
-            ("GTX 1650 S", 4.0),
-            ("GTX 1660", 6.0),
-            ("GTX 1660 S", 6.0),
-            ("GTX 1660 Ti", 6.0),
-            ("H100 NVL", 94.0),
-            ("H100 PCIE", 80.0),
-            ("H100 SXM", 80.0),
-            ("H200", 141.0),
-            ("H200 NVL", 141.0),
-            ("L4", 24.0),
-            ("L40", 48.0),
-            ("L40S", 48.0),
-            ("Q RTX 4000", 8.0),
-            ("Q RTX 6000", 24.0),
-            ("Q RTX 8000", 48.0),
-            ("Quadro P2000", 5.0),
-            ("Quadro P4000", 8.0),
-            ("Radeon VII", 16.0),
-            ("RTX 2000Ada", 16.0),
-            ("RTX 2060", 6.0),
-            ("RTX 2060S", 8.0),
-            ("RTX 2070", 8.0),
-            ("RTX 2070S", 8.0),
-            ("RTX 2080", 8.0),
-            ("RTX 2080 Ti", 11.0),
-            ("RTX 3050", 8.0),
-            ("RTX 3060", 12.0),
-            ("RTX 3060 laptop", 6.0),
-            ("RTX 3060 Ti", 8.0),
-            ("RTX 3070", 8.0),
-            ("RTX 3070 laptop", 8.0),
-            ("RTX 3070 Ti", 8.0),
-            ("RTX 3080", 10.0),
-            ("RTX 3080 Ti", 12.0),
-            ("RTX 3090", 24.0),
-            ("RTX 3090 Ti", 24.0),
-            ("RTX 4000Ada", 20.0),
-            ("RTX 4060", 8.0),
-            ("RTX 4060 Ti", 16.0),
-            ("RTX 4070", 12.0),
-            ("RTX 4070 laptop", 8.0),
-            ("RTX 4070S", 12.0),
-            ("RTX 4070S Ti", 16.0),
-            ("RTX 4070 Ti", 12.0),
-            ("RTX 4080", 16.0),
-            ("RTX 4080S", 16.0),
-            ("RTX 4090", 24.0),
-            ("RTX 4090D", 24.0),
-            ("RTX 4500Ada", 24.0),
-            ("RTX 5000Ada", 32.0),
-            ("RTX 5060", 8.0),
-            ("RTX 5060 Ti", 16.0),
-            ("RTX 5070", 12.0),
-            ("RTX 5070 Ti", 16.0),
-            ("RTX 5080", 16.0),
-            ("RTX 5090", 32.0),
-            ("RTX 5880Ada", 48.0),
-            ("RTX 6000Ada", 48.0),
-            ("RTX A2000", 12.0),
-            ("RTX A4000", 16.0),
-            ("RTX A4500", 20.0),
-            ("RTX A5000", 24.0),
-            ("RTX A6000", 48.0),
-            ("RTX PRO 4000", 24.0),
-            ("RTX PRO 4500", 32.0),
-            ("RTX PRO 5000", 48.0),
-            ("RTX PRO 6000 S", 96.0),
-            ("RTX PRO 6000 WS", 96.0),
-            ("RX 6950 XT", 16.0),
-            ("Tesla P100", 16.0),
-            ("Tesla P4", 8.0),
-            ("Tesla P40", 24.0),
-            ("Tesla T4", 16.0),
-            ("Tesla V100", 16.0),
-            ("Titan RTX", 24.0),
-            ("Titan V", 12.0),
-            ("Titan Xp", 12.0),
-        ] {
-            map.insert(normalize_gpu_name_token(model), gb);
-        }
-        map
-    });
-    &LOOKUP
-}
-
-fn gpu_vram_gb_fallback(token: &str) -> Option<f64> {
-    if token.contains("b200") {
-        return Some(180.0);
-    }
-    if token.contains("h200") {
-        return Some(141.0);
-    }
-    if token.contains("h100") {
-        return Some(80.0);
-    }
-    if token.contains("a100") {
-        return Some(40.0);
-    }
-    if token.contains("a800") {
-        return Some(80.0);
-    }
-    if token.contains("a40") || token.contains("l40") || token.contains("6000") {
-        return Some(48.0);
-    }
-    if token == "l4" || token.contains("l4") {
-        return Some(24.0);
-    }
-    if token.contains("teslat4") {
-        return Some(16.0);
-    }
-    if token.contains("teslav100") {
-        return Some(16.0);
-    }
-
-    None
-}
-
-fn gpu_fp32_tflops_estimate(model: &str) -> f64 {
-    let token = normalize_gpu_name_token(model);
-    if let Some(value) = known_gpu_fp32_tflops_lookup().get(&token) {
-        return *value;
-    }
-    gpu_fp32_tflops_fallback(&token)
-}
-
-fn known_gpu_fp32_tflops_lookup() -> &'static HashMap<String, f64> {
-    static LOOKUP: std::sync::LazyLock<HashMap<String, f64>> = std::sync::LazyLock::new(|| {
-        let mut map = HashMap::new();
-        for (model, tflops) in [
-            ("A10", 31.2),
-            ("A100 PCIE", 19.5),
-            ("A100 SXM4", 19.5),
-            ("A100X", 19.5),
-            ("A40", 37.4),
-            ("A800 PCIE", 19.5),
-            ("B200", 75.0),
-            ("CMP 50HX", 10.0),
-            ("GTX 1050", 1.8),
-            ("GTX 1050 Ti", 2.1),
-            ("GTX 1060", 4.4),
-            ("GTX 1070", 6.5),
-            ("GTX 1070 Ti", 8.2),
-            ("GTX 1080", 8.9),
-            ("GTX 1080 Ti", 11.3),
-            ("GTX 1650", 3.0),
-            ("GTX 1650 S", 4.4),
-            ("GTX 1660", 5.0),
-            ("GTX 1660 S", 5.0),
-            ("GTX 1660 Ti", 5.4),
-            ("H100 NVL", 60.0),
-            ("H100 PCIE", 51.0),
-            ("H100 SXM", 67.0),
-            ("H200", 67.0),
-            ("H200 NVL", 60.0),
-            ("L4", 30.3),
-            ("L40", 90.5),
-            ("L40S", 91.6),
-            ("Q RTX 4000", 7.1),
-            ("Q RTX 6000", 16.3),
-            ("Q RTX 8000", 16.3),
-            ("Quadro P2000", 3.0),
-            ("Quadro P4000", 5.3),
-            ("Radeon VII", 13.4),
-            ("RTX 2000Ada", 12.0),
-            ("RTX 2060", 6.5),
-            ("RTX 2060S", 7.2),
-            ("RTX 2070", 7.5),
-            ("RTX 2070S", 9.1),
-            ("RTX 2080", 10.1),
-            ("RTX 2080 Ti", 13.4),
-            ("RTX 3050", 9.1),
-            ("RTX 3060", 12.7),
-            ("RTX 3060 laptop", 13.0),
-            ("RTX 3060 Ti", 16.2),
-            ("RTX 3070", 20.3),
-            ("RTX 3070 laptop", 20.3),
-            ("RTX 3070 Ti", 21.8),
-            ("RTX 3080", 29.8),
-            ("RTX 3080 Ti", 34.1),
-            ("RTX 3090", 35.6),
-            ("RTX 3090 Ti", 40.0),
-            ("RTX 4000Ada", 26.7),
-            ("RTX 4060", 15.1),
-            ("RTX 4060 Ti", 22.1),
-            ("RTX 4070", 29.1),
-            ("RTX 4070 laptop", 28.0),
-            ("RTX 4070S", 35.5),
-            ("RTX 4070S Ti", 44.0),
-            ("RTX 4070 Ti", 40.1),
-            ("RTX 4080", 48.7),
-            ("RTX 4080S", 52.2),
-            ("RTX 4090", 82.6),
-            ("RTX 4090D", 73.0),
-            ("RTX 4500Ada", 39.6),
-            ("RTX 5000Ada", 65.3),
-            ("RTX 5060", 19.0),
-            ("RTX 5060 Ti", 24.0),
-            ("RTX 5070", 30.9),
-            ("RTX 5070 Ti", 43.9),
-            ("RTX 5080", 56.3),
-            ("RTX 5090", 104.8),
-            ("RTX 5880Ada", 69.0),
-            ("RTX 6000Ada", 91.1),
-            ("RTX A2000", 8.0),
-            ("RTX A4000", 19.2),
-            ("RTX A4500", 23.7),
-            ("RTX A5000", 27.8),
-            ("RTX A6000", 38.7),
-            ("RTX PRO 4000", 50.0),
-            ("RTX PRO 4500", 70.0),
-            ("RTX PRO 5000", 95.0),
-            ("RTX PRO 6000 S", 125.0),
-            ("RTX PRO 6000 WS", 125.0),
-            ("RX 6950 XT", 23.6),
-            ("Tesla P100", 10.6),
-            ("Tesla P4", 5.5),
-            ("Tesla P40", 12.0),
-            ("Tesla T4", 8.1),
-            ("Tesla V100", 15.7),
-            ("Titan RTX", 16.3),
-            ("Titan V", 13.8),
-            ("Titan Xp", 12.1),
-        ] {
-            map.insert(normalize_gpu_name_token(model), tflops);
-        }
-        map
-    });
-    &LOOKUP
-}
-
-fn gpu_fp32_tflops_fallback(token: &str) -> f64 {
-    if token.contains("b200") {
-        return 75.0;
-    }
-    if token.contains("h200") {
-        return 67.0;
-    }
-    if token.contains("h100") {
-        return 60.0;
-    }
-    if token.contains("a100") || token.contains("a800") {
-        return 19.5;
-    }
-    if token.contains("l40s") {
-        return 91.6;
-    }
-    if token.contains("l40") {
-        return 90.5;
-    }
-    if token == "l4" || token.contains("l4") {
-        return 30.3;
-    }
-    if token.contains("a40") {
-        return 37.4;
-    }
-    if token.contains("a10") {
-        return 31.2;
-    }
-    if token.contains("teslat4") {
-        return 8.1;
-    }
-    if token.contains("teslav100") {
-        return 15.7;
-    }
-
-    if let Some(num) = first_number_in(token) {
-        if token.starts_with("rtxpro") {
-            return 20.0 + (num as f64 / 60.0);
-        }
-        if token.starts_with("rtxa") || token.contains("ada") {
-            return 10.0 + (num as f64 / 100.0);
-        }
-        if token.starts_with("rtx") {
-            return match num {
-                5000..=9999 => 14.0 + ((num - 5000) as f64 / 9.0),
-                4000..=4999 => 12.0 + ((num - 4000) as f64 / 11.0),
-                3000..=3999 => 8.0 + ((num - 3000) as f64 / 11.0),
-                2000..=2999 => 5.0 + ((num - 2000) as f64 / 12.0),
-                _ => 5.0,
-            };
-        }
-        if token.starts_with("gtx") {
-            return match num {
-                1600..=1999 => 3.0 + ((num - 1600) as f64 / 80.0),
-                1000..=1599 => 1.6 + ((num - 1000) as f64 / 90.0),
-                _ => 2.0,
-            };
-        }
-        if token.starts_with("rx") {
-            return 10.0 + (num as f64 / 350.0);
-        }
-        if token.starts_with("quadro") {
-            return 2.0 + (num as f64 / 1000.0);
-        }
-    }
-
-    5.0
-}
-
-fn first_number_in(token: &str) -> Option<i64> {
-    let mut digits = String::new();
-    let mut seen = false;
-    for ch in token.chars() {
-        if ch.is_ascii_digit() {
-            digits.push(ch);
-            seen = true;
-        } else if seen {
-            break;
-        }
-    }
-    if digits.is_empty() {
-        None
-    } else {
-        digits.parse::<i64>().ok()
-    }
-}
-
-pub(crate) fn canonicalize_gpu_name(input: &str) -> Option<String> {
-    let lookup = known_gpu_lookup();
-    let normalized = normalize_gpu_name_token(input);
-    lookup.get(&normalized).cloned()
-}
-
-fn known_gpu_lookup() -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for model in KNOWN_VAST_GPU_MODELS {
-        map.insert(normalize_gpu_name_token(model), (*model).to_owned());
-    }
-    for spec in GCP_MACHINE_SPECS {
-        for gpu in spec.gpus {
-            map.insert(normalize_gpu_name_token(gpu), (*gpu).to_owned());
-        }
-    }
-    for spec in AWS_MACHINE_SPECS {
-        for gpu in spec.gpus {
-            map.insert(normalize_gpu_name_token(gpu), (*gpu).to_owned());
-        }
-    }
-    map
-}
-
-pub(crate) fn normalize_gpu_name_token(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(|ch| {
-            ch.to_ascii_lowercase()
-                .to_string()
-                .chars()
-                .collect::<Vec<_>>()
-        })
-        .collect::<String>()
-}
-
-fn all_machine_specs_for_cloud(cloud: Cloud) -> &'static [MachineTypeSpec] {
-    match cloud {
-        Cloud::VastAi => &[],
-        Cloud::Gcp => GCP_MACHINE_SPECS,
-        Cloud::Aws => AWS_MACHINE_SPECS,
-        Cloud::Local => &[],
-    }
-}
-
 pub(crate) fn estimated_machine_hourly_price(cloud: Cloud, machine: &str) -> Option<f64> {
-    all_machine_specs_for_cloud(cloud)
-        .iter()
-        .find(|spec| spec.machine.eq_ignore_ascii_case(machine))
-        .map(|spec| spec.hourly_usd)
+    match cloud {
+        Cloud::Gcp => gcp::cached_machine_hourly_price(machine),
+        Cloud::Aws => aws::cached_machine_hourly_price(machine),
+        Cloud::VastAi | Cloud::Local => None,
+    }
 }
 
 pub(crate) fn find_cheapest_cloud_machine(
@@ -1302,195 +780,69 @@ pub(crate) fn find_cheapest_cloud_machine(
     req: &CreateSearchRequirements,
     machine_override: Option<&str>,
 ) -> Result<CloudMachineCandidate> {
-    let specs = all_machine_specs_for_cloud(cloud);
-    if specs.is_empty() {
-        bail!("No machine catalog for cloud `{cloud}`");
-    }
-
-    let override_name = machine_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if let Some(name) = override_name
-        && !specs
-            .iter()
-            .any(|spec| spec.machine.eq_ignore_ascii_case(name))
-    {
-        bail!("Unknown machine type `{name}` for cloud `{cloud}`.");
-    }
-
-    let allowed_gpu_set: HashSet<String> = req
-        .allowed_gpus
-        .iter()
-        .filter_map(|gpu| canonicalize_gpu_name(gpu))
-        .map(|gpu| normalize_gpu_name_token(&gpu))
-        .collect();
-
-    let preferred_region = preferred_region_for_cloud(config, cloud);
-
-    let mut candidates = Vec::new();
-    for spec in specs {
-        if spec.cloud != cloud {
-            continue;
-        }
-        if let Some(name) = override_name
-            && !spec.machine.eq_ignore_ascii_case(name)
-        {
-            continue;
-        }
-        if spec.vcpus < req.min_cpus || spec.ram_gb < req.min_ram_gb {
-            continue;
-        }
-
-        if !allowed_gpu_set.is_empty() {
-            let gpu_match = spec.gpus.iter().any(|gpu| {
-                let canonical = canonicalize_gpu_name(gpu).unwrap_or_else(|| (*gpu).to_owned());
-                allowed_gpu_set.contains(&normalize_gpu_name_token(&canonical))
-            });
-            if !gpu_match {
-                continue;
-            }
-        }
-
-        let region = select_region(spec.regions, preferred_region.as_deref())
-            .ok_or_else(|| anyhow!("Machine `{}` has no regions in catalog", spec.machine))?;
-        let zone = if cloud == Cloud::Gcp {
-            Some(select_zone_for_region(config, &region))
-        } else {
-            None
-        };
-        candidates.push(CloudMachineCandidate {
-            machine: spec.machine.to_owned(),
-            vcpus: spec.vcpus,
-            ram_gb: spec.ram_gb,
-            gpus: spec.gpus.iter().map(|value| (*value).to_owned()).collect(),
-            hourly_usd: spec.hourly_usd,
-            region,
-            zone,
-        });
-    }
-
-    if candidates.is_empty() {
-        bail!(
-            "No {} machine type matches filters (min_cpus={}, min_ram_gb={}, allowed_gpus=[{}]){}.",
-            cloud,
-            req.min_cpus,
-            req.min_ram_gb,
-            req.allowed_gpus.join(", "),
-            override_name
-                .map(|name| format!(", machine={name}"))
-                .unwrap_or_default()
-        );
-    }
-
-    candidates.sort_by(|a, b| {
-        let price = a.hourly_usd.total_cmp(&b.hourly_usd);
-        if price != Ordering::Equal {
-            return price;
-        }
-        let region_pref = preferred_region.as_deref().unwrap_or("");
-        let a_pref = a.region.eq_ignore_ascii_case(region_pref);
-        let b_pref = b.region.eq_ignore_ascii_case(region_pref);
-        b_pref.cmp(&a_pref)
-    });
-
-    candidates
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("No candidate machine after sort"))
-}
-
-fn select_region(regions: &[&str], preferred: Option<&str>) -> Option<String> {
-    if regions.is_empty() {
-        return None;
-    }
-
-    if let Some(preferred) = preferred {
-        for region in regions {
-            if region.eq_ignore_ascii_case(preferred) {
-                return Some((*region).to_owned());
-            }
-        }
-    }
-
-    Some(regions[0].to_owned())
-}
-
-fn preferred_region_for_cloud(config: &IceConfig, cloud: Cloud) -> Option<String> {
     match cloud {
-        Cloud::VastAi => None,
-        Cloud::Gcp => config.default.gcp.region.clone().or_else(|| {
-            config
-                .default
-                .gcp
-                .zone
-                .as_deref()
-                .map(region_from_zone_name)
-        }),
-        Cloud::Aws => config.default.aws.region.clone(),
-        Cloud::Local => None,
+        Cloud::Gcp => gcp::find_cheapest_machine_candidate(config, req, machine_override),
+        Cloud::Aws => aws::find_cheapest_machine_candidate(config, req, machine_override),
+        Cloud::VastAi | Cloud::Local => bail!("No machine catalog for cloud `{cloud}`"),
     }
-}
-
-fn select_zone_for_region(config: &IceConfig, region: &str) -> String {
-    if let Some(zone) = config.default.gcp.zone.as_deref() {
-        let zone_name = short_gcp_zone(zone);
-        if region_from_zone_name(&zone_name).eq_ignore_ascii_case(region) {
-            return zone_name;
-        }
-    }
-    format!("{region}-a")
 }
 
 pub(crate) fn short_gcp_zone(zone: &str) -> String {
     zone.rsplit('/').next().unwrap_or(zone).to_owned()
 }
 
-fn region_from_zone_name(zone: &str) -> String {
-    let zone = short_gcp_zone(zone);
-    let mut parts = zone.split('-').collect::<Vec<_>>();
-    if parts.len() >= 3 {
-        parts.pop();
-        parts.join("-")
-    } else {
-        zone
-    }
-}
-
-pub(crate) fn print_machine_candidate_summary(
+pub(crate) fn machine_candidate_summary_lines(
     cloud: Cloud,
     candidate: &CloudMachineCandidate,
     cost: &RuntimeCostEstimate,
     req: &CreateSearchRequirements,
-) {
+    price_note: Option<&str>,
+) -> Vec<String> {
     let gpu = if candidate.gpus.is_empty() {
         "-".to_owned()
     } else {
         candidate.gpus.join(",")
     };
-    println!();
-    println!("Cheapest matching machine:");
-    println!("  Cloud: {cloud}");
-    println!("  Machine: {}", candidate.machine);
-    println!("  Price: ${:.4}/hr", cost.hourly_usd);
-    println!("  Region: {}", candidate.region);
+    let mut lines = vec![
+        "Cheapest matching machine:".to_owned(),
+        format!("  Cloud: {cloud}"),
+        format!("  Machine: {}", candidate.machine),
+        format!(
+            "  Price: ${:.4}/hr{}",
+            cost.hourly_usd,
+            price_note
+                .map(|note| format!(" {note}"))
+                .unwrap_or_default()
+        ),
+        format!("  Region: {}", candidate.region),
+    ];
     if let Some(zone) = candidate.zone.as_deref() {
-        println!("  Zone: {zone}");
+        lines.push(format!("  Zone: {zone}"));
     }
-    println!("  CPU: {} vCPU", candidate.vcpus);
-    println!("  RAM: {} GB", candidate.ram_gb);
-    println!("  GPU: {gpu}");
-    println!("  Requested runtime: {:.3}h", cost.requested_hours);
+    lines.push(format!("  CPU: {} vCPU", candidate.vcpus));
+    lines.push(format!("  RAM: {} GB", format_ram_mb_gb(candidate.ram_mb)));
+    lines.push(format!("  GPU: {gpu}"));
+    lines.push(format!("  Requested runtime: {:.3}h", cost.requested_hours));
     if (cost.billed_hours - cost.requested_hours).abs() > 0.000_001 {
-        println!("  Scheduled runtime: {:.3}h", cost.billed_hours);
+        lines.push(format!("  Scheduled runtime: {:.3}h", cost.billed_hours));
     }
-    println!("  Estimated compute cost: ${:.4}", cost.total_usd);
-    println!(
+    lines.push(format!("  Estimated compute cost: ${:.4}", cost.total_usd));
+    lines.push(format!(
         "  Your filters: min_cpus={} min_ram_gb={} allowed_gpus=[{}] max_price_per_hr=${:.4}/hr required_hours={:.2}",
         req.min_cpus,
         req.min_ram_gb,
         req.allowed_gpus.join(", "),
         req.max_price_per_hr,
         cost.requested_hours
-    );
-    println!();
+    ));
+    lines
+}
+
+fn format_ram_mb_gb(value: u32) -> String {
+    let value = f64::from(value) / 1000.0;
+    if (value.fract()).abs() < 1e-9 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.2}")
+    }
 }

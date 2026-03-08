@@ -9,7 +9,7 @@ use crate::model::{Cloud, DeployTargetRequest};
     name = "ice",
     about = "Manage cloud VM instances and local workload containers.",
     infer_subcommands = true,
-    after_help = "Examples:\n  ice deploy test-crate\n  ice deploy --arca test-crate --hours 0.25\n  ice deploy --unpack arca:test-crate --cloud vast.ai\n  ice deploy --container us-central1-docker.pkg.dev/my-project/arca/my-image:tag --cloud vast.ai\n  ice deploy --ssh --cloud gcp --machine g2-standard-4"
+    after_help = "Examples:\n  ice create test-crate\n  ice create --arca test-crate --hours 0.25\n  ice create --unpack arca:test-crate --cloud vast.ai\n  ice create --container us-central1-docker.pkg.dev/my-project/arca/my-image:tag --cloud vast.ai\n  ice create --ssh --cloud gcp --machine g2-standard-4"
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
@@ -58,16 +58,28 @@ pub(crate) enum Commands {
     Delete(InstanceArgs),
 
     #[command(
-        name = "deploy",
-        about = "Deploy a workload onto the cheapest matching instance, or a managed local container."
+        name = "create",
+        about = "Create the cheapest matching instance for a workload, or a managed local container."
     )]
-    Deploy(DeployArgs),
+    Create(CreateArgs),
+
+    #[command(
+        name = "refresh-catalog",
+        about = "Refresh a locally cached machine/pricing catalog for a cloud provider."
+    )]
+    RefreshCatalog(RefreshCatalogArgs),
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct CloudArgs {
     #[arg(long, value_enum)]
     pub(crate) cloud: Option<Cloud>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct RefreshCatalogArgs {
+    #[arg(long, value_enum, default_value_t = Cloud::Gcp)]
+    pub(crate) cloud: Cloud,
 }
 
 #[derive(Debug, Args)]
@@ -156,10 +168,25 @@ pub(crate) struct InstanceArgs {
 }
 
 #[derive(Debug, Args)]
-pub(crate) struct DeployArgs {
+pub(crate) struct CreateArgs {
     /// Target cloud. Defaults to `default.cloud`.
     #[arg(long, value_enum)]
     pub(crate) cloud: Option<Cloud>,
+    /// Override the minimum vCPU search filter.
+    #[arg(long, value_name = "COUNT")]
+    pub(crate) min_cpus: Option<u32>,
+    /// Override the minimum RAM search filter in GB.
+    #[arg(long, value_name = "GB")]
+    pub(crate) min_ram_gb: Option<f64>,
+    /// Override the allowed GPU filter. Repeat or separate with commas.
+    #[arg(long = "gpu", value_name = "GPU", action = ArgAction::Append, value_delimiter = ',')]
+    pub(crate) gpus: Vec<String>,
+    /// Clear any default GPU filter.
+    #[arg(long, conflicts_with = "gpus")]
+    pub(crate) no_gpu: bool,
+    /// Override the maximum hourly price filter in USD/hr.
+    #[arg(long, value_name = "USD")]
+    pub(crate) max_price_per_hr: Option<f64>,
     /// Runtime duration in hours. Defaults to `default.runtime_hours`, then `1.0`.
     #[arg(long, value_name = "HOURS")]
     pub(crate) hours: Option<f64>,
@@ -191,7 +218,7 @@ pub(crate) struct DeployArgs {
     pub(crate) target: Option<String>,
 }
 
-impl DeployArgs {
+impl CreateArgs {
     pub(crate) fn target_request(&self) -> DeployTargetRequest {
         DeployTargetRequest {
             ssh: self.ssh,

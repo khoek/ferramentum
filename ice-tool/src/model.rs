@@ -33,7 +33,7 @@ impl std::fmt::Display for Cloud {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct IceConfig {
     #[serde(default)]
@@ -42,7 +42,7 @@ pub(crate) struct IceConfig {
     pub(crate) auth: AuthConfig,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DefaultConfig {
     pub(crate) cloud: Option<Cloud>,
@@ -55,20 +55,20 @@ pub(crate) struct DefaultConfig {
     pub(crate) aws: AwsDefaults,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct VastDefaults {
     pub(crate) min_cpus: Option<u32>,
-    pub(crate) min_ram_gb: Option<u32>,
+    pub(crate) min_ram_gb: Option<f64>,
     pub(crate) allowed_gpus: Option<Vec<String>>,
     pub(crate) max_price_per_hr: Option<f64>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GcpDefaults {
     pub(crate) min_cpus: Option<u32>,
-    pub(crate) min_ram_gb: Option<u32>,
+    pub(crate) min_ram_gb: Option<f64>,
     pub(crate) allowed_gpus: Option<Vec<String>>,
     pub(crate) max_price_per_hr: Option<f64>,
     pub(crate) region: Option<String>,
@@ -78,11 +78,11 @@ pub(crate) struct GcpDefaults {
     pub(crate) boot_disk_gb: Option<u32>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AwsDefaults {
     pub(crate) min_cpus: Option<u32>,
-    pub(crate) min_ram_gb: Option<u32>,
+    pub(crate) min_ram_gb: Option<f64>,
     pub(crate) allowed_gpus: Option<Vec<String>>,
     pub(crate) max_price_per_hr: Option<f64>,
     pub(crate) region: Option<String>,
@@ -104,7 +104,7 @@ pub(crate) struct DeployTargetRequest {
     pub(crate) positional: Option<String>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AuthConfig {
     #[serde(default)]
@@ -115,41 +115,30 @@ pub(crate) struct AuthConfig {
     pub(crate) aws: AwsAuth,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct VastAuth {
     pub(crate) api_key: Option<String>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GcpAuth {
     pub(crate) project: Option<String>,
     pub(crate) service_account_json: Option<String>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AwsAuth {
     pub(crate) access_key_id: Option<String>,
     pub(crate) secret_access_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct MachineTypeSpec {
-    pub(crate) cloud: Cloud,
-    pub(crate) machine: &'static str,
-    pub(crate) vcpus: u32,
-    pub(crate) ram_gb: u32,
-    pub(crate) gpus: &'static [&'static str],
-    pub(crate) hourly_usd: f64,
-    pub(crate) regions: &'static [&'static str],
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct CreateSearchRequirements {
     pub(crate) min_cpus: u32,
-    pub(crate) min_ram_gb: u32,
+    pub(crate) min_ram_gb: f64,
     pub(crate) allowed_gpus: Vec<String>,
     pub(crate) max_price_per_hr: f64,
 }
@@ -206,7 +195,7 @@ pub(crate) enum PrefixLookup {
 pub(crate) struct CloudMachineCandidate {
     pub(crate) machine: String,
     pub(crate) vcpus: u32,
-    pub(crate) ram_gb: u32,
+    pub(crate) ram_mb: u32,
     pub(crate) gpus: Vec<String>,
     pub(crate) hourly_usd: f64,
     pub(crate) region: String,

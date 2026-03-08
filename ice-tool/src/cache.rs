@@ -1,14 +1,15 @@
-use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
+use capulus::store::{load_toml_or_default, write_toml_file};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::config_store::ice_root_dir;
 use crate::listing::{CachedListRow, ListedInstance};
 use crate::model::Cloud;
 use crate::providers::CloudInstance;
-use crate::support::{CONFIG_DIR_NAME, now_unix_secs};
+use crate::support::{PROVIDER_DIR_NAME, now_unix_secs};
 
 pub(crate) trait CloudCacheModel {
     type Instance: CloudInstance<ListContext = Self::ListContext>;
@@ -129,10 +130,11 @@ fn cloud_cache_slug(cloud: Cloud) -> &'static str {
 }
 
 fn cloud_cache_path(cloud: Cloud) -> Result<PathBuf> {
-    let home_dir = dirs::home_dir().ok_or_else(|| anyhow!("Failed to determine home directory"))?;
-    Ok(home_dir
-        .join(CONFIG_DIR_NAME)
-        .join(format!("instance-cache-{}.json", cloud_cache_slug(cloud))))
+    let root = ice_root_dir()?;
+    Ok(root
+        .join(PROVIDER_DIR_NAME)
+        .join(cloud_cache_slug(cloud))
+        .join("instance-cache.toml"))
 }
 
 fn load_cloud_cache_or_default<T>(cloud: Cloud) -> T
@@ -142,19 +144,7 @@ where
     let Ok(path) = cloud_cache_path(cloud) else {
         return T::default();
     };
-    if !path.exists() {
-        return T::default();
-    }
-
-    let content = match fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(_) => return T::default(),
-    };
-    if content.trim().is_empty() {
-        return T::default();
-    }
-
-    serde_json::from_str::<T>(&content).unwrap_or_default()
+    load_toml_or_default(&path).unwrap_or_default()
 }
 
 fn save_cloud_cache_best_effort<T>(cloud: Cloud, value: &T)
@@ -164,16 +154,5 @@ where
     let Ok(path) = cloud_cache_path(cloud) else {
         return;
     };
-
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if fs::create_dir_all(parent).is_err() {
-        return;
-    }
-
-    let Ok(content) = serde_json::to_string_pretty(value) else {
-        return;
-    };
-    let _ = fs::write(path, content);
+    let _ = write_toml_file(&path, value, None, None);
 }

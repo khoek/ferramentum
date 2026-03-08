@@ -1,22 +1,22 @@
 use std::collections::HashSet;
-use std::io::{self, IsTerminal, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
-use dialoguer::{Confirm, Input, theme::ColorfulTheme};
+use dialoguer::Input;
+use dialoguer::theme::ColorfulTheme;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use names::{ADJECTIVES as NAMES_ADJECTIVES, Generator, NOUNS as NAMES_NOUNS, Name};
 use reqwest::blocking::Response;
 use serde_json::Value;
 
 use crate::model::{Cloud, IceConfig, PrefixLookup};
-
 pub(crate) const CONFIG_DIR_NAME: &str = ".ice";
+pub(crate) const PROVIDER_DIR_NAME: &str = "provider";
 pub(crate) const CONFIG_FILE_NAME: &str = "config.toml";
 pub(crate) const ICE_LABEL_PREFIX: &str = "ice-";
 pub(crate) const VAST_DEFAULT_IMAGE: &str = "vastai/base-image:@vastai-automatic-tag";
@@ -33,7 +33,7 @@ pub(crate) const ICE_WORKLOAD_SOURCE_METADATA_KEY: &str = "ice-workload-source";
 pub(crate) const ICE_LOCAL_CLOUD_LABEL_KEY: &str = "ice-cloud";
 pub(crate) const ICE_LOCAL_CLOUD_LABEL_VALUE: &str = "local";
 pub(crate) const ICE_RUNTIME_SECONDS_LABEL_KEY: &str = "ice-runtime-seconds";
-pub(crate) const ICE_LOCAL_UNPACK_METADATA_FILE: &str = "instance.json";
+pub(crate) const ICE_LOCAL_UNPACK_METADATA_FILE: &str = "instance.toml";
 pub(crate) const ICE_UNPACK_ROOT_DIR: &str = "~/.ice/unpack";
 pub(crate) const ICE_UNPACK_ROOTFS_DIR: &str = "rootfs";
 pub(crate) const ICE_UNPACK_RUN_SCRIPT: &str = "run.sh";
@@ -49,102 +49,6 @@ pub(crate) const GCP_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/au
 const RANDOM_NAME_COLLISION_RETRIES: usize = 256;
 const NUMBERED_NAME_COLLISION_RETRIES: usize = 2048;
 const NUMBERED_NAME_SUFFIX_MAX: u16 = 9_999;
-
-pub(crate) const KNOWN_VAST_GPU_MODELS: &[&str] = &[
-    "A10",
-    "A100 PCIE",
-    "A100 SXM4",
-    "A100X",
-    "A40",
-    "A800 PCIE",
-    "B200",
-    "CMP 50HX",
-    "GTX 1050",
-    "GTX 1050 Ti",
-    "GTX 1060",
-    "GTX 1070",
-    "GTX 1070 Ti",
-    "GTX 1080",
-    "GTX 1080 Ti",
-    "GTX 1650",
-    "GTX 1650 S",
-    "GTX 1660",
-    "GTX 1660 S",
-    "GTX 1660 Ti",
-    "H100 NVL",
-    "H100 PCIE",
-    "H100 SXM",
-    "H200",
-    "H200 NVL",
-    "L4",
-    "L40",
-    "L40S",
-    "Q RTX 4000",
-    "Q RTX 6000",
-    "Q RTX 8000",
-    "Quadro P2000",
-    "Quadro P4000",
-    "Radeon VII",
-    "RTX 2000Ada",
-    "RTX 2060",
-    "RTX 2060S",
-    "RTX 2070",
-    "RTX 2070S",
-    "RTX 2080",
-    "RTX 2080 Ti",
-    "RTX 3050",
-    "RTX 3060",
-    "RTX 3060 laptop",
-    "RTX 3060 Ti",
-    "RTX 3070",
-    "RTX 3070 laptop",
-    "RTX 3070 Ti",
-    "RTX 3080",
-    "RTX 3080 Ti",
-    "RTX 3090",
-    "RTX 3090 Ti",
-    "RTX 4000Ada",
-    "RTX 4060",
-    "RTX 4060 Ti",
-    "RTX 4070",
-    "RTX 4070 laptop",
-    "RTX 4070S",
-    "RTX 4070S Ti",
-    "RTX 4070 Ti",
-    "RTX 4080",
-    "RTX 4080S",
-    "RTX 4090",
-    "RTX 4090D",
-    "RTX 4500Ada",
-    "RTX 5000Ada",
-    "RTX 5060",
-    "RTX 5060 Ti",
-    "RTX 5070",
-    "RTX 5070 Ti",
-    "RTX 5080",
-    "RTX 5090",
-    "RTX 5880Ada",
-    "RTX 6000Ada",
-    "RTX A2000",
-    "RTX A4000",
-    "RTX A4500",
-    "RTX A5000",
-    "RTX A6000",
-    "RTX PRO 4000",
-    "RTX PRO 4500",
-    "RTX PRO 5000",
-    "RTX PRO 6000 S",
-    "RTX PRO 6000 WS",
-    "RX 6950 XT",
-    "Tesla P100",
-    "Tesla P4",
-    "Tesla P40",
-    "Tesla T4",
-    "Tesla V100",
-    "Titan RTX",
-    "Titan V",
-    "Titan Xp",
-];
 
 const NAMEGEN_ADJECTIVES: &[&str] = &[
     "agile",
@@ -399,17 +303,11 @@ pub(crate) fn resolve_cloud(explicit_cloud: Option<Cloud>, config: &IceConfig) -
 }
 
 pub(crate) fn prompt_theme() -> &'static ColorfulTheme {
-    static THEME: LazyLock<ColorfulTheme> = LazyLock::new(ColorfulTheme::default);
-    &THEME
+    capulus::ui::prompt_theme()
 }
 
 pub(crate) fn prompt_confirm(prompt: &str, default: bool) -> Result<bool> {
-    require_interactive("Interactive confirmation required.")?;
-    Confirm::with_theme(prompt_theme())
-        .with_prompt(prompt)
-        .default(default)
-        .interact()
-        .context("Failed to read confirmation")
+    capulus::ui::prompt_confirm(prompt, default).context("Failed to read confirmation")
 }
 
 pub(crate) fn prompt_u32(prompt: &str, default: Option<u32>, min_value: u32) -> Result<u32> {
@@ -453,51 +351,22 @@ pub(crate) fn ensure_provider_cli_installed(cloud: Cloud) -> Result<()> {
 }
 
 pub(crate) fn ensure_command_available(command: &str) -> Result<()> {
-    if Command::new(command).arg("--version").output().is_ok() {
-        return Ok(());
-    }
-    bail!("Missing required command `{command}` in `PATH`.");
+    capulus::process::ensure_command_available(command)
 }
 
 pub(crate) fn run_command_output(
     command: &mut Command,
     context: &str,
 ) -> Result<std::process::Output> {
-    let output = command
-        .output()
-        .with_context(|| format!("Failed to run command while trying to {context}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let message = if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            format!("exit status {}", output.status)
-        };
-        bail!("Failed to {context}: {message}");
-    }
-    Ok(output)
+    capulus::process::run_output(command, context)
 }
 
 pub(crate) fn run_command_json(command: &mut Command, context: &str) -> Result<Value> {
-    let output = run_command_output(command, context)?;
-    let stdout = String::from_utf8(output.stdout)
-        .with_context(|| format!("Non-UTF8 command output while trying to {context}"))?;
-    serde_json::from_str::<Value>(&stdout).with_context(|| {
-        format!(
-            "Failed to parse JSON output while trying to {context}: {}",
-            truncate_ellipsis(&stdout, 280)
-        )
-    })
+    capulus::process::run_json_value(command, context)
 }
 
 pub(crate) fn run_command_text(command: &mut Command, context: &str) -> Result<String> {
-    let output = run_command_output(command, context)?;
-    let stdout = String::from_utf8(output.stdout)
-        .with_context(|| format!("Non-UTF8 command output while trying to {context}"))?;
-    Ok(stdout.trim().to_owned())
+    capulus::process::run_text(command, context)
 }
 
 pub(crate) fn run_command_status_with_stdin(
@@ -505,32 +374,11 @@ pub(crate) fn run_command_status_with_stdin(
     context: &str,
     stdin_data: &str,
 ) -> Result<()> {
-    command.stdin(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("Failed to run command while trying to {context}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(stdin_data.as_bytes())
-            .with_context(|| format!("Failed to write stdin while trying to {context}"))?;
-    }
-    let status = child
-        .wait()
-        .with_context(|| format!("Failed while waiting for command to {context}"))?;
-    if !status.success() {
-        bail!("Failed to {context}: command exited with status {status}");
-    }
-    Ok(())
+    capulus::process::run_status_with_input(command, context, stdin_data.as_bytes())
 }
 
 pub(crate) fn run_command_status(command: &mut Command, context: &str) -> Result<()> {
-    let status = command
-        .status()
-        .with_context(|| format!("Failed to run command while trying to {context}"))?;
-    if !status.success() {
-        bail!("Failed to {context}: command exited with status {status}");
-    }
-    Ok(())
+    capulus::process::run_status(command, context)
 }
 
 pub(crate) fn required_runtime_seconds(hours: f64) -> u64 {
@@ -736,28 +584,30 @@ pub(crate) fn extract_api_error_message(body: &str) -> String {
 }
 
 pub(crate) fn spinner(message: &str) -> ProgressBar {
-    let progress = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr());
-    let style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
-        .unwrap_or_else(|_| ProgressStyle::default_spinner())
-        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
+    capulus::ui::spinner(message)
+}
+
+pub(crate) fn progress_bar(prefix: &str, message: &str, length: u64) -> ProgressBar {
+    let progress = ProgressBar::with_draw_target(Some(length.max(1)), ProgressDrawTarget::stderr());
+    let style = ProgressStyle::with_template(
+        "{spinner:.cyan} {prefix} {wide_bar:.cyan/blue} {pos}/{len} {msg}",
+    )
+    .unwrap_or_else(|_| ProgressStyle::default_bar())
+    .progress_chars("██ ")
+    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
     progress.set_style(style);
     progress.enable_steady_tick(Duration::from_millis(90));
+    progress.set_prefix(prefix.to_owned());
     progress.set_message(message.to_owned());
     progress
 }
 
 pub(crate) fn require_interactive(message: &str) -> Result<()> {
-    if io::stdin().is_terminal() {
-        return Ok(());
-    }
-    bail!("{message}");
+    capulus::ui::require_interactive(message)
 }
 
 pub(crate) fn maybe_open_browser(url: &str) {
-    if let Err(err) = webbrowser::open(url) {
-        eprintln!("Could not open browser automatically: {err}");
-        eprintln!("Open this URL manually: {url}");
-    }
+    capulus::ui::maybe_open_browser(url)
 }
 
 pub(crate) fn nonempty_string(value: String) -> Option<String> {
@@ -813,21 +663,13 @@ pub(crate) fn truncate_ellipsis(value: &str, max_chars: usize) -> String {
 }
 
 pub(crate) fn shell_quote_single(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_owned();
-    }
-    format!("'{}'", value.replace('\'', "'\\''"))
+    capulus::shell::shell_quote(value)
 }
 
 pub(crate) fn write_temp_file(prefix: &str, suffix: &str, contents: &str) -> Result<PathBuf> {
-    let path = std::env::temp_dir().join(format!(
-        "{prefix}-{}-{}{}",
-        now_unix_secs(),
-        std::process::id(),
-        suffix
-    ));
-    std::fs::write(&path, contents)
-        .with_context(|| format!("Failed to write temporary file: {}", path.display()))?;
+    let path =
+        capulus::temp::create_secure_temp_file(prefix, suffix.trim_start_matches('.'), 0o600)?;
+    capulus::temp::write_bytes(&path, contents.as_bytes(), 0o600)?;
     Ok(path)
 }
 

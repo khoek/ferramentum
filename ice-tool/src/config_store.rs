@@ -1,11 +1,10 @@
-use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::gpu::canonicalize_gpu_name;
 use crate::model::{Cloud, IceConfig};
-use crate::provision::canonicalize_gpu_name;
-use crate::support::{CONFIG_DIR_NAME, CONFIG_FILE_NAME, nonempty_string};
+use crate::support::{CONFIG_FILE_NAME, nonempty_string};
 
 pub(crate) fn parse_key_value_pair(pair: &str) -> Result<(String, String)> {
     let (key, value) = pair.split_once('=').ok_or_else(|| {
@@ -234,7 +233,7 @@ pub(crate) fn set_config_value(config: &mut IceConfig, key: &str, value: &str) -
             Ok(parsed.to_string())
         }
         "default.vast_ai.min_ram_gb" => {
-            let parsed = parse_positive_u32_config_value(&key, value)?;
+            let parsed = parse_positive_f64_config_value(&key, value)?;
             config.default.vast_ai.min_ram_gb = Some(parsed);
             Ok(parsed.to_string())
         }
@@ -256,7 +255,7 @@ pub(crate) fn set_config_value(config: &mut IceConfig, key: &str, value: &str) -
             Ok(parsed.to_string())
         }
         "default.gcp.min_ram_gb" => {
-            let parsed = parse_positive_u32_config_value(&key, value)?;
+            let parsed = parse_positive_f64_config_value(&key, value)?;
             config.default.gcp.min_ram_gb = Some(parsed);
             Ok(parsed.to_string())
         }
@@ -278,7 +277,7 @@ pub(crate) fn set_config_value(config: &mut IceConfig, key: &str, value: &str) -
             Ok(parsed.to_string())
         }
         "default.aws.min_ram_gb" => {
-            let parsed = parse_positive_u32_config_value(&key, value)?;
+            let parsed = parse_positive_f64_config_value(&key, value)?;
             config.default.aws.min_ram_gb = Some(parsed);
             Ok(parsed.to_string())
         }
@@ -523,36 +522,16 @@ fn config_path() -> Result<PathBuf> {
 }
 
 pub(crate) fn ice_root_dir() -> Result<PathBuf> {
-    let home_dir = dirs::home_dir().ok_or_else(|| anyhow!("Failed to determine home directory"))?;
-    Ok(home_dir.join(CONFIG_DIR_NAME))
+    capulus::paths::app_dir("ice")
 }
 
 pub(crate) fn load_config() -> Result<IceConfig> {
-    let path = config_path()?;
-    if !path.exists() {
-        return Ok(IceConfig::default());
-    }
-
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-    if content.trim().is_empty() {
-        return Ok(IceConfig::default());
-    }
-
-    let config: IceConfig = toml::from_str(&content)
-        .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
-    Ok(config)
+    capulus::store::load_toml_or_default(&config_path()?)
 }
 
 pub(crate) fn save_config(config: &IceConfig) -> Result<PathBuf> {
     let path = config_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
-    }
-
-    let content = toml::to_string_pretty(config).context("Failed to serialize config TOML")?;
-    fs::write(&path, content)
+    capulus::store::write_toml_file(&path, config, None, None)
         .with_context(|| format!("Failed to write config file: {}", path.display()))?;
     Ok(path)
 }

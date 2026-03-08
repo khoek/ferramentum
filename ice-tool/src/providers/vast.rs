@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cache::{CloudCacheModel, load_cache_store, persist_instances, upsert_instance};
-use crate::cli::{DeployArgs, DownloadArgs, LogsArgs, ShellArgs};
+use crate::cli::{CreateArgs, DownloadArgs, LogsArgs, ShellArgs};
 use crate::http_retry;
 use crate::listing::{
     ListedInstance, display_name_or_fallback, display_state, list_state_color,
@@ -38,7 +38,7 @@ use crate::support::{
     format_unix_utc, now_unix_secs, now_unix_secs_f64, parse_json_response, prefix_lookup_indices,
     prompt_confirm, spinner, truncate_ellipsis, visible_instance_name,
 };
-use crate::ui::print_stage;
+use crate::ui::{print_stage, print_warning};
 use crate::unpack::{
     materialize_unpack_bundle, remote_unpack_dir_for_vast, unpack_logs_remote_command,
     unpack_prepare_remote_dir_command, unpack_start_remote_command,
@@ -1041,7 +1041,7 @@ impl CommandProvider for Provider {
 }
 
 impl CreateProvider for Provider {
-    fn create(config: &mut IceConfig, args: &DeployArgs) -> Result<()> {
+    fn create(config: &mut IceConfig, args: &CreateArgs) -> Result<()> {
         let client = client_from_config(config)?;
         let gpu_options = load_gpu_options(Cloud::VastAi, Some(&client));
         ensure_default_create_config(config, Cloud::VastAi, &gpu_options)?;
@@ -1052,7 +1052,7 @@ impl CreateProvider for Provider {
 
         let mut search = build_search_requirements(config, Cloud::VastAi)?;
         if args.custom {
-            prompt_create_search_filters(&mut search, &gpu_options)?;
+            prompt_create_search_filters(Cloud::VastAi, &mut search, &gpu_options)?;
         }
 
         let mut rejected_offer_ids = HashSet::new();
@@ -1105,6 +1105,7 @@ impl CreateProvider for Provider {
             match prompt_offer_decision(&build_accept_prompt(&cost))? {
                 crate::model::OfferDecision::ChangeFilter => {
                     prompt_adjust_search_filters(
+                        Cloud::VastAi,
                         &mut search,
                         &load_gpu_options(Cloud::VastAi, Some(&client)),
                     )?;
@@ -1125,7 +1126,10 @@ impl CreateProvider for Provider {
                         Err(err) => {
                             create_spinner.finish_and_clear();
                             rejected_offer_ids.insert(offer.id);
-                            eprintln!("Offer {} acceptance failed: {err:#}", offer.id);
+                            print_warning(&format!(
+                                "Offer {} acceptance failed: {err:#}",
+                                offer.id
+                            ));
                             if !io::stdin().is_terminal() {
                                 return Err(err).with_context(|| {
                                     format!("Failed to create instance from offer {}", offer.id)
@@ -1974,9 +1978,9 @@ where
                 AUTO_KEY_RETRY_DELAY,
             );
             if let Err(err) = client.delete_account_ssh_key(temp_key_id) {
-                eprintln!(
-                    "warning: failed to delete temporary vast.ai account ssh key {temp_key_id}: {err:#}"
-                );
+                print_warning(&format!(
+                    "Failed to delete temporary vast.ai account SSH key {temp_key_id}: {err:#}"
+                ));
             }
             temp_result.with_context(|| {
                 let attach_hint = match attach_status {
