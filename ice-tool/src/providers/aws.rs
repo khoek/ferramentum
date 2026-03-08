@@ -52,9 +52,11 @@ const AWS_DEFAULT_AMI_PARAMETER_X86_64: &str =
 const AWS_DEFAULT_AMI_PARAMETER_ARM64: &str =
     "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64";
 const AWS_LOCAL_CATALOG_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
-const AWS_PRICING_BATCH_SIZE: usize = 32;
+const AWS_PRICING_FILTER_VALUE_MAX_CHARS: usize = 1024;
+const AWS_PRICING_MAX_ATTEMPTS: &str = "10";
 const AWS_PRICE_LIST_REGION: &str = "us-east-1";
 const AWS_REGION_FILTER_LOCATION_TYPE: &str = "AWS Region";
+const AWS_STANDARD_RETRY_MODE: &str = "standard";
 static AWS_LOCAL_CATALOG_STORE_CACHE: LazyLock<Mutex<Option<Arc<AwsMachineCatalogStore>>>> =
     LazyLock::new(|| Mutex::new(None));
 
@@ -582,10 +584,7 @@ fn load_live_prices_for_instance_types(
         return Ok(HashMap::new());
     }
 
-    let batches = instance_types
-        .chunks(AWS_PRICING_BATCH_SIZE)
-        .map(|batch| batch.to_vec())
-        .collect::<Vec<_>>();
+    let batches = build_price_batches(instance_types);
     let progress = progress_bar(
         "Loading pricing:",
         "0 region/type pairs",
@@ -645,6 +644,31 @@ fn load_live_prices_for_instance_types(
             Err(err)
         }
     }
+}
+
+fn build_price_batches(instance_types: &[String]) -> Vec<Vec<String>> {
+    let mut batches = Vec::new();
+    let mut batch = Vec::new();
+    let mut batch_chars = 0_usize;
+
+    for instance_type in instance_types {
+        let separator_chars = usize::from(!batch.is_empty());
+        let next_batch_chars = batch_chars + separator_chars + instance_type.len();
+        if !batch.is_empty() && next_batch_chars > AWS_PRICING_FILTER_VALUE_MAX_CHARS {
+            batches.push(batch);
+            batch = Vec::new();
+            batch_chars = 0;
+        }
+
+        batch_chars += usize::from(!batch.is_empty()) + instance_type.len();
+        batch.push(instance_type.clone());
+    }
+
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+
+    batches
 }
 
 fn build_price_filters(instance_types: &[String]) -> Vec<Value> {
@@ -1824,7 +1848,10 @@ fn command(config: &IceConfig, region: &str) -> Command {
 }
 
 fn pricing_command(config: &IceConfig) -> Command {
-    command(config, AWS_PRICE_LIST_REGION)
+    let mut command = command(config, AWS_PRICE_LIST_REGION);
+    command.env("AWS_MAX_ATTEMPTS", AWS_PRICING_MAX_ATTEMPTS);
+    command.env("AWS_RETRY_MODE", AWS_STANDARD_RETRY_MODE);
+    command
 }
 
 fn preferred_region(config: &IceConfig) -> Result<Option<String>> {
@@ -2235,6 +2262,8 @@ fn lookup_default_ami(config: &IceConfig, region: &str, architecture: &str) -> R
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+
     use super::*;
     use crate::model::CreateSearchRequirements;
 
@@ -2516,5 +2545,45 @@ mod tests {
         .expect("candidate");
         assert_eq!(candidate.machine, "c7i.large");
         assert_eq!(candidate.zone.as_deref(), Some("us-east-1a"));
+    }
+
+    #[test]
+    fn pricing_command_forces_standard_retry_policy() {
+        let command = pricing_command(&IceConfig::default());
+        let envs = command.get_envs().collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            envs.get(OsStr::new("AWS_MAX_ATTEMPTS")),
+            Some(&Some(OsStr::new(AWS_PRICING_MAX_ATTEMPTS)))
+        );
+        assert_eq!(
+            envs.get(OsStr::new("AWS_RETRY_MODE")),
+            Some(&Some(OsStr::new(AWS_STANDARD_RETRY_MODE)))
+        );
+    }
+
+    #[test]
+    fn price_batches_respect_filter_value_limit() {
+        let instance_types = vec![
+            "a".repeat(600),
+            "b".repeat(300),
+            "c".repeat(200),
+            "d".repeat(50),
+        ];
+
+        let batches = build_price_batches(&instance_types);
+
+        assert_eq!(
+            batches,
+            vec![
+                vec!["a".repeat(600), "b".repeat(300)],
+                vec!["c".repeat(200), "d".repeat(50)],
+            ]
+        );
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.join(",").len() <= AWS_PRICING_FILTER_VALUE_MAX_CHARS)
+        );
     }
 }
