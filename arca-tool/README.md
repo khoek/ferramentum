@@ -19,7 +19,7 @@ Requirements:
 
 ```bash
 arca login --repo us-central1-docker.pkg.dev/my-project/arca/my-image
-arca build rust ./my-crate --profile dev --features '' --base-image nvidia/cuda:12.8.1-runtime-ubuntu24.04 --default
+arca build rust ./my-crate --profile dev --features '' --base-image nvidia/cuda:12.8.1-runtime-ubuntu24.04 --set-default
 arca build rust ./my-crate
 arca list
 arca push
@@ -55,7 +55,7 @@ Relevant options:
 - `-F, --features FEATURE[,FEATURE...]`
 - `--bin NAME`
 - `--base-image IMAGE`
-- `--default`
+- `-u, --set-default`
 - `--host-build`
 
 Behavior:
@@ -67,7 +67,7 @@ Behavior:
   from previously saved crate-local defaults in `<crate>/.arca/config.toml`.
 - `--bin` is only required when the crate exposes multiple binaries. Single-binary crates still
   auto-resolve that one binary.
-- `--default` saves the resolved profile, features, binary, and base image into
+- `--set-default` saves the resolved profile, features, binary, and base image into
   `<crate>/.arca/config.toml` for later invocations.
 - After you save defaults once, `arca build rust ./my-crate` reuses them with no extra flags.
 - The default build path is containerized: `arca` derives a cached builder image from the selected
@@ -89,7 +89,7 @@ arca build rust ./my-crate \
   --profile dev \
   --features '' \
   --base-image nvidia/cuda:12.8.1-runtime-ubuntu24.04 \
-  --default
+  --set-default
 ```
 
 Typical later build:

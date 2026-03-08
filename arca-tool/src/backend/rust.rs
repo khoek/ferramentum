@@ -620,7 +620,7 @@ fn resolve_profile(args: &RustArgs, loaded_config: &ProjectConfig) -> Result<Str
         return Ok(profile.to_owned());
     }
     bail!(
-        "Missing cargo profile. Pass `--profile PROFILE`, or rerun once with `--profile PROFILE --default` to save it in `.arca/config.toml`."
+        "Missing cargo profile. Pass `--profile PROFILE`, or rerun once with `--profile PROFILE --set-default` to save it in `.arca/config.toml`."
     )
 }
 
@@ -632,7 +632,7 @@ fn resolve_features(args: &RustArgs, loaded_config: &ProjectConfig) -> Result<Ve
         return Ok(features.clone());
     }
     bail!(
-        "Missing cargo features. Pass `-F/--features`, or rerun once with `-F/--features ... --default` to save them in `.arca/config.toml`. Use `--features ''` to save an empty feature set."
+        "Missing cargo features. Pass `-F/--features`, or rerun once with `-F/--features ... --set-default` to save them in `.arca/config.toml`. Use `--features ''` to save an empty feature set."
     )
 }
 
@@ -651,7 +651,7 @@ fn resolve_binary_name(
         return Ok(binary_targets[0].clone());
     }
     bail!(
-        "Crate exposes multiple binaries. Pass `--bin NAME`, or rerun once with `--bin NAME --default` to save it in `.arca/config.toml`."
+        "Crate exposes multiple binaries. Pass `--bin NAME`, or rerun once with `--bin NAME --set-default` to save it in `.arca/config.toml`."
     )
 }
 
@@ -665,7 +665,7 @@ fn resolve_base_image(args: &RustArgs, loaded_config: &ProjectConfig) -> Result<
             .ok_or_else(|| anyhow!("Runtime base image cannot be empty."));
     }
     bail!(
-        "Missing runtime base image. Pass `--base-image IMAGE`, or rerun once with `--base-image IMAGE --default` to save it in `.arca/config.toml`."
+        "Missing runtime base image. Pass `--base-image IMAGE`, or rerun once with `--base-image IMAGE --set-default` to save it in `.arca/config.toml`."
     )
 }
 

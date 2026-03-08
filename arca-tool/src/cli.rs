@@ -6,7 +6,7 @@ use clap::{ArgAction, ArgGroup, Args, Parser, Subcommand, ValueEnum};
 #[command(
     name = "arca",
     about = "Build and publish containerized crate artifacts.",
-    after_help = "Examples:\n  arca login --repo us-west1-docker.pkg.dev/my-project/arca/my-image\n  arca build rust ./my-crate --profile dev --features '' --base-image nvidia/cuda:12.8.1-runtime-ubuntu24.04 --default\n  arca build rust ./my-crate\n  arca push\n  arca push deadbeef\n  arca list\n  arca prune local --days 7\n  arca prune remote --days 7"
+    after_help = "Examples:\n  arca login --repo us-west1-docker.pkg.dev/my-project/arca/my-image\n  arca build rust ./my-crate --profile dev --features '' --base-image nvidia/cuda:12.8.1-runtime-ubuntu24.04 --set-default\n  arca build rust ./my-crate\n  arca push\n  arca push deadbeef\n  arca list\n  arca prune local --days 7\n  arca prune remote --days 7"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -82,7 +82,7 @@ pub struct RustArgs {
     pub base_image: Option<String>,
 
     /// Save the resolved build settings into `PATH/.arca/config.toml` for future invocations.
-    #[arg(short = 'd', long = "default")]
+    #[arg(short = 'u', long = "set-default")]
     pub save_defaults: bool,
 
     /// Build with local host cargo instead of the default cached builder container.

@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex, mpsc};
@@ -8,11 +6,12 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
+use capulus::gcp::{self, AccessTokenRequest};
 use dialoguer::Input;
 use reqwest::Url;
 use reqwest::blocking::Client;
 use reqwest::header::ACCEPT;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -27,8 +26,7 @@ use crate::ui::{
     detail, maybe_open_browser, prompt_theme, require_interactive, spinner, stage, success,
 };
 
-const ACCESS_TOKEN_CACHE_FILE_NAME: &str = "gcp-access-token.json";
-const ACCESS_TOKEN_CACHE_MAX_AGE_MS: u128 = 45 * 60 * 1_000;
+const ACCESS_TOKEN_CACHE_FILE_NAME: &str = "gcp-access-token.toml";
 
 #[derive(Debug, Clone, Copy)]
 pub enum LoginMethod {
@@ -98,13 +96,6 @@ struct RemoteArtifactCandidate {
     digest_ref: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CachedAccessToken {
-    token: String,
-    fetched_at_epoch_ms: u128,
-    credential_source: String,
-}
-
 #[derive(Debug, Deserialize)]
 struct RegistryManifest {
     config: RegistryManifestConfig,
@@ -134,9 +125,10 @@ pub fn login(
 ) -> Result<LoginOutcome> {
     ensure_command_available("gcloud")?;
 
-    let detected_project = detect_gcp_project(config, !force);
-    let detected_creds_path = detect_gcp_credentials_path(config, !force);
-    let has_active_account = gcp_has_active_account()?;
+    let detected_project = gcp::detect_project(config.auth.gcp.project.as_deref(), !force);
+    let detected_creds_path =
+        gcp::detect_credentials_path(config.auth.gcp.service_account_json.as_deref(), !force);
+    let has_active_account = gcp::has_active_account()?;
 
     let mut changed = false;
     let mut method = LoginMethod::AutoDetected;
@@ -173,7 +165,7 @@ pub fn login(
     if !has_nonempty(config.auth.gcp.project.as_deref()) && repo_override.is_none() {
         require_interactive("`arca login` requires interactive stdin to choose a GCP project.")?;
         method = LoginMethod::Prompted;
-        let project_seed = detect_gcp_project(config, true)
+        let project_seed = gcp::detect_project(config.auth.gcp.project.as_deref(), true)
             .or_else(|| config.auth.gcp.project.clone())
             .unwrap_or_default();
         let project = Input::<String>::with_theme(prompt_theme())
@@ -417,10 +409,10 @@ fn prompt_for_gcp_credentials(config: &mut ArcaConfig, force: bool) -> Result<()
         "Could not auto-detect GCP credentials. Provide a service-account JSON path, or run `gcloud auth login` and retry."
     );
 
-    let project_seed = detect_gcp_project(config, true)
+    let project_seed = gcp::detect_project(config.auth.gcp.project.as_deref(), true)
         .or_else(|| (!force).then(|| config.auth.gcp.project.clone()).flatten())
         .unwrap_or_default();
-    let creds_seed = detect_gcp_credentials_path(config, true)
+    let creds_seed = gcp::detect_credentials_path(config.auth.gcp.service_account_json.as_deref(), true)
         .or_else(|| {
             (!force)
                 .then(|| config.auth.gcp.service_account_json.clone())
@@ -445,7 +437,7 @@ fn prompt_for_gcp_credentials(config: &mut ArcaConfig, force: bool) -> Result<()
     let project = nonempty_string(project)
         .ok_or_else(|| anyhow!("A GCP project ID is required for Google registry publishing."))?;
     let service_account_json = nonempty_string(service_account_json);
-    if service_account_json.is_none() && !gcp_has_active_account()? {
+    if service_account_json.is_none() && !gcp::has_active_account()? {
         bail!(
             "No credentials configured. Provide a service-account JSON path, or run `gcloud auth login` and retry."
         );
@@ -793,82 +785,6 @@ fn split_image_reference(reference: &str) -> Result<(&str, &str, &str)> {
     Ok((host, image_path, tag))
 }
 
-fn detect_gcp_project(config: &ArcaConfig, include_cached: bool) -> Option<String> {
-    if include_cached
-        && let Some(project) = config.auth.gcp.project.as_deref()
-        && !project.trim().is_empty()
-    {
-        return Some(project.trim().to_owned());
-    }
-    for env_key in [
-        "CLOUDSDK_CORE_PROJECT",
-        "GOOGLE_CLOUD_PROJECT",
-        "GCLOUD_PROJECT",
-    ] {
-        if let Ok(value) = std::env::var(env_key) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_owned());
-            }
-        }
-    }
-
-    let mut command = Command::new("gcloud");
-    command.args(["config", "get-value", "project", "--quiet"]);
-    let output = command.output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value = String::from_utf8(output.stdout).ok()?;
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("(unset)") {
-        None
-    } else {
-        Some(trimmed.to_owned())
-    }
-}
-
-fn detect_gcp_credentials_path(config: &ArcaConfig, include_cached: bool) -> Option<String> {
-    let mut candidates = Vec::new();
-    if include_cached && let Some(path) = config.auth.gcp.service_account_json.as_deref() {
-        candidates.push(path.to_owned());
-    }
-    if let Ok(path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
-        && !path.trim().is_empty()
-    {
-        candidates.push(path);
-    }
-    if let Some(home) = dirs::home_dir() {
-        candidates.push(
-            home.join(".config/gcloud/application_default_credentials.json")
-                .display()
-                .to_string(),
-        );
-    }
-
-    candidates
-        .into_iter()
-        .find(|candidate| Path::new(candidate).is_file())
-}
-
-fn gcp_has_active_account() -> Result<bool> {
-    let mut command = Command::new("gcloud");
-    command.args([
-        "auth",
-        "list",
-        "--filter=status:ACTIVE",
-        "--format=value(account)",
-    ]);
-    let output = command
-        .output()
-        .context("Failed to run `gcloud auth list` for credential detection")?;
-    if !output.status.success() {
-        return Ok(false);
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.lines().any(|line| !line.trim().is_empty()))
-}
-
 fn configure_registry_login(
     config: &ArcaConfig,
     runtime: ContainerRuntime,
@@ -883,73 +799,10 @@ fn configure_registry_login(
 }
 
 fn gcp_access_token(config: &ArcaConfig) -> Result<String> {
-    if let Some(token) = load_cached_access_token(config)? {
-        return Ok(token);
-    }
-
-    let mut command = gcloud_command(config);
-    if has_nonempty(config.auth.gcp.service_account_json.as_deref()) {
-        command.args([
-            "auth",
-            "application-default",
-            "print-access-token",
-            "--format=json",
-        ]);
-    } else {
-        command.args(["auth", "print-access-token", "--format=json"]);
-    }
-    let token = run_command_text(&mut command, "obtain a GCP access token")?;
-    let token = serde_json::from_str::<serde_json::Value>(&token)
-        .context("Failed to parse GCP access token JSON")?
-        .get("token")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| anyhow!("GCP access token JSON did not contain a token."))?
-        .to_owned();
-    if token.is_empty() {
-        bail!("GCP access token command returned an empty token.");
-    }
-    save_cached_access_token(config, &token)?;
-    Ok(token)
-}
-
-fn load_cached_access_token(config: &ArcaConfig) -> Result<Option<String>> {
-    let path = access_token_cache_path()?;
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read cached GCP access token: {}", path.display()))?;
-    let cached = serde_json::from_str::<CachedAccessToken>(&content).with_context(|| {
-        format!(
-            "Failed to parse cached GCP access token: {}",
-            path.display()
-        )
-    })?;
-    let age_ms = now_epoch_ms()?.saturating_sub(cached.fetched_at_epoch_ms);
-    if age_ms >= ACCESS_TOKEN_CACHE_MAX_AGE_MS
-        || cached.token.trim().is_empty()
-        || cached.credential_source != access_token_cache_key(config)
-    {
-        return Ok(None);
-    }
-    Ok(Some(cached.token))
-}
-
-fn save_cached_access_token(config: &ArcaConfig, token: &str) -> Result<()> {
-    let path = access_token_cache_path()?;
-    let content = serde_json::to_string(&CachedAccessToken {
-        token: token.to_owned(),
-        fetched_at_epoch_ms: now_epoch_ms()?,
-        credential_source: access_token_cache_key(config),
-    })
-    .context("Failed to serialize cached GCP access token")?;
-    fs::write(&path, content).with_context(|| {
-        format!(
-            "Failed to write cached GCP access token: {}",
-            path.display()
-        )
+    let cache_path = access_token_cache_path()?;
+    gcp::access_token(AccessTokenRequest {
+        configured_credentials_path: config.auth.gcp.service_account_json.as_deref(),
+        cache_path: &cache_path,
     })
 }
 
@@ -957,25 +810,8 @@ fn access_token_cache_path() -> Result<PathBuf> {
     Ok(ensure_cache_root()?.join(ACCESS_TOKEN_CACHE_FILE_NAME))
 }
 
-fn access_token_cache_key(config: &ArcaConfig) -> String {
-    config
-        .auth
-        .gcp
-        .service_account_json
-        .as_deref()
-        .filter(|path| !path.trim().is_empty())
-        .map(|path| format!("adc:{path}"))
-        .unwrap_or_else(|| "gcloud-active-account".to_owned())
-}
-
 fn gcloud_command(config: &ArcaConfig) -> Command {
-    let mut command = Command::new("gcloud");
-    if let Some(path) = config.auth.gcp.service_account_json.as_deref()
-        && !path.trim().is_empty()
-    {
-        command.env("GOOGLE_APPLICATION_CREDENTIALS", path.trim());
-    }
-    command
+    gcp::command(config.auth.gcp.service_account_json.as_deref())
 }
 
 fn normalize_registry_repository(repository: String) -> Result<String> {
@@ -1117,8 +953,9 @@ fn now_epoch_ms() -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RemoteArtifact, RemoteArtifactCandidate, hydrate_candidate_summaries_from_local_artifacts,
-        normalize_registry_repository, registry_host, split_image_reference,
+        ACCESS_TOKEN_CACHE_FILE_NAME, CachedAccessToken, RemoteArtifact, RemoteArtifactCandidate,
+        hydrate_candidate_summaries_from_local_artifacts, normalize_registry_repository,
+        registry_host, split_image_reference,
     };
     use crate::artifact::{ArtifactMetadata, StoredArtifact};
     use std::path::PathBuf;
@@ -1216,5 +1053,28 @@ mod tests {
                 .created_at_epoch_ms,
             1
         );
+    }
+
+    #[test]
+    fn cached_access_token_round_trips_through_toml() {
+        let cached = CachedAccessToken {
+            token: "token".to_owned(),
+            fetched_at_epoch_ms: 42,
+            credential_source: "adc:/tmp/creds.json".to_owned(),
+        };
+
+        let serialized = toml::to_string_pretty(&cached).expect("cache should serialize as TOML");
+        assert!(serialized.contains("token = "));
+
+        let decoded =
+            toml::from_str::<CachedAccessToken>(&serialized).expect("cache should parse as TOML");
+        assert_eq!(decoded.token, cached.token);
+        assert_eq!(decoded.fetched_at_epoch_ms, cached.fetched_at_epoch_ms);
+        assert_eq!(decoded.credential_source, cached.credential_source);
+    }
+
+    #[test]
+    fn access_token_cache_file_uses_toml_extension() {
+        assert_eq!(ACCESS_TOKEN_CACHE_FILE_NAME, "gcp-access-token.toml");
     }
 }

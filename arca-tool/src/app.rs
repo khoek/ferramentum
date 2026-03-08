@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
 
 use crate::artifact::{
     ArtifactSummary, StoredArtifact, load_stored_artifacts, resolve_artifact, save_metadata,
@@ -52,6 +52,7 @@ enum BuilderStatus {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
+    let _instance_lock = capulus::acquire("arca")?;
     match cli.command {
         Commands::Login(args) => cmd_login(args),
         Commands::Build(command) => cmd_build(command),
@@ -458,35 +459,23 @@ fn profile_color(profile: &str) -> Color {
 }
 
 fn new_list_row_spinner() -> ProgressBar {
-    let row = ProgressBar::new_spinner();
-    let style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
-        .unwrap_or_else(|_| ProgressStyle::default_spinner())
-        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
-    row.set_style(style);
-    row
+    capulus::ui::new_list_row_spinner()
 }
 
 fn new_list_spacer() -> ProgressBar {
-    let spacer = ProgressBar::new_spinner();
-    let style =
-        ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_spinner());
-    spacer.set_style(style);
-    spacer
+    capulus::ui::new_list_spacer()
 }
 
 fn activate_list_row_spinner(row: &ProgressBar) {
-    row.enable_steady_tick(std::time::Duration::from_millis(90));
+    capulus::ui::activate_list_row_spinner(row);
 }
 
 fn finish_list_spacer(spacer: &ProgressBar) {
-    spacer.finish_with_message(" ".to_owned());
+    capulus::ui::finish_list_spacer(spacer);
 }
 
 fn finish_list_row(row: &ProgressBar, message: &str) {
-    let style =
-        ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_spinner());
-    row.set_style(style);
-    row.finish_with_message(message.to_owned());
+    capulus::ui::finish_list_row(row, message);
 }
 
 fn render_pending_local_row(artifact: &StoredArtifact, builder_status: BuilderStatus) -> String {
@@ -736,15 +725,12 @@ fn compose_list_row(
 }
 
 fn clear_list_spacer(progress: &MultiProgress, spacer: &ProgressBar) {
-    spacer.finish_and_clear();
-    progress.remove(spacer);
+    capulus::ui::clear_progress_bar(progress, spacer);
 }
 
 fn clear_list_footer(progress: &MultiProgress, spacer: &ProgressBar, footer: &ProgressBar) {
-    spacer.finish_and_clear();
-    footer.finish_and_clear();
-    progress.remove(spacer);
-    progress.remove(footer);
+    capulus::ui::clear_progress_bar(progress, spacer);
+    capulus::ui::clear_progress_bar(progress, footer);
 }
 
 fn render_list_remote_line(remote_line: ListRemoteLine, target: &impl RenderTarget) -> String {
