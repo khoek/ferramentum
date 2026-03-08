@@ -20,7 +20,7 @@ fn main() {
     match run(args) {
         Ok(code) => std::process::exit(code),
         Err(err) => {
-            eprintln!("{err}");
+            capulus::ui::print_error(&err.to_string());
             std::process::exit(1);
         }
     }
@@ -49,6 +49,7 @@ fn init_tracing(level: LogLevel) {
 }
 
 fn run(args: Args) -> Result<i32, AppError> {
+    let _instance_lock = capulus::acquire("ocular")?;
     let mut args = args;
 
     if let Some(payload_path) = args.internal_openconnect_payload.clone() {

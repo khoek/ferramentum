@@ -54,8 +54,17 @@ pub enum AppError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 
+    #[error("{0}")]
+    Lock(#[from] capulus::LockError),
+
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("TOML decode error: {0}")]
+    TomlDe(#[from] toml::de::Error),
+
+    #[error("TOML encode error: {0}")]
+    TomlSer(#[from] toml::ser::Error),
 
     #[error("could not determine home directory ($HOME)")]
     HomeNotFound,

@@ -17,6 +17,8 @@ name = "ocular"
 path = "src/main.rs"
 
 [dependencies]
+capulus = { path = "../../caudex/capulus" }
+
 clap = { version = "4", features = ["derive"] }
 dialoguer = "0.12"
 headless_chrome = "1"
@@ -27,6 +29,8 @@ quick-xml = { version = "0.39", features = ["escape-html"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "cookies", "rustls", "socks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
 thiserror = "2"
 toml = "1"
 tracing = "0.1"

@@ -1,24 +1,4 @@
-pub fn sh_quote(input: &str) -> String {
-    if input.is_empty() {
-        return "''".to_string();
-    }
-
-    if !input.contains('\'') {
-        return format!("'{input}'");
-    }
-
-    let mut out = String::with_capacity(input.len() + 2);
-    out.push('\'');
-    for ch in input.chars() {
-        if ch == '\'' {
-            out.push_str("'\"'\"'");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
-}
+pub use capulus::shell::shell_quote as sh_quote;
 
 #[cfg(test)]
 mod tests {

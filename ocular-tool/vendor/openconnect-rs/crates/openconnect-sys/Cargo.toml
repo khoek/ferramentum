@@ -22,8 +22,8 @@ crate-type = ["lib"]
 bindgen = "0.69.4"
 cc = "1.0.90"
 pkg-config = "0.3.30"
-home = { workspace = true }
-reqwest = { workspace = true }
+home = "0.5.9"
+reqwest = { version = "0.12.2", features = ["multipart", "blocking", "cookies"] }
 zip = "0.6.6"
 
 [package.metadata.docs.rs]

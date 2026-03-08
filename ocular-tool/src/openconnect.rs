@@ -1,22 +1,21 @@
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs;
+use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use openconnect_core::config::{ConfigBuilder, EntrypointBuilder, LogLevel as CoreLogLevel};
 use openconnect_core::events::EventHandlers;
 use openconnect_core::protocols::get_anyconnect_protocol;
 use openconnect_core::result::OpenconnectError;
 use openconnect_core::{Connectable, Status, VpnClient};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
+use sha2::Sha256;
 #[cfg(not(target_os = "windows"))]
 use which::which;
 
@@ -25,7 +24,9 @@ use crate::cli::LogLevel;
 use crate::error::AppError;
 use crate::shell;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+const PRIVILEGED_HANDOFF_FILE_EXTENSION: &str = "toml";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenConnectResult {
     pub exit_code: i32,
     pub auth_failed: bool,
@@ -44,6 +45,12 @@ struct PrivilegedConnectPayload {
     #[serde(default)]
     interactive: bool,
     result_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeerCertHashes {
+    sha1: String,
+    sha256: String,
 }
 
 pub fn run_openconnect(
@@ -85,7 +92,7 @@ pub fn run_openconnect(
 }
 
 pub fn run_privileged_payload(payload_path: &Path, log_level: LogLevel) -> Result<i32, AppError> {
-    let payload = read_json_file::<PrivilegedConnectPayload>(payload_path)?.ok_or_else(|| {
+    let payload = read_toml_file::<PrivilegedConnectPayload>(payload_path)?.ok_or_else(|| {
         AppError::Config("privileged connection payload file was empty".to_string())
     })?;
     cleanup_temp_file(payload_path);
@@ -108,7 +115,7 @@ pub fn run_privileged_payload(payload_path: &Path, log_level: LogLevel) -> Resul
         log_level,
     )?;
 
-    if let Err(err) = write_json_file(&payload.result_path, &result, 0o666) {
+    if let Err(err) = write_toml_file(&payload.result_path, &result, 0o666) {
         tracing::warn!(
             file = %payload.result_path.display(),
             %err,
@@ -245,7 +252,7 @@ fn run_openconnect_local(
         }
         return Ok(OpenConnectResult {
             exit_code: 1,
-            auth_failed: true,
+            auth_failed: false,
             ..OpenConnectResult::default()
         });
     }
@@ -287,8 +294,9 @@ fn run_openconnect_via_elevated_child(
     log_level: LogLevel,
 ) -> Result<OpenConnectResult, AppError> {
     let (program, prefix_args) = privileged_command_prefix()?;
-    let payload_path = create_secure_temp_file("payload", "json", 0o600)?;
-    let result_path = create_secure_temp_file("result", "json", 0o666)?;
+    let payload_path =
+        create_secure_temp_file("payload", PRIVILEGED_HANDOFF_FILE_EXTENSION, 0o600)?;
+    let result_path = create_secure_temp_file("result", PRIVILEGED_HANDOFF_FILE_EXTENSION, 0o666)?;
 
     let payload = PrivilegedConnectPayload {
         host_url: host_url.to_string(),
@@ -300,12 +308,13 @@ fn run_openconnect_via_elevated_child(
         interactive,
         result_path: result_path.clone(),
     };
-    write_json_file(&payload_path, &payload, 0o600)?;
+    write_toml_file(&payload_path, &payload, 0o600)?;
 
     let exe = std::env::current_exe()?;
     tracing::info!(runner = %program, "Delegating VPN connect to privileged helper");
 
     let mut cmd = Command::new(&program);
+    capulus::configure_privileged_child_command(&mut cmd, &program);
     cmd.args(&prefix_args);
     cmd.arg(exe);
     cmd.arg("--internal-openconnect-payload");
@@ -318,7 +327,7 @@ fn run_openconnect_via_elevated_child(
 
     let status = cmd.status()?;
 
-    let mut result = match read_json_file::<OpenConnectResult>(&result_path) {
+    let mut result = match read_toml_file::<OpenConnectResult>(&result_path) {
         Ok(Some(result)) => result,
         Ok(None) => OpenConnectResult {
             exit_code: exit_code(status),
@@ -392,75 +401,21 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
 }
 
 fn create_secure_temp_file(prefix: &str, extension: &str, mode: u32) -> Result<PathBuf, AppError> {
-    let dir = std::env::temp_dir();
-    let pid = std::process::id();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-
-    for attempt in 0..256_u32 {
-        let path = dir.join(format!("ocular-{prefix}-{pid}-{now}-{attempt}.{extension}"));
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            opts.mode(mode);
-        }
-
-        match opts.open(&path) {
-            Ok(_) => {
-                #[cfg(unix)]
-                fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
-                return Ok(path);
-            }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(AppError::Io(err)),
-        }
-    }
-
-    Err(AppError::Io(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "failed to create temporary payload file",
-    )))
+    capulus::temp::create_secure_temp_file(prefix, extension, mode)
+        .map_err(|error| AppError::Io(io::Error::other(error.to_string())))
 }
 
-fn write_json_file<T: Serialize>(path: &Path, value: &T, mode: u32) -> Result<(), AppError> {
-    let raw = serde_json::to_vec(value)?;
-
-    let mut opts = OpenOptions::new();
-    opts.write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        opts.mode(mode);
-    }
-
-    let mut file = opts.open(path)?;
-    file.write_all(&raw)?;
-    file.flush()?;
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    Ok(())
+fn write_toml_file<T: Serialize>(path: &Path, value: &T, mode: u32) -> Result<(), AppError> {
+    capulus::temp::write_toml_file(path, value, mode)
+        .map_err(|error| AppError::Config(error.to_string()))
 }
 
-fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, AppError> {
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let raw = fs::read(path)?;
-    if raw.is_empty() {
-        return Ok(None);
-    }
-
-    let value = serde_json::from_slice(&raw)?;
-    Ok(Some(value))
+fn read_toml_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, AppError> {
+    capulus::temp::read_toml_file(path).map_err(|error| AppError::Config(error.to_string()))
 }
 
 fn cleanup_temp_file(path: &Path) {
-    if let Err(err) = fs::remove_file(path)
-        && err.kind() != io::ErrorKind::NotFound
-    {
+    if let Err(err) = capulus::temp::cleanup_temp_file(path) {
         tracing::debug!(file = %path.display(), %err, "Failed to remove temporary file");
     }
 }
@@ -623,9 +578,7 @@ struct LiveConnectionLine {
 impl LiveConnectionLine {
     fn new() -> Self {
         let pb = ProgressBar::new_spinner();
-        let style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner());
-        pb.set_style(style);
+        pb.set_style(capulus::ui::spinner_style("{spinner:.cyan} {msg}"));
         pb.enable_steady_tick(Duration::from_millis(120));
         pb.set_message("connecting...".to_string());
         Self { pb }
@@ -735,12 +688,59 @@ fn parse_expected_hashes(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(normalize_hash)
+        .map(ToOwned::to_owned)
         .collect()
 }
 
-fn normalize_hash(hash: &str) -> String {
+fn normalize_cert_hash(hash: &str) -> String {
     hash.trim().to_ascii_lowercase()
+}
+
+fn is_hex_hash(hash: &str, len: usize) -> bool {
+    hash.len() == len && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn peer_cert_hashes(client: &VpnClient) -> Option<PeerCertHashes> {
+    let cert_der = match client.get_peer_cert_der() {
+        Ok(cert_der) if !cert_der.is_empty() => cert_der,
+        Ok(_) => {
+            tracing::debug!("Peer certificate DER was empty");
+            return None;
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, "Failed to read peer certificate DER");
+            return None;
+        }
+    };
+
+    Some(PeerCertHashes {
+        sha1: format!("{:x}", Sha1::digest(&cert_der)),
+        sha256: format!("{:x}", Sha256::digest(&cert_der)),
+    })
+}
+
+fn cert_hash_matches(expected: &str, actual_hashes: &PeerCertHashes) -> bool {
+    let expected = expected.trim();
+
+    if let Some((prefix, value)) = expected.split_once(':') {
+        if prefix.eq_ignore_ascii_case("sha1") {
+            return actual_hashes.sha1 == normalize_cert_hash(value);
+        }
+        if prefix.eq_ignore_ascii_case("sha256") {
+            return actual_hashes.sha256 == normalize_cert_hash(value);
+        }
+        return false;
+    }
+
+    if is_hex_hash(expected, 40) {
+        return actual_hashes.sha1 == normalize_cert_hash(expected);
+    }
+
+    if is_hex_hash(expected, 64) {
+        return actual_hashes.sha256 == normalize_cert_hash(expected);
+    }
+
+    false
 }
 
 fn handle_invalid_cert(
@@ -773,8 +773,12 @@ fn handle_invalid_cert(
 }
 
 fn cert_hash_matches_any(client: &VpnClient, expected_hashes: &[String]) -> bool {
-    let actual_hash = normalize_hash(&client.get_peer_cert_hash());
-    expected_hashes.iter().any(|expected| expected == &actual_hash)
+    let Some(actual_hashes) = peer_cert_hashes(client) else {
+        return false;
+    };
+    expected_hashes
+        .iter()
+        .any(|expected| cert_hash_matches(expected, &actual_hashes))
 }
 
 fn is_probably_auth_failure(err: &OpenconnectError) -> bool {
@@ -785,4 +789,98 @@ fn is_probably_auth_failure(err: &OpenconnectError) -> bool {
             | OpenconnectError::MakeCstpError(_)
             | OpenconnectError::MainLoopError(_)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{
+        OpenConnectResult, PRIVILEGED_HANDOFF_FILE_EXTENSION, create_secure_temp_file,
+        read_toml_file, write_toml_file,
+    };
+
+    struct TempFile(PathBuf);
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            super::cleanup_temp_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn privileged_handoff_files_use_toml_extension() {
+        let path = TempFile(
+            create_secure_temp_file("payload-test", PRIVILEGED_HANDOFF_FILE_EXTENSION, 0o600)
+                .expect("create temp file"),
+        );
+        assert_eq!(
+            path.0.extension().and_then(|ext| ext.to_str()),
+            Some("toml")
+        );
+    }
+
+    #[test]
+    fn privileged_handoff_round_trips_toml() {
+        let path = TempFile(
+            create_secure_temp_file("result-test", PRIVILEGED_HANDOFF_FILE_EXTENSION, 0o600)
+                .expect("create temp file"),
+        );
+        let expected = OpenConnectResult {
+            exit_code: 7,
+            auth_failed: true,
+            expires_at_epoch: Some(123),
+            expires_at_text: Some("soon".to_string()),
+        };
+
+        write_toml_file(&path.0, &expected, 0o600).expect("write toml");
+        let raw = std::fs::read_to_string(&path.0).expect("read raw toml");
+        assert!(raw.contains("exit_code = 7"));
+        assert_eq!(
+            read_toml_file::<OpenConnectResult>(&path.0).expect("read toml"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn cert_hash_matches_bare_sha1_fingerprint() {
+        let actual_hashes = super::PeerCertHashes {
+            sha1: "eaae34364443a941bb84402423a9fc7cf8cad01b".to_string(),
+            sha256: "347b48cb944664463954474d440c305bdeb126b469ed5ed2099e68ec7a2bd077".to_string(),
+        };
+        assert_eq!(
+            super::cert_hash_matches("EAAE34364443A941BB84402423A9FC7CF8CAD01B", &actual_hashes),
+            true
+        );
+    }
+
+    #[test]
+    fn cert_hash_matches_prefixed_sha256_fingerprint() {
+        let actual_hashes = super::PeerCertHashes {
+            sha1: "eaae34364443a941bb84402423a9fc7cf8cad01b".to_string(),
+            sha256: "347b48cb944664463954474d440c305bdeb126b469ed5ed2099e68ec7a2bd077".to_string(),
+        };
+        assert_eq!(
+            super::cert_hash_matches(
+                "SHA256:347B48CB944664463954474D440C305BDEB126B469ED5ED2099E68EC7A2BD077",
+                &actual_hashes
+            ),
+            true
+        );
+    }
+
+    #[test]
+    fn cert_hash_does_not_treat_pin_sha256_as_certificate_hash() {
+        let actual_hashes = super::PeerCertHashes {
+            sha1: "eaae34364443a941bb84402423a9fc7cf8cad01b".to_string(),
+            sha256: "347b48cb944664463954474d440c305bdeb126b469ed5ed2099e68ec7a2bd077".to_string(),
+        };
+        assert_eq!(
+            super::cert_hash_matches(
+                "pin-sha256:21qYUjnJqVC9nG3Lt9YkFPejMjUbqK62WwH4FB77v5c=",
+                &actual_hashes
+            ),
+            false
+        );
+    }
 }

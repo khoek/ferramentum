@@ -319,6 +319,22 @@ impl VpnClient {
             .to_string()
     }
 
+    pub fn get_peer_cert_der(&self) -> OpenconnectResult<Vec<u8>> {
+        let mut buf = std::ptr::null_mut();
+        let len = unsafe { openconnect_get_peer_cert_DER(self.vpninfo, &mut buf) };
+        if len <= 0 || buf.is_null() {
+            return Err(OpenconnectError::OtherError(format!(
+                "get peer cert der failed: {len}"
+            )));
+        }
+
+        let cert = unsafe { std::slice::from_raw_parts(buf, len as usize).to_vec() };
+        unsafe {
+            openconnect_free_cert_info(self.vpninfo, buf.cast());
+        }
+        Ok(cert)
+    }
+
     pub fn check_peer_cert_hash(&self, hash: &str) -> OpenconnectResult<bool> {
         let hash = CString::new(hash)
             .map_err(|_| OpenconnectError::OtherError("invalid cert hash".to_string()))?;

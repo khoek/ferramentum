@@ -1,13 +1,13 @@
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use capulus::paths;
+use capulus::store::{load_toml_or_default, write_toml_file};
 use serde::{Deserialize, Serialize};
 
 use crate::anyconnect;
 use crate::error::AppError;
 
-const CONFIG_DIR: &str = ".ocular";
 const CONFIG_FILE: &str = "config.toml";
 
 #[derive(Debug, Clone)]
@@ -19,12 +19,8 @@ pub struct ConfigStore {
 impl ConfigStore {
     pub fn load() -> Result<Self, AppError> {
         let path = config_path()?;
-        let mut cfg = if path.exists() {
-            let raw = fs::read_to_string(&path)?;
-            toml::from_str(&raw).map_err(|e| AppError::Config(e.to_string()))?
-        } else {
-            Config::default()
-        };
+        let mut cfg: Config =
+            load_toml_or_default(&path).map_err(|error| AppError::Config(error.to_string()))?;
         cfg.sort_remotes();
         Ok(Self { path, cfg })
     }
@@ -38,18 +34,9 @@ impl ConfigStore {
     }
 
     pub fn save(&mut self) -> Result<(), AppError> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-            tighten_dir_permissions(parent)?;
-        }
-
         self.cfg.sort_remotes();
-
-        let content =
-            toml::to_string_pretty(&self.cfg).map_err(|e| AppError::Config(e.to_string()))?;
-        atomic_write(&self.path, content.as_bytes())?;
-        tighten_file_permissions(&self.path)?;
-        Ok(())
+        write_toml_file(&self.path, &self.cfg, Some(0o600), Some(0o700))
+            .map_err(|error| AppError::Config(error.to_string()))
     }
 }
 
@@ -225,75 +212,9 @@ pub fn now_epoch() -> i64 {
 }
 
 pub fn app_dir() -> Result<PathBuf, AppError> {
-    let home = home_dir()?;
-    Ok(home.join(CONFIG_DIR))
-}
-
-fn home_dir() -> Result<PathBuf, AppError> {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .ok_or(AppError::HomeNotFound)?;
-    Ok(PathBuf::from(home))
+    paths::app_dir("ocular").map_err(|_| AppError::HomeNotFound)
 }
 
 fn config_path() -> Result<PathBuf, AppError> {
     Ok(app_dir()?.join(CONFIG_FILE))
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
-    let tmp = path.with_extension("toml.new");
-    write_file(&tmp, bytes)?;
-    #[cfg(windows)]
-    {
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-    }
-    fs::rename(tmp, path)?;
-    Ok(())
-}
-
-fn write_file(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(bytes)?;
-        file.flush()?;
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    {
-        fs::write(path, bytes)?;
-        Ok(())
-    }
-}
-
-fn tighten_dir_permissions(dir: &Path) -> Result<(), AppError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o700);
-        let _ = fs::set_permissions(dir, perms);
-    }
-    let _ = dir;
-    Ok(())
-}
-
-fn tighten_file_permissions(path: &Path) -> Result<(), AppError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o600);
-        let _ = fs::set_permissions(path, perms);
-    }
-    let _ = path;
-    Ok(())
 }

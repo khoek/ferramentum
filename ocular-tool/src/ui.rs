@@ -1,19 +1,16 @@
 pub mod interactive {
-    use std::io::IsTerminal;
     use std::time::Duration;
 
-    use dialoguer::{Confirm, Input, Select, theme::ColorfulTheme};
+    use dialoguer::{Confirm, Input, Select};
 
     use crate::cli::{Args, AuthenticateOutputFormat, LogLevel};
     use crate::config;
     use crate::error::AppError;
 
     pub fn run(args: &mut Args, cfg: &config::Config) -> Result<(), AppError> {
-        if !std::io::stdin().is_terminal() {
-            return Err(AppError::InteractiveRequiresTty);
-        }
-
-        let theme = ColorfulTheme::default();
+        capulus::ui::require_interactive("interactive mode requires a TTY")
+            .map_err(|_| AppError::InteractiveRequiresTty)?;
+        let theme = capulus::ui::prompt_theme();
 
         eprintln!("ocular\n");
 
@@ -22,7 +19,7 @@ pub mod interactive {
             && let Some(last) = cfg.last_connect.as_ref()
             && !last.remote_url.trim().is_empty()
         {
-            let quick = Confirm::with_theme(&theme)
+            let quick = Confirm::with_theme(theme)
                 .with_prompt(format!(
                     "Quick connect to {}?",
                     quick_connect_target(&last.remote_url)
@@ -82,7 +79,7 @@ pub mod interactive {
         let selection = if cfg.remotes.is_empty() {
             labels.len().saturating_sub(1)
         } else {
-            Select::with_theme(&theme)
+            Select::with_theme(theme)
                 .with_prompt("Remote")
                 .items(&labels)
                 .default(default_idx)
@@ -91,7 +88,7 @@ pub mod interactive {
 
         if selection == labels.len() - 1 {
             let server_initial = args.server.clone().unwrap_or_default();
-            let server: String = Input::with_theme(&theme)
+            let server: String = Input::with_theme(theme)
                 .with_prompt("VPN server (host[/group] or https://…)")
                 .with_initial_text(server_initial)
                 .validate_with(|input: &String| {
@@ -127,7 +124,7 @@ pub mod interactive {
             Some(AuthenticateOutputFormat::Shell) => 1,
             Some(AuthenticateOutputFormat::Json) => 2,
         };
-        let action_idx = Select::with_theme(&theme)
+        let action_idx = Select::with_theme(theme)
             .with_prompt("Action")
             .items(&action_items)
             .default(action_default)
@@ -139,14 +136,14 @@ pub mod interactive {
             _ => unreachable!(),
         };
 
-        let advanced = Confirm::with_theme(&theme)
+        let advanced = Confirm::with_theme(theme)
             .with_prompt("Advanced options?")
             .default(false)
             .interact()?;
 
         if advanced {
             let proxy_initial = args.proxy.clone().unwrap_or_default();
-            let proxy: String = Input::with_theme(&theme)
+            let proxy: String = Input::with_theme(theme)
                 .with_prompt("Proxy (optional, http:// or socks5://)")
                 .with_initial_text(proxy_initial)
                 .allow_empty(true)
@@ -156,14 +153,14 @@ pub mod interactive {
                 v => Some(v.to_string()),
             };
 
-            let usergroup: String = Input::with_theme(&theme)
+            let usergroup: String = Input::with_theme(theme)
                 .with_prompt("User group override (optional)")
                 .with_initial_text(args.usergroup.clone())
                 .allow_empty(true)
                 .interact_text()?;
             args.usergroup = usergroup.trim().to_string();
 
-            let authgroup: String = Input::with_theme(&theme)
+            let authgroup: String = Input::with_theme(theme)
                 .with_prompt("Auth group (optional)")
                 .with_initial_text(args.authgroup.clone())
                 .allow_empty(true)
@@ -171,7 +168,7 @@ pub mod interactive {
             args.authgroup = authgroup.trim().to_string();
 
             let timeout_initial = args.browser_timeout.as_secs().to_string();
-            let timeout_secs: u64 = Input::with_theme(&theme)
+            let timeout_secs: u64 = Input::with_theme(theme)
                 .with_prompt("Browser timeout (seconds)")
                 .with_initial_text(timeout_initial)
                 .validate_with(|input: &String| {
@@ -185,7 +182,7 @@ pub mod interactive {
                 .unwrap_or(args.browser_timeout.as_secs());
             args.browser_timeout = std::time::Duration::from_secs(timeout_secs);
 
-            let on_disconnect: String = Input::with_theme(&theme)
+            let on_disconnect: String = Input::with_theme(theme)
                 .with_prompt("On disconnect command (optional)")
                 .with_initial_text(args.on_disconnect.clone())
                 .allow_empty(true)
@@ -204,7 +201,7 @@ pub mod interactive {
                 .iter()
                 .position(|(lvl, _)| *lvl == args.log_level)
                 .unwrap_or(1);
-            let idx = Select::with_theme(&theme)
+            let idx = Select::with_theme(theme)
                 .with_prompt("Log level")
                 .items(&log_level_labels)
                 .default(current)
@@ -247,8 +244,7 @@ pub mod status {
 
     impl UiStatus {
         pub fn new(enabled: bool) -> Self {
-            let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
-                .unwrap_or_else(|_| ProgressStyle::default_spinner());
+            let spinner_style = capulus::ui::spinner_style("{spinner:.cyan} {msg}");
             Self {
                 enabled,
                 spinner_style,
