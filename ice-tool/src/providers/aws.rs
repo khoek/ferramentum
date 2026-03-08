@@ -53,7 +53,8 @@ const AWS_DEFAULT_AMI_PARAMETER_ARM64: &str =
     "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64";
 const AWS_LOCAL_CATALOG_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 const AWS_PRICING_FILTER_VALUE_MAX_CHARS: usize = 1024;
-const AWS_PRICING_MAX_ATTEMPTS: &str = "10";
+const AWS_PRICING_MAX_RETRIES: u32 = 10;
+const AWS_PRICING_MAX_ATTEMPTS: u32 = AWS_PRICING_MAX_RETRIES + 1;
 const AWS_PRICE_LIST_REGION: &str = "us-east-1";
 const AWS_REGION_FILTER_LOCATION_TYPE: &str = "AWS Region";
 const AWS_STANDARD_RETRY_MODE: &str = "standard";
@@ -1849,7 +1850,7 @@ fn command(config: &IceConfig, region: &str) -> Command {
 
 fn pricing_command(config: &IceConfig) -> Command {
     let mut command = command(config, AWS_PRICE_LIST_REGION);
-    command.env("AWS_MAX_ATTEMPTS", AWS_PRICING_MAX_ATTEMPTS);
+    command.env("AWS_MAX_ATTEMPTS", AWS_PRICING_MAX_ATTEMPTS.to_string());
     command.env("AWS_RETRY_MODE", AWS_STANDARD_RETRY_MODE);
     command
 }
@@ -2551,10 +2552,11 @@ mod tests {
     fn pricing_command_forces_standard_retry_policy() {
         let command = pricing_command(&IceConfig::default());
         let envs = command.get_envs().collect::<HashMap<_, _>>();
+        let max_attempts = AWS_PRICING_MAX_ATTEMPTS.to_string();
 
         assert_eq!(
             envs.get(OsStr::new("AWS_MAX_ATTEMPTS")),
-            Some(&Some(OsStr::new(AWS_PRICING_MAX_ATTEMPTS)))
+            Some(&Some(OsStr::new(&max_attempts)))
         );
         assert_eq!(
             envs.get(OsStr::new("AWS_RETRY_MODE")),
