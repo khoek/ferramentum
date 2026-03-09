@@ -1,6 +1,6 @@
 [package]
 name = "ocular-tool"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 publish.workspace = true
 description = "CLI bridge for SSO authentication with OpenConnect/AnyConnect VPNs"
@@ -17,7 +17,7 @@ name = "ocular"
 path = "src/main.rs"
 
 [dependencies]
-capulus = { path = "../../caudex/capulus" }
+capulus = { version = "0.1.0", path = "../../caudex/capulus" }
 
 clap = { version = "4", features = ["derive"] }
 dialoguer = "0.12"

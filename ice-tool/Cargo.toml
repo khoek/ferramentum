@@ -19,6 +19,7 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29.0"
+csv = "1"
 dialoguer = "0.12"
 dirs = "6"
 indicatif = "0.18"

@@ -1,6 +1,6 @@
 [package]
 name = "kai-tool"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 publish.workspace = true
 description = "CLI helpers for AI coding workflows, file bundling, and git worktree management."
@@ -15,7 +15,7 @@ name = "kai"
 path = "src/main.rs"
 
 [dependencies]
-capulus = { path = "../../caudex/capulus" }
+capulus = { version = "0.1.0", path = "../../caudex/capulus" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
