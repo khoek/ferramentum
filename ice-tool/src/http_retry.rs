@@ -25,7 +25,7 @@ impl Default for BackoffPolicy {
 }
 
 impl BackoffPolicy {
-    fn delay_for_retry(self, retry_index: u32) -> Duration {
+    pub(crate) fn delay_for_retry(self, retry_index: u32) -> Duration {
         let capped_shift = retry_index.min(20);
         let base_ms = self.initial_delay.as_millis() as u64;
         let max_ms = self.max_delay.as_millis() as u64;
