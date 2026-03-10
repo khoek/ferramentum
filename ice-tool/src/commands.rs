@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::cache::remove_instance;
-use crate::cli::{DownloadArgs, InstanceArgs, LogsArgs, ShellArgs};
+use crate::cli::{InstanceArgs, LogsArgs, PullArgs, PushArgs, ShellArgs};
 use crate::model::{Cloud, IceConfig};
 use crate::providers::{
     CloudInstance, CloudProvider, CommandProvider, RemoteCloudProvider, aws, gcp, local, vast,
@@ -30,12 +30,21 @@ pub(crate) fn cmd_shell(args: ShellArgs, config: &IceConfig) -> Result<()> {
     }
 }
 
-pub(crate) fn cmd_download(args: DownloadArgs, config: &IceConfig) -> Result<()> {
+pub(crate) fn cmd_pull(args: PullArgs, config: &IceConfig) -> Result<()> {
     match resolve_cloud(args.cloud, config)? {
-        Cloud::VastAi => run_download::<vast::Provider>(config, &args),
-        Cloud::Gcp => run_download::<gcp::Provider>(config, &args),
-        Cloud::Aws => run_download::<aws::Provider>(config, &args),
-        Cloud::Local => run_download::<local::Provider>(config, &args),
+        Cloud::VastAi => run_pull::<vast::Provider>(config, &args),
+        Cloud::Gcp => run_pull::<gcp::Provider>(config, &args),
+        Cloud::Aws => run_pull::<aws::Provider>(config, &args),
+        Cloud::Local => run_pull::<local::Provider>(config, &args),
+    }
+}
+
+pub(crate) fn cmd_push(args: PushArgs, config: &IceConfig) -> Result<()> {
+    match resolve_cloud(args.cloud, config)? {
+        Cloud::VastAi => run_push::<vast::Provider>(config, &args),
+        Cloud::Gcp => run_push::<gcp::Provider>(config, &args),
+        Cloud::Aws => run_push::<aws::Provider>(config, &args),
+        Cloud::Local => run_push::<local::Provider>(config, &args),
     }
 }
 
@@ -76,9 +85,14 @@ fn run_shell<P: CommandProvider>(config: &IceConfig, args: &ShellArgs) -> Result
     P::shell(config, args)
 }
 
-fn run_download<P: CommandProvider>(config: &IceConfig, args: &DownloadArgs) -> Result<()> {
+fn run_pull<P: CommandProvider>(config: &IceConfig, args: &PullArgs) -> Result<()> {
     P::ensure_cli()?;
-    P::download(config, args)
+    P::pull(config, args)
+}
+
+fn run_push<P: CommandProvider>(config: &IceConfig, args: &PushArgs) -> Result<()> {
+    P::ensure_cli()?;
+    P::push(config, args)
 }
 
 fn cmd_stop_cloud<P: CloudProvider>(config: &IceConfig, identifier: &str) -> Result<()> {

@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 
 use crate::cache::CloudCacheModel;
-use crate::cli::{CreateArgs, DownloadArgs, LogsArgs, ShellArgs};
+use crate::cli::{CreateArgs, LogsArgs, PullArgs, PushArgs, ShellArgs};
 use crate::listing::ListedInstance;
 use crate::model::{Cloud, CloudMachineCandidate, IceConfig};
 use crate::support::{VAST_WAIT_TIMEOUT_SECS, ensure_provider_cli_installed, prompt_confirm};
@@ -149,7 +149,8 @@ pub(crate) trait CommandProvider: CloudProvider {
 
     fn logs(config: &IceConfig, args: &LogsArgs) -> Result<()>;
     fn shell(config: &IceConfig, args: &ShellArgs) -> Result<()>;
-    fn download(config: &IceConfig, args: &DownloadArgs) -> Result<()>;
+    fn pull(config: &IceConfig, args: &PullArgs) -> Result<()>;
+    fn push(config: &IceConfig, args: &PushArgs) -> Result<()>;
 }
 
 pub(crate) trait CreateProvider: CommandProvider {
@@ -171,11 +172,17 @@ pub(crate) trait RemoteSshProvider: RemoteCloudProvider {
     ) -> Result<()>;
     fn shell_connect_command(config: &IceConfig, instance: &Self::Instance) -> Result<String>;
     fn open_instance_shell(config: &IceConfig, instance: &Self::Instance) -> Result<()>;
-    fn download_from_instance(
+    fn pull_from_instance(
         config: &IceConfig,
         instance: &Self::Instance,
         remote_path: &str,
         local_path: Option<&Path>,
+    ) -> Result<()>;
+    fn push_to_instance(
+        config: &IceConfig,
+        instance: &Self::Instance,
+        local_path: &Path,
+        remote_path: Option<&str>,
     ) -> Result<()>;
     fn upload_unpack_bundle(
         config: &IceConfig,
@@ -289,7 +296,7 @@ impl<T: RemoteSshProvider> CommandProvider for T {
         T::open_instance_shell(config, &instance)
     }
 
-    fn download(config: &IceConfig, args: &DownloadArgs) -> Result<()> {
+    fn pull(config: &IceConfig, args: &PullArgs) -> Result<()> {
         let context = T::context(config)?;
         let instance = T::resolve_instance(&context, &args.instance)?;
         if !instance.is_running() {
@@ -299,11 +306,32 @@ impl<T: RemoteSshProvider> CommandProvider for T {
                 instance.state_value()
             );
         }
-        T::download_from_instance(
+        T::pull_from_instance(
             config,
             &instance,
             &args.remote_path,
             args.local_path.as_deref(),
+        )
+    }
+
+    fn push(config: &IceConfig, args: &PushArgs) -> Result<()> {
+        if !args.local_path.exists() {
+            bail!("Local path `{}` does not exist.", args.local_path.display());
+        }
+        let context = T::context(config)?;
+        let instance = T::resolve_instance(&context, &args.instance)?;
+        if !instance.is_running() {
+            bail!(
+                "Instance `{}` is not running (state: {}).",
+                instance.display_name(),
+                instance.state_value()
+            );
+        }
+        T::push_to_instance(
+            config,
+            &instance,
+            args.local_path.as_path(),
+            args.remote_path.as_deref(),
         )
     }
 }

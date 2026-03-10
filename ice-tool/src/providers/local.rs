@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 
-use crate::cli::{CreateArgs, DownloadArgs, LogsArgs, ShellArgs};
+use crate::cli::{CreateArgs, LogsArgs, PullArgs, PushArgs, ShellArgs};
 use crate::listing::{
     ListedInstance, display_name_or_fallback, display_state, list_state_color, listed_instance,
     present_field, push_field, show_health_field,
@@ -10,8 +10,8 @@ use crate::listing::{
 use crate::local::{
     LocalContext, LocalInstance, local_backend_display, local_context, local_delete_instance,
     local_describe_instance, local_download, local_list_instances, local_open_shell,
-    local_start_instance, local_stop_instance, local_stream_logs, local_workload_display,
-    resolve_local_instance,
+    local_start_instance, local_stop_instance, local_stream_logs, local_upload,
+    local_workload_display, resolve_local_instance,
 };
 use crate::model::{Cloud, IceConfig};
 use crate::providers::{CloudInstance, CloudProvider, CommandProvider, CreateProvider};
@@ -184,7 +184,7 @@ impl CommandProvider for Provider {
         local_open_shell(&context, &instance)
     }
 
-    fn download(config: &IceConfig, args: &DownloadArgs) -> Result<()> {
+    fn pull(config: &IceConfig, args: &PullArgs) -> Result<()> {
         let _ = config;
         let context = local_context();
         let instance = resolve_local_instance(&context, &args.instance)?;
@@ -193,6 +193,21 @@ impl CommandProvider for Provider {
             &instance,
             &args.remote_path,
             args.local_path.as_deref(),
+        )
+    }
+
+    fn push(config: &IceConfig, args: &PushArgs) -> Result<()> {
+        let _ = config;
+        if !args.local_path.exists() {
+            bail!("Local path `{}` does not exist.", args.local_path.display());
+        }
+        let context = local_context();
+        let instance = resolve_local_instance(&context, &args.instance)?;
+        local_upload(
+            &context,
+            &instance,
+            args.local_path.as_path(),
+            args.remote_path.as_deref(),
         )
     }
 }

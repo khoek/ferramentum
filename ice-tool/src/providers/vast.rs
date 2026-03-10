@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cache::{CloudCacheModel, load_cache_store, persist_instances, upsert_instance};
-use crate::cli::{CreateArgs, DownloadArgs, LogsArgs, ShellArgs};
+use crate::cli::{CreateArgs, LogsArgs, PullArgs, PushArgs, ShellArgs};
 use crate::gpu::runtime_provider_data_path;
 use crate::http_retry;
 use crate::listing::{
@@ -31,6 +31,7 @@ use crate::provision::{
 };
 use crate::remote::{
     RemoteAccess, discover_local_ssh_keypair, run_rsync_download, run_rsync_upload,
+    run_rsync_upload_path,
 };
 use crate::support::{
     ICE_LABEL_PREFIX, VAST_DEFAULT_DISK_GB, VAST_DEFAULT_IMAGE,
@@ -1023,7 +1024,7 @@ impl CommandProvider for Provider {
         }
     }
 
-    fn download(config: &IceConfig, args: &DownloadArgs) -> Result<()> {
+    fn pull(config: &IceConfig, args: &PullArgs) -> Result<()> {
         let client = client_from_config(config)?;
         let instance = resolve_instance(&client, &args.instance)?;
         if !instance.is_running() {
@@ -1045,6 +1046,34 @@ impl CommandProvider for Provider {
             &instance,
             &args.remote_path,
             args.local_path.as_deref(),
+        )
+    }
+
+    fn push(config: &IceConfig, args: &PushArgs) -> Result<()> {
+        let client = client_from_config(config)?;
+        let instance = resolve_instance(&client, &args.instance)?;
+        if !instance.is_running() {
+            bail!(
+                "Instance `{}` is not running (state: {}).",
+                instance.id,
+                instance.state_str()
+            );
+        }
+        if !instance_supports_ssh(&instance) {
+            bail!(
+                concat!(
+                    "Instance `{}` is a Vast entrypoint workload. Uploading files requires SSH ",
+                    "access, which Vast does not provide for entrypoint-mode containers."
+                ),
+                instance.id
+            );
+        }
+        ensure_instance_has_ssh(&instance)?;
+        run_upload_with_auto_key(
+            &client,
+            &instance,
+            args.local_path.as_path(),
+            args.remote_path.as_deref(),
         )
     }
 }
@@ -1566,6 +1595,28 @@ pub(crate) fn run_download_with_auto_key(
             remote_path,
             local_path,
             &format!("download from vast.ai instance {}", instance.id),
+        )
+    })
+}
+
+pub(crate) fn run_upload_with_auto_key(
+    client: &VastClient,
+    instance: &VastInstance,
+    local_path: &Path,
+    remote_path: Option<&str>,
+) -> Result<()> {
+    let (host, port) = ssh_target(instance)?;
+    with_auto_key(client, instance, |identity| {
+        run_rsync_upload_path(
+            RemoteAccess {
+                user: "root",
+                host: &host,
+                port: Some(port),
+                identity_file: identity,
+            },
+            local_path,
+            remote_path,
+            &format!("upload to vast.ai instance {}", instance.id),
         )
     })
 }

@@ -43,10 +43,16 @@ pub(crate) enum Commands {
     Shell(ShellArgs),
 
     #[command(
-        name = "dl",
+        name = "pull",
         about = "Download file/dir from an instance or managed local container."
     )]
-    Dl(DownloadArgs),
+    Pull(PullArgs),
+
+    #[command(
+        name = "push",
+        about = "Upload file/dir to an instance or managed local container."
+    )]
+    Push(PushArgs),
 
     #[command(name = "stop", about = "Stop an instance.")]
     Stop(InstanceArgs),
@@ -156,12 +162,21 @@ pub(crate) struct ShellArgs {
 }
 
 #[derive(Debug, Args)]
-pub(crate) struct DownloadArgs {
+pub(crate) struct PullArgs {
     #[arg(long, value_enum)]
     pub(crate) cloud: Option<Cloud>,
     pub(crate) instance: String,
     pub(crate) remote_path: String,
     pub(crate) local_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PushArgs {
+    #[arg(long, value_enum)]
+    pub(crate) cloud: Option<Cloud>,
+    pub(crate) instance: String,
+    pub(crate) local_path: PathBuf,
+    pub(crate) remote_path: Option<String>,
 }
 
 #[derive(Debug, Args)]

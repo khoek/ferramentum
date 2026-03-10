@@ -939,6 +939,46 @@ fn shell_cli_parses_preserve_ephemeral_flag() {
 }
 
 #[test]
+fn pull_cli_parses_remote_and_local_paths() {
+    let cli = Cli::parse_from([
+        "ice",
+        "pull",
+        "--cloud",
+        "aws",
+        "ice-test",
+        "/remote/file.txt",
+        "./local.txt",
+    ]);
+    let Commands::Pull(args) = cli.command else {
+        panic!("expected pull command");
+    };
+    assert_eq!(args.cloud, Some(Cloud::Aws));
+    assert_eq!(args.instance, "ice-test");
+    assert_eq!(args.remote_path, "/remote/file.txt");
+    assert_eq!(args.local_path.as_deref(), Some(Path::new("./local.txt")));
+}
+
+#[test]
+fn push_cli_parses_local_and_remote_paths() {
+    let cli = Cli::parse_from([
+        "ice",
+        "push",
+        "--cloud",
+        "gcp",
+        "ice-test",
+        "./local-dir",
+        "/remote/dir",
+    ]);
+    let Commands::Push(args) = cli.command else {
+        panic!("expected push command");
+    };
+    assert_eq!(args.cloud, Some(Cloud::Gcp));
+    assert_eq!(args.instance, "ice-test");
+    assert_eq!(args.local_path.as_path(), Path::new("./local-dir"));
+    assert_eq!(args.remote_path.as_deref(), Some("/remote/dir"));
+}
+
+#[test]
 fn aws_shell_connect_command_includes_identity_and_destination() {
     let mut config = IceConfig::default();
     config.default.aws.ssh_key_path = Some("/tmp/id_ed25519".to_owned());

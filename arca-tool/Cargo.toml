@@ -1,6 +1,6 @@
 [package]
 name = "arca-tool"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 publish.workspace = true
 description = "CLI for building and publishing containerized Rust crate artifacts."

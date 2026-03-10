@@ -920,6 +920,21 @@ fn local_download_from_container(
     run_command_status(&mut command, "download from local container")
 }
 
+fn local_upload_to_container(
+    runtime: &LocalContainerRuntime,
+    instance: &LocalInstance,
+    local_path: &Path,
+    remote_path: Option<&str>,
+) -> Result<()> {
+    let destination = remote_path.unwrap_or(".");
+    let mut command = runtime.command();
+    command
+        .arg("cp")
+        .arg(local_path)
+        .arg(format!("{}:{}", instance.name, destination));
+    run_command_status(&mut command, "upload to local container")
+}
+
 pub(crate) fn local_stop_instance(context: &LocalContext, instance: &LocalInstance) -> Result<()> {
     match instance.backend {
         LocalInstanceBackend::Container => {
@@ -978,6 +993,23 @@ pub(crate) fn local_download(
         LocalInstanceBackend::Unpack => {
             local_download_from_unpack(instance, remote_path, local_path)
         }
+    }
+}
+
+pub(crate) fn local_upload(
+    context: &LocalContext,
+    instance: &LocalInstance,
+    local_path: &Path,
+    remote_path: Option<&str>,
+) -> Result<()> {
+    match instance.backend {
+        LocalInstanceBackend::Container => local_upload_to_container(
+            &context.require_runtime()?,
+            instance,
+            local_path,
+            remote_path,
+        ),
+        LocalInstanceBackend::Unpack => local_upload_to_unpack(instance, local_path, remote_path),
     }
 }
 
@@ -1077,6 +1109,17 @@ fn local_download_from_unpack(
     let mut command = Command::new("cp");
     command.arg("-a").arg(&source).arg(destination);
     run_command_status(&mut command, "download from local unpack workload")
+}
+
+fn local_upload_to_unpack(
+    instance: &LocalInstance,
+    local_path: &Path,
+    remote_path: Option<&str>,
+) -> Result<()> {
+    let destination = local_unpack_requested_path(instance, remote_path.unwrap_or("."))?;
+    let mut command = Command::new("cp");
+    command.arg("-a").arg(local_path).arg(destination);
+    run_command_status(&mut command, "upload to local unpack workload")
 }
 
 fn local_stream_container_logs(

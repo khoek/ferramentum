@@ -554,13 +554,22 @@ impl RemoteSshProvider for Provider {
         open_shell(config, instance)
     }
 
-    fn download_from_instance(
+    fn pull_from_instance(
         config: &IceConfig,
         instance: &Self::Instance,
         remote_path: &str,
         local_path: Option<&Path>,
     ) -> Result<()> {
         download(config, instance, remote_path, local_path)
+    }
+
+    fn push_to_instance(
+        config: &IceConfig,
+        instance: &Self::Instance,
+        local_path: &Path,
+        remote_path: Option<&str>,
+    ) -> Result<()> {
+        upload(config, instance, local_path, remote_path)
     }
 
     fn wait_for_ssh_ready(
@@ -2612,6 +2621,29 @@ pub(crate) fn download(
     ]);
     maybe_add_project_arg(&mut command, config);
     run_command_status(&mut command, "download from gcp instance")
+}
+
+pub(crate) fn upload(
+    config: &IceConfig,
+    instance: &GcpInstance,
+    local_path: &Path,
+    remote_path: Option<&str>,
+) -> Result<()> {
+    let mut command = command(config);
+    command.args([
+        "compute",
+        "scp",
+        "--scp-flag=-o",
+        "--scp-flag=StrictHostKeyChecking=accept-new",
+    ]);
+    if local_path.is_dir() {
+        command.arg("--recurse");
+    }
+    command.arg(local_path);
+    command.arg(format!("{}:{}", instance.name, remote_path.unwrap_or(".")));
+    command.args(["--zone", &instance.zone]);
+    maybe_add_project_arg(&mut command, config);
+    run_command_status(&mut command, "upload to gcp instance")
 }
 
 pub(crate) fn delete_instance(config: &IceConfig, instance: &GcpInstance) -> Result<()> {

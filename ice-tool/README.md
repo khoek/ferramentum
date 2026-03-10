@@ -39,7 +39,8 @@ Supported cloud identifiers:
 - `ice list [--cloud CLOUD]`
 - `ice logs [--cloud CLOUD] <INSTANCE> [--tail N] [--follow]`
 - `ice shell [--cloud CLOUD] <INSTANCE>`
-- `ice dl [--cloud CLOUD] <INSTANCE> <REMOTE_PATH> [LOCAL_PATH]`
+- `ice pull [--cloud CLOUD] <INSTANCE> <REMOTE_PATH> [LOCAL_PATH]`
+- `ice push [--cloud CLOUD] <INSTANCE> <LOCAL_PATH> [REMOTE_PATH]`
 - `ice stop [--cloud CLOUD] <INSTANCE>`
 - `ice start [--cloud CLOUD] <INSTANCE>`
 - `ice delete [--cloud CLOUD] <INSTANCE>`

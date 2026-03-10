@@ -33,7 +33,7 @@ use crate::providers::{
     load_cached_arc,
 };
 use crate::provision::estimated_machine_hourly_price;
-use crate::remote::{RemoteAccess, run_rsync_download, run_rsync_upload};
+use crate::remote::{RemoteAccess, run_rsync_download, run_rsync_upload, run_rsync_upload_path};
 use crate::support::{
     ICE_LABEL_PREFIX, ICE_WORKLOAD_CONTAINER_METADATA_KEY, ICE_WORKLOAD_KIND_METADATA_KEY,
     ICE_WORKLOAD_REGISTRY_METADATA_KEY, ICE_WORKLOAD_SOURCE_METADATA_KEY, VAST_POLL_INTERVAL_SECS,
@@ -581,13 +581,22 @@ impl RemoteSshProvider for Provider {
         open_shell(config, instance)
     }
 
-    fn download_from_instance(
+    fn pull_from_instance(
         config: &IceConfig,
         instance: &Self::Instance,
         remote_path: &str,
         local_path: Option<&Path>,
     ) -> Result<()> {
         download(config, instance, remote_path, local_path)
+    }
+
+    fn push_to_instance(
+        config: &IceConfig,
+        instance: &Self::Instance,
+        local_path: &Path,
+        remote_path: Option<&str>,
+    ) -> Result<()> {
+        upload(config, instance, local_path, remote_path)
     }
 
     fn wait_for_ssh_ready(
@@ -3002,6 +3011,28 @@ pub(crate) fn download(
         remote_path,
         local_path,
         "download from aws instance",
+    )
+}
+
+pub(crate) fn upload(
+    config: &IceConfig,
+    instance: &AwsInstance,
+    local_path: &Path,
+    remote_path: Option<&str>,
+) -> Result<()> {
+    let key_path = ssh_key_path(config)?;
+    let user = ssh_user(config);
+    let host = ssh_host(instance)?;
+    run_rsync_upload_path(
+        RemoteAccess {
+            user: &user,
+            host: &host,
+            port: None,
+            identity_file: Some(key_path.as_path()),
+        },
+        local_path,
+        remote_path,
+        "upload to aws instance",
     )
 }
 

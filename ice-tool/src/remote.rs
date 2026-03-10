@@ -111,6 +111,26 @@ pub(crate) fn run_rsync_upload(
     run_command_status(&mut command, context)
 }
 
+pub(crate) fn run_rsync_upload_path(
+    access: RemoteAccess<'_>,
+    local_path: &Path,
+    remote_path: Option<&str>,
+    context: &str,
+) -> Result<()> {
+    let destination = remote_path.unwrap_or(".");
+    let remote_spec = format!("{}@{}:{destination}", access.user, access.host);
+
+    let mut command = Command::new("rsync");
+    command
+        .arg("-az")
+        .arg("--progress")
+        .arg("-e")
+        .arg(ssh_transport(&access))
+        .arg(local_path)
+        .arg(remote_spec);
+    run_command_status(&mut command, context)
+}
+
 fn read_first_ssh_public_key_line(path: &Path) -> Result<Option<String>> {
     let content =
         fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
