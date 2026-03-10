@@ -412,13 +412,14 @@ fn prompt_for_gcp_credentials(config: &mut ArcaConfig, force: bool) -> Result<()
     let project_seed = gcp::detect_project(config.auth.gcp.project.as_deref(), true)
         .or_else(|| (!force).then(|| config.auth.gcp.project.clone()).flatten())
         .unwrap_or_default();
-    let creds_seed = gcp::detect_credentials_path(config.auth.gcp.service_account_json.as_deref(), true)
-        .or_else(|| {
-            (!force)
-                .then(|| config.auth.gcp.service_account_json.clone())
-                .flatten()
-        })
-        .unwrap_or_default();
+    let creds_seed =
+        gcp::detect_credentials_path(config.auth.gcp.service_account_json.as_deref(), true)
+            .or_else(|| {
+                (!force)
+                    .then(|| config.auth.gcp.service_account_json.clone())
+                    .flatten()
+            })
+            .unwrap_or_default();
 
     let project = Input::<String>::with_theme(prompt_theme())
         .with_prompt("GCP project ID")
