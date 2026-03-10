@@ -15,7 +15,7 @@ name = "arca"
 path = "src/main.rs"
 
 [dependencies]
-capulus = { version = "0.1.0", path = "../../caudex/capulus" }
+capulus = "0.1.0"
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
