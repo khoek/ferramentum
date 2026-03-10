@@ -24,7 +24,7 @@ dialoguer = { workspace = true }
 headless_chrome = "1"
 indicatif = { workspace = true }
 libc = { workspace = true }
-openconnect-core = "0.1.5"
+openconnect-core = { git = "https://github.com/khoek/Openconnect-RS.git", branch = "ocular-peer-cert-der" }
 quick-xml = { version = "0.39", features = ["escape-html"] }
 reqwest = { workspace = true, features = ["blocking", "cookies", "rustls", "socks"] }
 serde = { workspace = true }
