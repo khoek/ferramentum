@@ -15,20 +15,20 @@ name = "arca"
 path = "src/main.rs"
 
 [dependencies]
-capulus = "0.1.0"
+capulus = { workspace = true }
 
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-dialoguer = "0.12"
-dirs = "6"
-indicatif = "0.18"
-libc = "0.2"
-rand = "0.10"
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-tempfile = "3"
+anyhow = { workspace = true }
+clap = { workspace = true }
+dialoguer = { workspace = true }
+dirs = { workspace = true }
+indicatif = { workspace = true }
+libc = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true, features = ["blocking", "json", "rustls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 toml = "1"
-webbrowser = "1"
+webbrowser = { workspace = true }

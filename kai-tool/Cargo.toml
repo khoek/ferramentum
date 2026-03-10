@@ -15,16 +15,16 @@ name = "kai"
 path = "src/main.rs"
 
 [dependencies]
-capulus = "0.1.0"
+capulus = { workspace = true }
 
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+anyhow = { workspace = true }
+clap = { workspace = true }
 fs2 = "0.4"
-indicatif = "0.18"
-libc = "0.2"
+indicatif = { workspace = true }
+libc = { workspace = true }
 pathdiff = "0.2"
-rand = "0.10"
-tempfile = "3"
+rand = { workspace = true }
+tempfile = { workspace = true }
 walkdir = "2"
-which = "8"
+which = { workspace = true }
 toml = "0.9"
