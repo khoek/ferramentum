@@ -147,7 +147,7 @@ pub(crate) fn main() -> ExitCode {
 }
 
 pub(crate) fn run() -> Result<ExitCode> {
-    let _instance_lock = capulus::acquire("ice")?;
+    let _instance_lock = capulus::acquire("ice", true)?;
     let cli = Cli::parse();
     ensure_runtime_gpu_data_files()?;
     let mut config = load_config()?;

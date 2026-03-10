@@ -52,7 +52,7 @@ enum BuilderStatus {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
-    let _instance_lock = capulus::acquire("arca")?;
+    let _instance_lock = capulus::acquire("arca", true)?;
     match cli.command {
         Commands::Login(args) => cmd_login(args),
         Commands::Build(command) => cmd_build(command),
