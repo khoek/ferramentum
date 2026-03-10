@@ -19,7 +19,9 @@ use crate::model::{
     Cloud, CloudMachineCandidate, CreateSearchRequirements, DeployTargetRequest, IceConfig,
     PrefixLookup, RuntimeCostEstimate,
 };
-use crate::providers::gcp::GcpMachineCatalogEntry;
+use crate::providers::RemoteSshProvider;
+use crate::providers::aws::AwsInstance;
+use crate::providers::gcp::{GcpInstance, GcpMachineCatalogEntry};
 use crate::providers::vast::{
     VastInstance, VastScheduledJob, infer_workload, instance_supports_ssh, job_termination_unix,
     nearest_scheduled_termination_by_instance, remaining_contract_hours_at, runtype_for_workload,
@@ -899,6 +901,101 @@ fn config_accepts_fractional_market_ram_filters() {
 }
 
 #[test]
+fn shell_cli_parses_print_creds_flag() {
+    let cli = Cli::parse_from([
+        "ice",
+        "shell",
+        "--cloud",
+        "aws",
+        "--print-creds",
+        "ice-test",
+    ]);
+    let Commands::Shell(args) = cli.command else {
+        panic!("expected shell command");
+    };
+    assert_eq!(args.cloud, Some(Cloud::Aws));
+    assert!(args.print_creds);
+    assert!(!args.preserve_ephemeral);
+    assert_eq!(args.instance, "ice-test");
+}
+
+#[test]
+fn shell_cli_parses_preserve_ephemeral_flag() {
+    let cli = Cli::parse_from([
+        "ice",
+        "shell",
+        "--cloud",
+        "vast.ai",
+        "--preserve-ephemeral",
+        "ice-test",
+    ]);
+    let Commands::Shell(args) = cli.command else {
+        panic!("expected shell command");
+    };
+    assert_eq!(args.cloud, Some(Cloud::VastAi));
+    assert!(!args.print_creds);
+    assert!(args.preserve_ephemeral);
+    assert_eq!(args.instance, "ice-test");
+}
+
+#[test]
+fn aws_shell_connect_command_includes_identity_and_destination() {
+    let mut config = IceConfig::default();
+    config.default.aws.ssh_key_path = Some("/tmp/id_ed25519".to_owned());
+    config.default.aws.ssh_user = Some("ubuntu".to_owned());
+    let instance = AwsInstance {
+        instance_id: "i-1234567890".to_owned(),
+        name: Some("ice-test".to_owned()),
+        region: "us-west-2".to_owned(),
+        state: "running".to_owned(),
+        instance_type: "g5.xlarge".to_owned(),
+        launch_time: None,
+        public_ip: Some("203.0.113.10".to_owned()),
+        public_dns: None,
+        workload: Some(InstanceWorkload::Shell),
+    };
+
+    let command = <crate::providers::aws::Provider as RemoteSshProvider>::shell_connect_command(
+        &config, &instance,
+    )
+    .expect("aws shell command");
+
+    assert!(command.contains("ssh"));
+    assert!(command.contains("/tmp/id_ed25519"));
+    assert!(command.contains("StrictHostKeyChecking=accept-new"));
+    assert!(command.contains("-t"));
+    assert!(command.contains("ubuntu@203.0.113.10"));
+}
+
+#[test]
+fn gcp_shell_connect_command_includes_project_and_zone() {
+    let mut config = IceConfig::default();
+    config.auth.gcp.project = Some("demo-project".to_owned());
+    let instance = GcpInstance {
+        name: "ice-test".to_owned(),
+        zone: "us-central1-a".to_owned(),
+        status: "RUNNING".to_owned(),
+        machine_type: "g2-standard-4".to_owned(),
+        creation_timestamp: None,
+        last_start_timestamp: None,
+        workload: Some(InstanceWorkload::Shell),
+    };
+
+    let command = <crate::providers::gcp::Provider as RemoteSshProvider>::shell_connect_command(
+        &config, &instance,
+    )
+    .expect("gcp shell command");
+
+    assert!(command.contains("gcloud"));
+    assert!(command.contains("compute"));
+    assert!(command.contains("ssh"));
+    assert!(command.contains("ice-test"));
+    assert!(command.contains("us-central1-a"));
+    assert!(command.contains("demo-project"));
+    assert!(command.contains("--ssh-flag=-t"));
+}
+
+#[test]
 fn create_cli_parses_aws_dry_run_flags_without_custom_mode() {
     let cli = Cli::parse_from([
         "ice",
@@ -965,6 +1062,24 @@ fn create_cli_parses_repeated_gpu_override_flags() {
     };
     assert_eq!(args.gpus, vec!["L4".to_owned(), "H100 SXM".to_owned()]);
     assert!(!args.no_gpu);
+}
+
+#[test]
+fn refresh_catalog_cli_defaults_to_all_supported_clouds() {
+    let cli = Cli::parse_from(["ice", "refresh-catalog"]);
+    let Commands::RefreshCatalog(args) = cli.command else {
+        panic!("expected refresh-catalog command");
+    };
+    assert_eq!(args.cloud, None);
+}
+
+#[test]
+fn refresh_catalog_cli_accepts_explicit_cloud_override() {
+    let cli = Cli::parse_from(["ice", "refresh-catalog", "--cloud", "aws"]);
+    let Commands::RefreshCatalog(args) = cli.command else {
+        panic!("expected refresh-catalog command");
+    };
+    assert_eq!(args.cloud, Some(Cloud::Aws));
 }
 
 #[test]

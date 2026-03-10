@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 use crate::cache::{CloudCacheModel, load_cache_store, persist_instances, upsert_instance};
 use crate::cli::{CreateArgs, DownloadArgs, LogsArgs, ShellArgs};
+use crate::gpu::runtime_provider_data_path;
 use crate::http_retry;
 use crate::listing::{
     ListedInstance, display_name_or_fallback, display_state, list_state_color,
@@ -36,12 +37,12 @@ use crate::support::{
     VAST_LOG_READY_POLL_INTERVAL_MILLIS, VAST_LOG_READY_TIMEOUT_SECS, VAST_POLL_INTERVAL_SECS,
     VAST_WAIT_TIMEOUT_SECS, build_cloud_instance_name, elapsed_since, extract_api_error_message,
     format_unix_utc, now_unix_secs, now_unix_secs_f64, parse_json_response, prefix_lookup_indices,
-    prompt_confirm, spinner, truncate_ellipsis, visible_instance_name,
+    prompt_confirm, render_command_line, spinner, truncate_ellipsis, visible_instance_name,
 };
 use crate::ui::{print_stage, print_warning};
 use crate::unpack::{
     materialize_unpack_bundle, remote_unpack_dir_for_vast, unpack_logs_remote_command,
-    unpack_prepare_remote_dir_command, unpack_start_remote_command,
+    unpack_prepare_remote_dir_command, unpack_shell_remote_command, unpack_start_remote_command,
 };
 use crate::workload::{
     ContainerImageReference, InstanceWorkload, display_unpack_source, resolve_deploy_hours,
@@ -1002,15 +1003,23 @@ impl CommandProvider for Provider {
             instance.id,
             Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
         )?;
-        if matches!(
-            instance.workload.as_ref(),
-            Some(InstanceWorkload::Unpack(_))
-        ) {
-            let remote_command =
-                crate::unpack::unpack_shell_remote_command(&remote_unpack_dir_for_vast(&instance));
-            open_remote_shell_with_auto_key(&client, &instance, Some(&remote_command))
+        let remote_command = shell_remote_command(&instance);
+        if args.print_creds {
+            print_shell_command_with_auto_key(
+                &client,
+                &instance,
+                remote_command.as_deref(),
+                args.preserve_ephemeral,
+            )
+        } else if let Some(remote_command) = remote_command.as_deref() {
+            open_remote_shell_with_auto_key(
+                &client,
+                &instance,
+                Some(remote_command),
+                args.preserve_ephemeral,
+            )
         } else {
-            open_shell_with_auto_key(&client, &instance)
+            open_shell_with_auto_key(&client, &instance, args.preserve_ephemeral)
         }
     }
 
@@ -1175,7 +1184,7 @@ impl CreateProvider for Provider {
                 )?;
                 if prompt_confirm("Open shell in the new instance now?", true)? {
                     print_stage("Opening shell");
-                    open_shell_with_auto_key(&client, &instance)?;
+                    open_shell_with_auto_key(&client, &instance, false)?;
                 }
             }
             InstanceWorkload::Container(_) => {
@@ -1460,18 +1469,78 @@ pub(crate) fn wait_for_workload_start(
     }
 }
 
-pub(crate) fn open_shell_with_auto_key(client: &VastClient, instance: &VastInstance) -> Result<()> {
-    open_remote_shell_with_auto_key(client, instance, None)
+pub(crate) fn open_shell_with_auto_key(
+    client: &VastClient,
+    instance: &VastInstance,
+    preserve_ephemeral: bool,
+) -> Result<()> {
+    open_remote_shell_with_auto_key(client, instance, None, preserve_ephemeral)
 }
 
 pub(crate) fn open_remote_shell_with_auto_key(
     client: &VastClient,
     instance: &VastInstance,
     remote_command: Option<&str>,
+    preserve_ephemeral: bool,
 ) -> Result<()> {
-    with_auto_key(client, instance, |identity| {
-        run_ssh_command(instance, identity, remote_command, true)
-    })
+    with_auto_key_behavior(
+        client,
+        instance,
+        if preserve_ephemeral {
+            TemporaryKeyBehavior::Preserve
+        } else {
+            TemporaryKeyBehavior::Cleanup
+        },
+        |identity| run_ssh_command(instance, identity, remote_command, true),
+    )
+}
+
+fn shell_remote_command(instance: &VastInstance) -> Option<String> {
+    matches!(
+        instance.workload.as_ref(),
+        Some(InstanceWorkload::Unpack(_))
+    )
+    .then(|| unpack_shell_remote_command(&remote_unpack_dir_for_vast(instance)))
+}
+
+fn print_shell_command_with_auto_key(
+    client: &VastClient,
+    instance: &VastInstance,
+    remote_command: Option<&str>,
+    preserve_ephemeral: bool,
+) -> Result<()> {
+    println!(
+        "{}",
+        shell_command_with_auto_key(client, instance, remote_command, preserve_ephemeral)?
+    );
+    Ok(())
+}
+
+fn shell_command_with_auto_key(
+    client: &VastClient,
+    instance: &VastInstance,
+    remote_command: Option<&str>,
+    preserve_ephemeral: bool,
+) -> Result<String> {
+    with_auto_key_behavior(
+        client,
+        instance,
+        if preserve_ephemeral {
+            TemporaryKeyBehavior::Preserve
+        } else {
+            TemporaryKeyBehavior::Reject
+        },
+        |identity| {
+            run_ssh_command(instance, identity, Some("true"), false)?;
+            let (host, port) = ssh_target(instance)?;
+            let mut args = ssh_args(&host, port, identity);
+            if let Some(remote_command) = remote_command {
+                args.push("-t".to_owned());
+                args.push(remote_command.to_owned());
+            }
+            Ok(render_command_line("ssh", args))
+        },
+    )
 }
 
 pub(crate) fn ensure_instance_has_ssh(instance: &VastInstance) -> Result<()> {
@@ -1908,7 +1977,26 @@ fn run_ssh_command(
     Ok(())
 }
 
-fn with_auto_key<T, F>(client: &VastClient, instance: &VastInstance, mut action: F) -> Result<T>
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TemporaryKeyBehavior {
+    Cleanup,
+    Preserve,
+    Reject,
+}
+
+fn with_auto_key<T, F>(client: &VastClient, instance: &VastInstance, action: F) -> Result<T>
+where
+    F: FnMut(Option<&Path>) -> Result<T>,
+{
+    with_auto_key_behavior(client, instance, TemporaryKeyBehavior::Cleanup, action)
+}
+
+fn with_auto_key_behavior<T, F>(
+    client: &VastClient,
+    instance: &VastInstance,
+    temporary_key_behavior: TemporaryKeyBehavior,
+    mut action: F,
+) -> Result<T>
 where
     F: FnMut(Option<&Path>) -> Result<T>,
 {
@@ -1966,6 +2054,27 @@ where
                 return Ok(value);
             }
 
+            if temporary_key_behavior == TemporaryKeyBehavior::Reject {
+                let attach_hint = match attach_status {
+                    InstanceSshKeyAttachStatus::Attached => "The key attach call succeeded.",
+                    InstanceSshKeyAttachStatus::AlreadyAssociated => {
+                        "Vast reports an SSH key is already associated with this instance."
+                    }
+                };
+                return Err(first_err.context(format!(
+                    concat!(
+                        "Initial SSH attempt failed: {}. Retried with instance-level key attach ",
+                        "and account-level key sync, but printing SSH credentials would now ",
+                        "require a temporary Vast account key. Re-run with ",
+                        "`--preserve-ephemeral` to keep that key after `ice shell` exits. ",
+                        "Local key: `{}`. {}"
+                    ),
+                    first_err_text,
+                    identity.display(),
+                    attach_hint
+                )));
+            }
+
             print_stage("Installing a temporary Vast RSA SSH key");
             let temp_key = TemporarySshKey::generate()?;
             let temp_key_id = client
@@ -1977,23 +2086,51 @@ where
                 AUTO_KEY_RETRY_ATTEMPTS,
                 AUTO_KEY_RETRY_DELAY,
             );
-            if let Err(err) = client.delete_account_ssh_key(temp_key_id) {
-                print_warning(&format!(
-                    "Failed to delete temporary vast.ai account SSH key {temp_key_id}: {err:#}"
-                ));
-            }
-            temp_result.with_context(|| {
-                let attach_hint = match attach_status {
-                    InstanceSshKeyAttachStatus::Attached => "The key attach call succeeded.",
-                    InstanceSshKeyAttachStatus::AlreadyAssociated => {
-                        "Vast reports an SSH key is already associated with this instance."
+            match temp_result {
+                Ok(value) => {
+                    if temporary_key_behavior == TemporaryKeyBehavior::Preserve {
+                        let preserved_key_path = temp_key
+                            .preserve()
+                            .context("Failed to preserve temporary vast.ai SSH key locally")?;
+                        print_warning(&format!(
+                            concat!(
+                                "Preserved temporary vast.ai SSH key at `{}`. ",
+                                "It remains installed on your vast.ai account until you remove it."
+                            ),
+                            preserved_key_path.display()
+                        ));
+                        return Ok(value);
                     }
-                };
-                format!(
-                    "Initial SSH attempt failed: {first_err_text}. Retried with instance-level key attach, account-level key sync, and finally a temporary RSA account key, but authentication still failed. Local key: `{}`. {attach_hint}",
-                    identity.display()
-                )
-            })
+
+                    if let Err(err) = client.delete_account_ssh_key(temp_key_id) {
+                        print_warning(&format!(
+                            "Failed to delete temporary vast.ai account SSH key {temp_key_id}: {err:#}"
+                        ));
+                    }
+                    Ok(value)
+                }
+                Err(err) => {
+                    if let Err(delete_err) = client.delete_account_ssh_key(temp_key_id) {
+                        print_warning(&format!(
+                            "Failed to delete temporary vast.ai account SSH key {temp_key_id}: {delete_err:#}"
+                        ));
+                    }
+                    Err(err).with_context(|| {
+                        let attach_hint = match attach_status {
+                            InstanceSshKeyAttachStatus::Attached => {
+                                "The key attach call succeeded."
+                            }
+                            InstanceSshKeyAttachStatus::AlreadyAssociated => {
+                                "Vast reports an SSH key is already associated with this instance."
+                            }
+                        };
+                        format!(
+                            "Initial SSH attempt failed: {first_err_text}. Retried with instance-level key attach, account-level key sync, and finally a temporary RSA account key, but authentication still failed. Local key: `{}`. {attach_hint}",
+                            identity.display()
+                        )
+                    })
+                }
+            }
         }
     }
 }
@@ -2055,6 +2192,72 @@ impl TemporarySshKey {
             public_key,
         })
     }
+
+    fn preserve(&self) -> Result<PathBuf> {
+        let root = preserved_ephemeral_key_root_dir()?;
+        fs::create_dir_all(&root)
+            .with_context(|| format!("Failed to create {}", root.display()))?;
+        let preserved_dir = allocate_preserved_ephemeral_key_dir(&root)?;
+        let preserved_private_key_path = preserved_dir.join("id_rsa");
+        let public_key_path = self.private_key_path.with_extension("pub");
+        let preserved_public_key_path = preserved_private_key_path.with_extension("pub");
+
+        fs::copy(&self.private_key_path, &preserved_private_key_path).with_context(|| {
+            format!(
+                "Failed to copy {} to {}",
+                self.private_key_path.display(),
+                preserved_private_key_path.display()
+            )
+        })?;
+        fs::set_permissions(
+            &preserved_private_key_path,
+            fs::metadata(&self.private_key_path)
+                .with_context(|| format!("Failed to read {}", self.private_key_path.display()))?
+                .permissions(),
+        )
+        .with_context(|| format!("Failed to set {}", preserved_private_key_path.display()))?;
+
+        fs::copy(&public_key_path, &preserved_public_key_path).with_context(|| {
+            format!(
+                "Failed to copy {} to {}",
+                public_key_path.display(),
+                preserved_public_key_path.display()
+            )
+        })?;
+        fs::set_permissions(
+            &preserved_public_key_path,
+            fs::metadata(&public_key_path)
+                .with_context(|| format!("Failed to read {}", public_key_path.display()))?
+                .permissions(),
+        )
+        .with_context(|| format!("Failed to set {}", preserved_public_key_path.display()))?;
+
+        Ok(preserved_private_key_path)
+    }
+}
+
+fn preserved_ephemeral_key_root_dir() -> Result<PathBuf> {
+    let path = runtime_provider_data_path(Cloud::VastAi, "ephemeral-ssh")?;
+    Ok(path)
+}
+
+fn allocate_preserved_ephemeral_key_dir(root: &Path) -> Result<PathBuf> {
+    let timestamp = now_unix_secs();
+    let pid = std::process::id();
+    for attempt in 0..256 {
+        let dir = root.join(format!("key-{timestamp}-{pid}-{attempt}"));
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("Failed to create {}", dir.display()));
+            }
+        }
+    }
+    bail!(
+        "Failed to allocate a preserved ephemeral SSH key directory in {}.",
+        root.display()
+    );
 }
 
 impl Drop for TemporarySshKey {

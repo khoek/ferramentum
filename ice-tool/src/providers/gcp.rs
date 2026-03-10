@@ -18,7 +18,7 @@ use serde_json::Value;
 use crate::cache::{CloudCacheModel, load_cache_store, persist_instances, upsert_instance};
 use crate::gpu::{
     ProviderGpuAliasEntry, bundled_gcp_machine_pricing_map, canonicalize_gpu_name_for_cloud,
-    normalize_gpu_name_token, runtime_gcp_machine_pricing_map_path,
+    normalize_gpu_name_token, runtime_gcp_machine_pricing_map_path, runtime_provider_data_path,
 };
 use crate::listing::{
     ListedInstance, display_name_or_fallback, display_state, list_state_color,
@@ -26,6 +26,11 @@ use crate::listing::{
 };
 use crate::model::{
     Cloud, CloudMachineCandidate, CreateSearchRequirements, IceConfig, RegistryAuth,
+};
+use crate::providers::catalog::{
+    MachineRegionEntry, MachineRegionKey, MachineRegionSkipEntry, RefreshCatalogOutcome,
+    build_machine_region_index, changed_entry_count_by_key, machine_region_key_set,
+    stale_machine_region_entries,
 };
 use crate::providers::{
     CloudInstance, CloudProvider, RemoteCloudProvider, RemoteSshProvider, clear_cached_arc,
@@ -37,8 +42,8 @@ use crate::support::{
     ICE_LABEL_PREFIX, ICE_WORKLOAD_CONTAINER_METADATA_KEY, ICE_WORKLOAD_KIND_METADATA_KEY,
     ICE_WORKLOAD_REGISTRY_METADATA_KEY, ICE_WORKLOAD_SOURCE_METADATA_KEY, VAST_POLL_INTERVAL_SECS,
     VAST_WAIT_TIMEOUT_SECS, build_cloud_instance_name, elapsed_hours_from_rfc3339, elapsed_since,
-    now_unix_secs, prefix_lookup_indices, progress_bar, run_command_json, run_command_status,
-    run_command_text, spinner, visible_instance_name, write_temp_file,
+    now_unix_secs, prefix_lookup_indices, progress_bar, render_command_line, run_command_json,
+    run_command_status, run_command_text, spinner, visible_instance_name, write_temp_file,
 };
 use crate::ui::print_warning;
 use crate::unpack::{
@@ -85,6 +90,28 @@ const GCP_BILLING_SERVICE: &str = "6F81-5844-456A";
 const GCP_BILLING_PAGE_SIZE: &str = "5000";
 const GCP_COMPUTE_PAGE_SIZE: &str = "500";
 const GCP_LOCAL_CATALOG_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+const GCP_ZONES_FIELDS: &str = "items(name,status),nextPageToken";
+const GCP_MACHINE_TYPES_FIELDS: &str = concat!(
+    "items/*/machineTypes(",
+    "name,zone,guestCpus,memoryMb,isSharedCpu,description,",
+    "bundledLocalSsds/partitionCount,",
+    "accelerators(guestAcceleratorType,guestAcceleratorCount)",
+    "),",
+    "items/*/warning/code,",
+    "nextPageToken"
+);
+const GCP_BILLING_CATALOG_FIELDS: &str = concat!(
+    "skus(",
+    "skuId,description,category/usageType,",
+    "pricingInfo(",
+    "pricingExpression(",
+    "usageUnit,baseUnitConversionFactor,",
+    "tieredRates(startUsageAmount,unitPrice(units,nanos))",
+    ")",
+    ")",
+    "),",
+    "nextPageToken"
+);
 static GCP_MACHINE_PRICING_MAP_STORE_CACHE: LazyLock<
     Mutex<Option<Arc<GcpMachinePricingMapStore>>>,
 > = LazyLock::new(|| Mutex::new(None));
@@ -95,7 +122,7 @@ static GCP_SKU_PRICING_CACHE_STORE_CACHE: LazyLock<Mutex<Option<Arc<GcpSkuPricin
 static GCP_SKU_PRICING_CACHE_INDEX_CACHE: LazyLock<Mutex<Option<Arc<GcpSkuPricingCacheIndex>>>> =
     LazyLock::new(|| Mutex::new(None));
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct GcpMachineShape {
     machine: String,
     zone: String,
@@ -105,6 +132,16 @@ struct GcpMachineShape {
     ram_mb: u32,
     accelerators: Vec<GcpAccelerator>,
     bundled_local_ssd_partitions: u32,
+}
+
+impl MachineRegionEntry for GcpMachineShape {
+    fn machine(&self) -> &str {
+        &self.machine
+    }
+
+    fn region(&self) -> &str {
+        &self.region
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -173,6 +210,22 @@ struct GcpMachinePricingMapEntry {
     components: Vec<GcpMachinePricingComponent>,
 }
 
+impl MachineRegionEntry for GcpMachinePricingMapEntry {
+    fn machine(&self) -> &str {
+        &self.machine
+    }
+
+    fn region(&self) -> &str {
+        &self.region
+    }
+}
+
+impl MachineRegionSkipEntry for GcpMachinePricingMapEntry {
+    fn skip_reason(&self) -> Option<&str> {
+        self.skip_reason.as_deref()
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct GcpMachinePricingMapStore {
     #[serde(default)]
@@ -195,6 +248,14 @@ struct GcpSkuPricingCacheStore {
     refreshed_at_unix: u64,
     #[serde(default)]
     entries: Vec<GcpSkuPricingCacheEntry>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct GcpMachineShapeCacheStore {
+    #[serde(default)]
+    refreshed_at_unix: u64,
+    #[serde(default)]
+    entries: Vec<GcpMachineShape>,
 }
 
 type GcpSkuPricingCacheIndex = HashMap<String, GcpSkuPricingCacheEntry>;
@@ -251,15 +312,6 @@ struct GcpMachineCatalogStore {
     refreshed_at_unix: u64,
     #[serde(default)]
     entries: Vec<GcpMachineCatalogEntry>,
-}
-
-#[derive(Debug)]
-pub(crate) struct RefreshCatalogOutcome {
-    pub(crate) path: PathBuf,
-    pub(crate) entry_count: usize,
-    pub(crate) changed_entry_count: usize,
-    pub(crate) warning_count: usize,
-    pub(crate) warning_summary: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -494,6 +546,10 @@ impl RemoteSshProvider for Provider {
         create_instance(config, candidate, hours, workload)
     }
 
+    fn shell_connect_command(config: &IceConfig, instance: &Self::Instance) -> Result<String> {
+        build_shell_connect_command(config, instance)
+    }
+
     fn open_instance_shell(config: &IceConfig, instance: &Self::Instance) -> Result<()> {
         open_shell(config, instance)
     }
@@ -554,19 +610,14 @@ pub(crate) fn registry_login(config: &IceConfig) -> Result<RegistryAuth> {
 
 fn build_machine_pricing_map_index(
     store: &GcpMachinePricingMapStore,
-) -> Result<HashMap<(String, String), &GcpMachinePricingMapEntry>> {
-    let mut index = HashMap::with_capacity(store.entries.len());
+) -> Result<HashMap<MachineRegionKey, &GcpMachinePricingMapEntry>> {
+    let index = build_machine_region_index(&store.entries, |key| {
+        render_catalog_error(&GcpCatalogError::DuplicateMachinePricingMap {
+            machine: key.machine.clone(),
+            region: key.region.clone(),
+        })
+    })?;
     for entry in &store.entries {
-        let key = (entry.region.clone(), entry.machine.clone());
-        if index.insert(key.clone(), entry).is_some() {
-            bail!(
-                "{}",
-                render_catalog_error(&GcpCatalogError::DuplicateMachinePricingMap {
-                    machine: key.1,
-                    region: key.0,
-                })
-            );
-        }
         if entry.skip_reason.is_some() && !entry.components.is_empty() {
             bail!(
                 "{}",
@@ -758,12 +809,16 @@ fn gcp_provider_dir() -> Result<PathBuf> {
     Ok(parent.to_path_buf())
 }
 
+fn gcp_machine_shape_cache_path() -> Result<PathBuf> {
+    runtime_provider_data_path(Cloud::Gcp, "machine-shapes.toml")
+}
+
 fn gcp_sku_pricing_cache_path() -> Result<PathBuf> {
-    Ok(gcp_provider_dir()?.join("sku-pricing-cache.toml"))
+    runtime_provider_data_path(Cloud::Gcp, "sku-pricing-cache.toml")
 }
 
 fn local_catalog_path() -> Result<PathBuf> {
-    Ok(gcp_provider_dir()?.join("machine-catalog.toml"))
+    runtime_provider_data_path(Cloud::Gcp, "machine-catalog.toml")
 }
 
 fn load_machine_pricing_map_store() -> Result<Arc<GcpMachinePricingMapStore>> {
@@ -860,16 +915,7 @@ fn load_sku_pricing_cache_store() -> Result<Arc<GcpSkuPricingCacheStore>> {
                     path.display()
                 );
             }
-            let store = toml::from_str::<GcpSkuPricingCacheStore>(&content).with_context(|| {
-                format!("Failed to parse local GCP SKU cache at {}", path.display())
-            })?;
-            if store.entries.is_empty() {
-                bail!(
-                    "Local GCP SKU cache at {} contains no SKU prices. Run `ice refresh-catalog --cloud gcp`.",
-                    path.display()
-                );
-            }
-            Ok(store)
+            parse_sku_pricing_cache_store(&content, &path)
         },
         "GCP runtime-data",
     )
@@ -917,6 +963,18 @@ fn save_local_catalog_store(store: &GcpMachineCatalogStore) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn save_machine_shape_cache_store(store: &GcpMachineShapeCacheStore) -> Result<PathBuf> {
+    let path = gcp_machine_shape_cache_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Invalid GCP machine-shape cache path {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
+    let content =
+        toml::to_string_pretty(store).context("Failed to serialize GCP machine-shape cache")?;
+    fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(path)
+}
+
 fn save_sku_pricing_cache_store(store: &GcpSkuPricingCacheStore) -> Result<PathBuf> {
     let path = gcp_sku_pricing_cache_path()?;
     let parent = path
@@ -929,6 +987,28 @@ fn save_sku_pricing_cache_store(store: &GcpSkuPricingCacheStore) -> Result<PathB
     clear_cached_arc(&GCP_SKU_PRICING_CACHE_STORE_CACHE, "GCP runtime-data")?;
     clear_cached_arc(&GCP_SKU_PRICING_CACHE_INDEX_CACHE, "GCP runtime-data")?;
     Ok(path)
+}
+
+fn parse_sku_pricing_cache_store(content: &str, path: &Path) -> Result<GcpSkuPricingCacheStore> {
+    let store = toml::from_str::<GcpSkuPricingCacheStore>(content)
+        .with_context(|| format!("Failed to parse local GCP SKU cache at {}", path.display()))?;
+    if store.entries.is_empty() {
+        bail!(
+            "Local GCP SKU cache at {} contains no SKU prices. Run `ice refresh-catalog --cloud gcp`.",
+            path.display()
+        );
+    }
+    if store
+        .entries
+        .iter()
+        .any(|entry| !(entry.usd_per_unit.is_finite() && entry.usd_per_unit >= 0.0))
+    {
+        bail!(
+            "Local GCP SKU cache at {} contains invalid SKU prices. Run `ice refresh-catalog --cloud gcp`.",
+            path.display()
+        );
+    }
+    Ok(store)
 }
 
 fn warn_if_catalog_stale(store: &GcpMachineCatalogStore) {
@@ -952,26 +1032,9 @@ fn changed_catalog_entry_count(
     previous: &[GcpMachineCatalogEntry],
     current: &[GcpMachineCatalogEntry],
 ) -> usize {
-    let previous_by_key = previous
-        .iter()
-        .map(|entry| ((entry.machine.clone(), entry.zone.clone()), entry))
-        .collect::<HashMap<_, _>>();
-    let current_by_key = current
-        .iter()
-        .map(|entry| ((entry.machine.clone(), entry.zone.clone()), entry))
-        .collect::<HashMap<_, _>>();
-    let updated_or_added = current_by_key
-        .iter()
-        .filter(|(key, entry)| match previous_by_key.get(*key) {
-            Some(previous_entry) => *previous_entry != **entry,
-            None => true,
-        })
-        .count();
-    let deleted = previous_by_key
-        .keys()
-        .filter(|key| !current_by_key.contains_key(*key))
-        .count();
-    updated_or_added + deleted
+    changed_entry_count_by_key(previous, current, |entry| {
+        (entry.machine.clone(), entry.zone.clone())
+    })
 }
 
 pub(crate) fn refresh_local_catalog(config: &IceConfig) -> Result<RefreshCatalogOutcome> {
@@ -985,11 +1048,16 @@ pub(crate) fn refresh_local_catalog(config: &IceConfig) -> Result<RefreshCatalog
             None
         }
     };
-    let machine_shapes = load_live_machine_shapes(config)?;
+    let machine_shape_cache = GcpMachineShapeCacheStore {
+        refreshed_at_unix: now_unix_secs(),
+        entries: load_live_machine_shapes(config)?,
+    };
+    save_machine_shape_cache_store(&machine_shape_cache)?;
+    let machine_shapes = &machine_shape_cache.entries;
     let mapping_store = load_machine_pricing_map_store()?;
     let mapping_index = build_machine_pricing_map_index(&mapping_store)?;
     let preparation =
-        prepare_mapped_catalog(&machine_shapes, &mapping_store.entries, &mapping_index);
+        prepare_mapped_catalog(machine_shapes, &mapping_store.entries, &mapping_index);
     let pricing_store = refresh_sku_pricing_cache(
         config,
         &preparation.required_sku_ids,
@@ -1066,17 +1134,11 @@ fn priced_catalog_entries(
 fn prepare_mapped_catalog<'a>(
     machine_shapes: &'a [GcpMachineShape],
     mapping_entries: &'a [GcpMachinePricingMapEntry],
-    mapping_index: &HashMap<(String, String), &'a GcpMachinePricingMapEntry>,
+    mapping_index: &HashMap<MachineRegionKey, &'a GcpMachinePricingMapEntry>,
 ) -> GcpMappedCatalogPreparation<'a> {
     let mut preparation = GcpMappedCatalogPreparation::default();
-    let live_keys = machine_shapes
-        .iter()
-        .map(|shape| (shape.region.as_str(), shape.machine.as_str()))
-        .collect::<HashSet<_>>();
-    for entry in mapping_entries {
-        if live_keys.contains(&(entry.region.as_str(), entry.machine.as_str())) {
-            continue;
-        }
+    let live_keys = machine_region_key_set(machine_shapes);
+    for entry in stale_machine_region_entries(mapping_entries, &live_keys) {
         preparation
             .warnings
             .entry(GcpCatalogWarning::StaleMachinePricingMap {
@@ -1086,7 +1148,7 @@ fn prepare_mapped_catalog<'a>(
             .or_default();
     }
     for shape in machine_shapes {
-        let key = (shape.region.clone(), shape.machine.clone());
+        let key = shape.machine_region_key();
         let Some(mapping) = mapping_index.get(&key).copied() else {
             preparation
                 .warnings
@@ -1445,10 +1507,7 @@ fn refresh_sku_pricing_cache(
     show_progress: bool,
 ) -> Result<GcpSkuPricingCacheStore> {
     if required_sku_ids.is_empty() {
-        return Ok(GcpSkuPricingCacheStore {
-            refreshed_at_unix: now_unix_secs(),
-            entries: Vec::new(),
-        });
+        return Ok(GcpSkuPricingCacheStore::default());
     }
 
     let token = registry_access_token(config)?;
@@ -1462,7 +1521,7 @@ fn refresh_sku_pricing_cache(
     });
     let mut page_token: Option<String> = None;
     let mut page_count = 0_u64;
-    let mut remaining = required_sku_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let mut remaining = required_sku_ids.clone();
     let mut entries = BTreeMap::new();
 
     loop {
@@ -1616,11 +1675,19 @@ fn aggregated_machine_shapes_page(
     Ok((machines, zones))
 }
 
-fn fetch_gcp_billing_catalog_page(
-    client: &Client,
-    token: &str,
-    page_token: Option<&str>,
-) -> Result<Value> {
+fn fetch_gcp_json(client: &Client, token: &str, url: Url, api_name: &str) -> Result<Value> {
+    client
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .with_context(|| format!("Failed to query the {api_name}"))?
+        .error_for_status()
+        .with_context(|| format!("{api_name} returned an error"))?
+        .json::<Value>()
+        .with_context(|| format!("Failed to decode the {api_name} response"))
+}
+
+fn build_gcp_billing_catalog_url(page_token: Option<&str>) -> Result<Url> {
     let mut url = Url::parse(&format!(
         "https://cloudbilling.googleapis.com/v1/services/{GCP_BILLING_SERVICE}/skus"
     ))
@@ -1629,27 +1696,29 @@ fn fetch_gcp_billing_catalog_page(
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("currencyCode", "USD");
         pairs.append_pair("pageSize", GCP_BILLING_PAGE_SIZE);
+        pairs.append_pair("fields", GCP_BILLING_CATALOG_FIELDS);
+        pairs.append_pair("prettyPrint", "false");
         if let Some(value) = page_token {
             pairs.append_pair("pageToken", value);
         }
     }
-    client
-        .get(url)
-        .bearer_auth(token)
-        .send()
-        .context("Failed to query the GCP Billing Catalog API")?
-        .error_for_status()
-        .context("GCP Billing Catalog API returned an error")?
-        .json::<Value>()
-        .context("Failed to decode the GCP Billing Catalog API response")
+    Ok(url)
 }
 
-fn fetch_gcp_zone_page(
+fn fetch_gcp_billing_catalog_page(
     client: &Client,
     token: &str,
-    project: &str,
     page_token: Option<&str>,
 ) -> Result<Value> {
+    fetch_gcp_json(
+        client,
+        token,
+        build_gcp_billing_catalog_url(page_token)?,
+        "GCP Billing Catalog API",
+    )
+}
+
+fn build_gcp_zone_url(project: &str, page_token: Option<&str>) -> Result<Url> {
     let mut url = Url::parse(&format!(
         "https://compute.googleapis.com/compute/v1/projects/{project}/zones"
     ))
@@ -1658,19 +1727,44 @@ fn fetch_gcp_zone_page(
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("filter", "status = UP");
         pairs.append_pair("maxResults", GCP_COMPUTE_PAGE_SIZE);
+        pairs.append_pair("fields", GCP_ZONES_FIELDS);
+        pairs.append_pair("prettyPrint", "false");
         if let Some(value) = page_token {
             pairs.append_pair("pageToken", value);
         }
     }
-    client
-        .get(url)
-        .bearer_auth(token)
-        .send()
-        .context("Failed to query the GCP zones API")?
-        .error_for_status()
-        .context("GCP zones API returned an error")?
-        .json::<Value>()
-        .context("Failed to decode the GCP zones API response")
+    Ok(url)
+}
+
+fn fetch_gcp_zone_page(
+    client: &Client,
+    token: &str,
+    project: &str,
+    page_token: Option<&str>,
+) -> Result<Value> {
+    fetch_gcp_json(
+        client,
+        token,
+        build_gcp_zone_url(project, page_token)?,
+        "GCP zones API",
+    )
+}
+
+fn build_gcp_machine_types_url(project: &str, page_token: Option<&str>) -> Result<Url> {
+    let mut url = Url::parse(&format!(
+        "https://compute.googleapis.com/compute/v1/projects/{project}/aggregated/machineTypes"
+    ))
+    .context("Failed to build the GCP aggregated machine-types URL")?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("maxResults", GCP_COMPUTE_PAGE_SIZE);
+        pairs.append_pair("fields", GCP_MACHINE_TYPES_FIELDS);
+        pairs.append_pair("prettyPrint", "false");
+        if let Some(value) = page_token {
+            pairs.append_pair("pageToken", value);
+        }
+    }
+    Ok(url)
 }
 
 fn fetch_gcp_machine_types_page(
@@ -1679,26 +1773,12 @@ fn fetch_gcp_machine_types_page(
     project: &str,
     page_token: Option<&str>,
 ) -> Result<Value> {
-    let mut url = Url::parse(&format!(
-        "https://compute.googleapis.com/compute/v1/projects/{project}/aggregated/machineTypes"
-    ))
-    .context("Failed to build the GCP aggregated machine-types URL")?;
-    {
-        let mut pairs = url.query_pairs_mut();
-        pairs.append_pair("maxResults", GCP_COMPUTE_PAGE_SIZE);
-        if let Some(value) = page_token {
-            pairs.append_pair("pageToken", value);
-        }
-    }
-    client
-        .get(url)
-        .bearer_auth(token)
-        .send()
-        .context("Failed to query the GCP aggregated machine-types API")?
-        .error_for_status()
-        .context("GCP aggregated machine-types API returned an error")?
-        .json::<Value>()
-        .context("Failed to decode the GCP aggregated machine-types API response")
+    fetch_gcp_json(
+        client,
+        token,
+        build_gcp_machine_types_url(project, page_token)?,
+        "GCP aggregated machine-types API",
+    )
 }
 
 fn gcp_billing_sku_rows(value: &Value) -> Result<&Vec<Value>> {
@@ -1982,7 +2062,7 @@ fn region_from_zone(zone: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
 
     use serde_json::json;
 
@@ -1990,9 +2070,16 @@ mod tests {
         GcpAccelerator, GcpMachineCatalogEntry, GcpMachinePricingComponent,
         GcpMachinePricingMapEntry, GcpMachinePricingMapStore, GcpMachinePricingQuantitySource,
         GcpMachineShape, GcpSkuPricingCacheEntry, GcpSkuRateUnit, aggregated_machine_shapes_page,
-        billing_sku_pricing_cache_entry, build_machine_pricing_map_index,
+        billing_sku_pricing_cache_entry, build_gcp_billing_catalog_url,
+        build_gcp_machine_types_url, build_gcp_zone_url, build_machine_pricing_map_index,
         changed_catalog_entry_count, prepare_mapped_catalog, resolve_machine_hourly_price_from_map,
     };
+
+    fn query_pairs(url: &reqwest::Url) -> BTreeMap<String, String> {
+        url.query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect()
+    }
 
     fn test_catalog_entry(machine: &str, zone: &str, hourly_usd: f64) -> GcpMachineCatalogEntry {
         GcpMachineCatalogEntry {
@@ -2284,6 +2371,44 @@ mod tests {
     }
 
     #[test]
+    fn gcp_request_urls_trim_payloads() {
+        let billing = build_gcp_billing_catalog_url(Some("page-1")).expect("billing url");
+        let billing_query = query_pairs(&billing);
+        assert_eq!(billing_query.get("prettyPrint"), Some(&"false".to_owned()));
+        assert!(
+            billing_query
+                .get("fields")
+                .is_some_and(|value| value.contains("pricingInfo("))
+        );
+        assert_eq!(billing_query.get("pageToken"), Some(&"page-1".to_owned()));
+
+        let zones = build_gcp_zone_url("demo-project", None).expect("zones url");
+        let zones_query = query_pairs(&zones);
+        assert_eq!(zones_query.get("prettyPrint"), Some(&"false".to_owned()));
+        assert_eq!(
+            zones_query.get("fields"),
+            Some(&"items(name,status),nextPageToken".to_owned())
+        );
+
+        let machine_types =
+            build_gcp_machine_types_url("demo-project", Some("page-2")).expect("machine types");
+        let machine_types_query = query_pairs(&machine_types);
+        assert_eq!(
+            machine_types_query.get("prettyPrint"),
+            Some(&"false".to_owned())
+        );
+        assert!(
+            machine_types_query
+                .get("fields")
+                .is_some_and(|value| value.contains("items/*/machineTypes("))
+        );
+        assert_eq!(
+            machine_types_query.get("pageToken"),
+            Some(&"page-2".to_owned())
+        );
+    }
+
+    #[test]
     fn parse_machine_shape_row_reads_bundled_local_ssd_partition_count() {
         let value = json!({
             "name": "c4-standard-4-lssd",
@@ -2419,17 +2544,47 @@ pub(crate) fn wait_for_state(
 }
 
 pub(crate) fn open_shell(config: &IceConfig, instance: &GcpInstance) -> Result<()> {
-    let remote_command = match instance.workload.as_ref() {
-        Some(InstanceWorkload::Unpack(_)) => {
-            unpack_shell_remote_command(&remote_unpack_dir_for_gcp(instance))
-        }
-        Some(workload) => instance_shell_remote_command(workload),
+    run_ssh_command(config, instance, &shell_remote_command(instance)?, true)
+}
+
+fn shell_remote_command(instance: &GcpInstance) -> Result<String> {
+    match instance.workload.as_ref() {
+        Some(InstanceWorkload::Unpack(_)) => Ok(unpack_shell_remote_command(
+            &remote_unpack_dir_for_gcp(instance),
+        )),
+        Some(workload) => Ok(instance_shell_remote_command(workload)),
         None => bail!(
             "Instance `{}` is missing workload metadata; refuse to guess its shell mode.",
             instance.name
         ),
-    };
-    run_ssh_command(config, instance, &remote_command, true)
+    }
+}
+
+fn build_shell_connect_command(config: &IceConfig, instance: &GcpInstance) -> Result<String> {
+    let mut args = vec![
+        "compute".to_owned(),
+        "ssh".to_owned(),
+        instance.name.clone(),
+        "--zone".to_owned(),
+        instance.zone.clone(),
+        "--command".to_owned(),
+        shell_remote_command(instance)?,
+        "--ssh-flag=-o".to_owned(),
+        "--ssh-flag=StrictHostKeyChecking=accept-new".to_owned(),
+        "--ssh-flag=-t".to_owned(),
+    ];
+    if let Some(project) = config
+        .auth
+        .gcp
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        args.push("--project".to_owned());
+        args.push(project.to_owned());
+    }
+    Ok(render_command_line("gcloud", args))
 }
 
 pub(crate) fn download(

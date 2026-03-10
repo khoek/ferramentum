@@ -17,6 +17,7 @@ use crate::unpack::{
 use crate::workload::{InstanceWorkload, display_unpack_source};
 
 pub(crate) mod aws;
+pub(crate) mod catalog;
 pub(crate) mod gcp;
 pub(crate) mod local;
 pub(crate) mod vast;
@@ -168,6 +169,7 @@ pub(crate) trait RemoteSshProvider: RemoteCloudProvider {
         instance: &Self::Instance,
         timeout: Duration,
     ) -> Result<()>;
+    fn shell_connect_command(config: &IceConfig, instance: &Self::Instance) -> Result<String>;
     fn open_instance_shell(config: &IceConfig, instance: &Self::Instance) -> Result<()>;
     fn download_from_instance(
         config: &IceConfig,
@@ -255,6 +257,12 @@ impl<T: RemoteSshProvider> CommandProvider for T {
     }
 
     fn shell(config: &IceConfig, args: &ShellArgs) -> Result<()> {
+        if args.preserve_ephemeral {
+            bail!(
+                "`ice shell --cloud {}` does not support `--preserve-ephemeral`.",
+                T::CLOUD
+            );
+        }
         let context = T::context(config)?;
         let mut instance = T::resolve_instance(&context, &args.instance)?;
         if instance.is_stopped() {
@@ -274,6 +282,10 @@ impl<T: RemoteSshProvider> CommandProvider for T {
             &instance,
             Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
         )?;
+        if args.print_creds {
+            println!("{}", T::shell_connect_command(config, &instance)?);
+            return Ok(());
+        }
         T::open_instance_shell(config, &instance)
     }
 

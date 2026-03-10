@@ -253,11 +253,11 @@ fn refresh_catalog_error_message(cloud: Cloud) -> Option<String> {
     }
 }
 
-fn cmd_refresh_catalog(args: RefreshCatalogArgs, config: &IceConfig) -> Result<()> {
-    if let Some(message) = refresh_catalog_error_message(args.cloud) {
+fn refresh_catalog_for_cloud(cloud: Cloud, config: &IceConfig) -> Result<()> {
+    if let Some(message) = refresh_catalog_error_message(cloud) {
         bail!("{message}");
     }
-    match args.cloud {
+    match cloud {
         Cloud::Gcp => {
             ensure_provider_cli_installed(Cloud::Gcp)?;
             let outcome = gcp::refresh_local_catalog(config)?;
@@ -300,6 +300,17 @@ fn cmd_refresh_catalog(args: RefreshCatalogArgs, config: &IceConfig) -> Result<(
         }
         _ => unreachable!("non-GCP/AWS refresh-catalog availability is handled above"),
     }
+}
+
+fn cmd_refresh_catalog(args: RefreshCatalogArgs, config: &IceConfig) -> Result<()> {
+    if let Some(cloud) = args.cloud {
+        return refresh_catalog_for_cloud(cloud, config);
+    }
+
+    for cloud in [Cloud::Gcp, Cloud::Aws] {
+        refresh_catalog_for_cloud(cloud, config)?;
+    }
+    Ok(())
 }
 
 fn create_for<P: CreateProvider>(config: &mut IceConfig, args: &CreateArgs) -> Result<()> {

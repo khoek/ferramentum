@@ -666,6 +666,19 @@ pub(crate) fn shell_quote_single(value: &str) -> String {
     capulus::shell::shell_quote(value)
 }
 
+pub(crate) fn render_command_line<I, S>(program: &str, args: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut parts = vec![shell_quote_single(program)];
+    parts.extend(
+        args.into_iter()
+            .map(|value| shell_quote_single(value.as_ref())),
+    );
+    parts.join(" ")
+}
+
 pub(crate) fn write_temp_file(prefix: &str, suffix: &str, contents: &str) -> Result<PathBuf> {
     let path =
         capulus::temp::create_secure_temp_file(prefix, suffix.trim_start_matches('.'), 0o600)?;

@@ -162,6 +162,12 @@ impl CommandProvider for Provider {
     }
 
     fn shell(_config: &IceConfig, args: &ShellArgs) -> Result<()> {
+        if args.print_creds {
+            bail!("`ice shell --cloud local --print-creds` is not supported.");
+        }
+        if args.preserve_ephemeral {
+            bail!("`ice shell --cloud local --preserve-ephemeral` is not supported.");
+        }
         let context = local_context();
         let mut instance = resolve_local_instance(&context, &args.instance)?;
         if instance.is_stopped()

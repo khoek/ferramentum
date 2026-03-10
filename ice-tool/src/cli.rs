@@ -78,8 +78,8 @@ pub(crate) struct CloudArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct RefreshCatalogArgs {
-    #[arg(long, value_enum, default_value_t = Cloud::Gcp)]
-    pub(crate) cloud: Cloud,
+    #[arg(long, value_enum)]
+    pub(crate) cloud: Option<Cloud>,
 }
 
 #[derive(Debug, Args)]
@@ -148,6 +148,10 @@ pub(crate) struct ConfigUnsetArgs {
 pub(crate) struct ShellArgs {
     #[arg(long, value_enum)]
     pub(crate) cloud: Option<Cloud>,
+    #[arg(long)]
+    pub(crate) print_creds: bool,
+    #[arg(long)]
+    pub(crate) preserve_ephemeral: bool,
     pub(crate) instance: String,
 }
 

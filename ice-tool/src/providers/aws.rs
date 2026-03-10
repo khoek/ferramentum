@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{BufRead, BufReader, ErrorKind, Read};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, LazyLock, Mutex, mpsc};
@@ -8,11 +8,10 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
-use csv::StringRecord;
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::cache::{CloudCacheModel, load_cache_store, persist_instances, upsert_instance};
 use crate::gpu::{
@@ -24,6 +23,11 @@ use crate::listing::{
     listed_instance as base_listed_instance, present_field, push_field,
 };
 use crate::model::{Cloud, CloudMachineCandidate, CreateSearchRequirements, IceConfig};
+use crate::providers::catalog::{
+    MachineRegionEntry, MachineRegionKey, MachineRegionSkipEntry, RefreshCatalogOutcome,
+    build_machine_region_index, changed_entry_count_by_key, machine_region_skip_reason,
+    skipped_machine_region_key_set,
+};
 use crate::providers::{
     CloudInstance, CloudProvider, RemoteCloudProvider, RemoteSshProvider, clear_cached_arc,
     load_cached_arc,
@@ -34,9 +38,9 @@ use crate::support::{
     ICE_LABEL_PREFIX, ICE_WORKLOAD_CONTAINER_METADATA_KEY, ICE_WORKLOAD_KIND_METADATA_KEY,
     ICE_WORKLOAD_REGISTRY_METADATA_KEY, ICE_WORKLOAD_SOURCE_METADATA_KEY, VAST_POLL_INTERVAL_SECS,
     VAST_WAIT_TIMEOUT_SECS, build_cloud_instance_name, elapsed_hours_from_rfc3339, elapsed_since,
-    now_unix_secs, prefix_lookup_indices, progress_bar, run_command_json, run_command_output,
-    run_command_status, run_command_text, spinner, truncate_ellipsis, visible_instance_name,
-    write_temp_file,
+    now_unix_secs, prefix_lookup_indices, progress_bar, render_command_line, run_command_json,
+    run_command_output, run_command_status, run_command_text, spinner, truncate_ellipsis,
+    visible_instance_name, write_temp_file,
 };
 use crate::ui::print_warning;
 use crate::unpack::{
@@ -56,20 +60,37 @@ const AWS_DEFAULT_AMI_PARAMETER_X86_64: &str =
 const AWS_DEFAULT_AMI_PARAMETER_ARM64: &str =
     "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64";
 const AWS_LOCAL_CATALOG_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
-const AWS_PRICE_LIST_BASE_URL: &str = "https://pricing.us-east-1.amazonaws.com";
+const AWS_MACHINE_SHAPE_CACHE_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
+const AWS_REGION_OFFERINGS_CACHE_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+const AWS_ZONE_OFFERINGS_CACHE_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 const AWS_PRICE_LIST_REGION_INDEX_URL: &str =
     "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/region_index.json";
-const AWS_PRICE_LIST_CSV_METADATA_ROWS: usize = 5;
 const AWS_PRICING_MAX_RETRIES: u32 = 10;
 const AWS_PRICING_MAX_ATTEMPTS: u32 = AWS_PRICING_MAX_RETRIES + 1;
 const AWS_PRICING_CONNECT_TIMEOUT_SECS: u64 = 30;
 const AWS_PRICING_REQUEST_TIMEOUT_SECS: u64 = 1800;
+const AWS_PRICING_MAX_PARALLEL_REQUESTS: usize = 4;
+const AWS_INSTANCE_TYPES_PER_REQUEST: usize = 100;
+const AWS_PRICING_QUERY_PAGE_SIZE: &str = "100";
+const AWS_PRICING_FILTER_VALUE_MAX_CHARS: usize = 1024;
 const AWS_PRICE_LIST_REGION: &str = "us-east-1";
 const AWS_REGION_FILTER_LOCATION_TYPE: &str = "AWS Region";
 const AWS_COMPUTE_INSTANCE_PRODUCT_FAMILY: &str = "Compute Instance";
 const AWS_BARE_METAL_PRODUCT_FAMILY: &str = "Compute Instance (bare metal)";
 static AWS_LOCAL_CATALOG_STORE_CACHE: LazyLock<Mutex<Option<Arc<AwsMachineCatalogStore>>>> =
     LazyLock::new(|| Mutex::new(None));
+static AWS_MACHINE_PRICING_MAP_STORE_CACHE: LazyLock<
+    Mutex<Option<Arc<AwsMachinePricingMapStore>>>,
+> = LazyLock::new(|| Mutex::new(None));
+static AWS_MACHINE_SHAPE_CACHE_STORE_CACHE: LazyLock<
+    Mutex<Option<Arc<AwsMachineShapeCacheStore>>>,
+> = LazyLock::new(|| Mutex::new(None));
+static AWS_REGION_OFFERINGS_CACHE_STORE_CACHE: LazyLock<
+    Mutex<Option<Arc<AwsRegionOfferingsCacheStore>>>,
+> = LazyLock::new(|| Mutex::new(None));
+static AWS_ZONE_OFFERINGS_CACHE_STORE_CACHE: LazyLock<
+    Mutex<Option<Arc<AwsZoneOfferingsCacheStore>>>,
+> = LazyLock::new(|| Mutex::new(None));
 
 fn aws_parallelism(task_count: usize) -> usize {
     thread::available_parallelism()
@@ -79,16 +100,19 @@ fn aws_parallelism(task_count: usize) -> usize {
         .min(task_count.max(1))
 }
 
+fn aws_pricing_parallelism(task_count: usize) -> usize {
+    aws_parallelism(task_count).min(AWS_PRICING_MAX_PARALLEL_REQUESTS)
+}
+
 #[derive(Debug, Clone)]
 struct AwsImageRequirements {
     architecture: String,
     virtualization_type: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct AwsMachineShape {
     machine: String,
-    region: String,
     vcpus: u32,
     ram_mb: u32,
     gpus: Vec<String>,
@@ -134,7 +158,8 @@ pub(crate) struct CacheStore {
 pub(crate) struct AwsMachineCatalogEntry {
     pub(crate) machine: String,
     pub(crate) region: String,
-    pub(crate) zone: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) zone: Option<String>,
     pub(crate) vcpus: u32,
     pub(crate) ram_mb: u32,
     #[serde(default)]
@@ -155,20 +180,102 @@ struct AwsMachineCatalogStore {
     entries: Vec<AwsMachineCatalogEntry>,
 }
 
-#[derive(Debug)]
-pub(crate) struct RefreshCatalogOutcome {
-    pub(crate) path: PathBuf,
-    pub(crate) entry_count: usize,
-    pub(crate) changed_entry_count: usize,
-    pub(crate) warning_count: usize,
-    pub(crate) warning_summary: Vec<String>,
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct AwsMachineShapeCacheStore {
+    #[serde(default)]
+    refreshed_at_unix: u64,
+    #[serde(default)]
+    entries: Vec<AwsMachineShape>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct AwsRegionOfferingsCacheStore {
+    #[serde(default)]
+    entries: Vec<AwsRegionOfferingsCacheEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AwsRegionOfferingsCacheEntry {
+    region: String,
+    #[serde(default)]
+    refreshed_at_unix: u64,
+    #[serde(default)]
+    machines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AwsMachinePricingMapEntry {
+    machine: String,
+    region: String,
+    skip_reason: String,
+}
+
+impl MachineRegionEntry for AwsMachinePricingMapEntry {
+    fn machine(&self) -> &str {
+        &self.machine
+    }
+
+    fn region(&self) -> &str {
+        &self.region
+    }
+}
+
+impl MachineRegionSkipEntry for AwsMachinePricingMapEntry {
+    fn skip_reason(&self) -> Option<&str> {
+        Some(self.skip_reason.as_str())
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct AwsMachinePricingMapStore {
+    #[serde(default)]
+    refreshed_at_unix: u64,
+    #[serde(default)]
+    entries: Vec<AwsMachinePricingMapEntry>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct AwsZoneOfferingsCacheStore {
+    #[serde(default)]
+    entries: Vec<AwsZoneOfferingsCacheEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AwsZoneOfferingsCacheEntry {
+    region: String,
+    zone: String,
+    #[serde(default)]
+    refreshed_at_unix: u64,
+    #[serde(default)]
+    machines: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum AwsCatalogWarning {
-    MissingInstanceOffering { machine: String, region: String },
+    PricingMapEntryNowPriced { machine: String, region: String },
+    StaleMachinePricingMap { machine: String, region: String },
     MissingPrice { machine: String, region: String },
     HostTenancyPriceOnly { machine: String, region: String },
+}
+
+impl MachineRegionEntry for AwsCatalogWarning {
+    fn machine(&self) -> &str {
+        match self {
+            AwsCatalogWarning::PricingMapEntryNowPriced { machine, .. }
+            | AwsCatalogWarning::StaleMachinePricingMap { machine, .. }
+            | AwsCatalogWarning::MissingPrice { machine, .. }
+            | AwsCatalogWarning::HostTenancyPriceOnly { machine, .. } => machine,
+        }
+    }
+
+    fn region(&self) -> &str {
+        match self {
+            AwsCatalogWarning::PricingMapEntryNowPriced { region, .. }
+            | AwsCatalogWarning::StaleMachinePricingMap { region, .. }
+            | AwsCatalogWarning::MissingPrice { region, .. }
+            | AwsCatalogWarning::HostTenancyPriceOnly { region, .. } => region,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,26 +289,81 @@ struct AwsPriceListRegionFile {
     current_version_url: String,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct AwsBulkPriceCsvColumns {
-    term_type: usize,
-    unit: usize,
-    currency: usize,
-    price_per_unit: usize,
-    product_family: usize,
-    location_type: usize,
-    instance_type: usize,
-    tenancy: usize,
-    operating_system: usize,
-    pre_installed_software: usize,
-    capacity_status: usize,
-    region_code: usize,
-}
-
 #[derive(Debug, Default)]
 struct AwsLivePricing {
     shared_prices: HashMap<(String, String), f64>,
     available_tenancies: HashMap<(String, String), BTreeSet<String>>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct AwsPricingCacheStore {
+    #[serde(default)]
+    regions: Vec<AwsPricingCacheRegion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AwsPricingCacheRegion {
+    region: String,
+    current_version_url: String,
+    #[serde(default)]
+    entries: Vec<AwsPricingCacheEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AwsPricingCacheEntry {
+    machine: String,
+    #[serde(default)]
+    shared_hourly_usd: Option<f64>,
+    #[serde(default)]
+    available_tenancies: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AwsRegionPricingVersion {
+    region: String,
+    current_version_url: String,
+}
+
+#[derive(Debug, Clone)]
+struct AwsPricingQueryBatch {
+    region_codes: Vec<String>,
+    instance_types: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AwsPricingQueryProduct {
+    #[serde(default, rename = "version")]
+    _version: Option<String>,
+    product: AwsPricingQueryProductMetadata,
+    #[serde(default)]
+    terms: AwsPricingQueryTerms,
+}
+
+#[derive(Debug, Deserialize)]
+struct AwsPricingQueryProductMetadata {
+    #[serde(rename = "productFamily")]
+    product_family: String,
+    attributes: HashMap<String, String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AwsPricingQueryTerms {
+    #[serde(default, rename = "OnDemand")]
+    on_demand: HashMap<String, AwsPricingQueryTerm>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AwsPricingQueryTerm {
+    #[serde(default, rename = "priceDimensions")]
+    price_dimensions: HashMap<String, AwsPricingQueryPriceDimension>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AwsPricingQueryPriceDimension {
+    #[serde(default)]
+    unit: String,
+    #[serde(default, rename = "pricePerUnit")]
+    price_per_unit: HashMap<String, String>,
 }
 
 impl AwsInstance {
@@ -411,6 +573,10 @@ impl RemoteSshProvider for Provider {
         create_instance(config, candidate, hours, workload)
     }
 
+    fn shell_connect_command(config: &IceConfig, instance: &Self::Instance) -> Result<String> {
+        build_shell_connect_command(config, instance)
+    }
+
     fn open_instance_shell(config: &IceConfig, instance: &Self::Instance) -> Result<()> {
         open_shell(config, instance)
     }
@@ -474,6 +640,10 @@ pub(crate) fn find_cheapest_machine_candidate(
     let preferred_region = validated_preferred_region(config)?;
     let search_zone = resolve_search_zone(config, preferred_region.as_deref())?;
     let images = resolve_search_image_requirements(config, preferred_region.as_deref())?;
+    let zone_offered_machines = match (preferred_region.as_deref(), search_zone.as_deref()) {
+        (Some(region), Some(zone)) => Some(load_zone_instance_offerings(config, region, zone)?),
+        _ => None,
+    };
     let override_name = machine_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -484,6 +654,13 @@ pub(crate) fn find_cheapest_machine_candidate(
             .iter()
             .any(|entry| entry.machine.eq_ignore_ascii_case(name))
     {
+        if let Some(region) = preferred_region.as_deref() {
+            return Err(missing_catalog_entry_error(
+                name,
+                region,
+                search_zone.as_deref(),
+            ));
+        }
         bail!(
             "Machine type `{name}` is not present in the local AWS catalog. Run `ice refresh-catalog --cloud aws`."
         );
@@ -496,6 +673,7 @@ pub(crate) fn find_cheapest_machine_candidate(
         &images,
         preferred_region.as_deref(),
         search_zone.as_deref(),
+        zone_offered_machines.as_ref(),
     )
 }
 
@@ -572,7 +750,7 @@ fn describe_image_requirements(
 }
 
 fn refresh_machine_offer(
-    _config: &IceConfig,
+    config: &IceConfig,
     candidate: &CloudMachineCandidate,
 ) -> Result<CloudMachineCandidate> {
     let catalog = load_local_catalog_store().with_context(
@@ -580,19 +758,16 @@ fn refresh_machine_offer(
     )?;
     let entry = catalog_entry_for_candidate(&catalog, candidate)
         .cloned()
-        .ok_or_else(|| match candidate.zone.as_deref() {
-            Some(zone) => anyhow!(
-                "Machine type `{}` in `{}` / `{zone}` is not present in the local AWS catalog. Run `ice refresh-catalog --cloud aws`.",
-                candidate.machine,
-                candidate.region
-            ),
-            None => anyhow!(
-                "Machine type `{}` in `{}` is not present in the local AWS catalog. Run `ice refresh-catalog --cloud aws`.",
-                candidate.machine,
-                candidate.region
-            ),
+        .ok_or_else(|| {
+            missing_catalog_entry_error(
+                &candidate.machine,
+                &candidate.region,
+                candidate.zone.as_deref(),
+            )
         })?;
-    let zone = candidate.zone.as_ref().map(|_| entry.zone.clone());
+    if let Some(zone) = candidate.zone.as_deref() {
+        ensure_machine_offered_in_zone(config, &entry.region, zone, &entry.machine)?;
+    }
     Ok(CloudMachineCandidate {
         machine: entry.machine,
         vcpus: entry.vcpus,
@@ -600,7 +775,7 @@ fn refresh_machine_offer(
         gpus: entry.gpus,
         hourly_usd: entry.hourly_usd,
         region: entry.region,
-        zone,
+        zone: candidate.zone.clone(),
     })
 }
 
@@ -621,6 +796,109 @@ fn map_gpu_filter_to_aws_accelerator(value: &str) -> Option<String> {
     })
 }
 
+fn merge_cached_pricing_region(
+    pricing: &mut AwsLivePricing,
+    cached_region: &AwsPricingCacheRegion,
+) {
+    for entry in &cached_region.entries {
+        let key = (cached_region.region.clone(), entry.machine.clone());
+        if let Some(hourly_usd) = entry.shared_hourly_usd {
+            let current = pricing
+                .shared_prices
+                .entry(key.clone())
+                .or_insert(hourly_usd);
+            *current = (*current).min(hourly_usd);
+        }
+        if !entry.available_tenancies.is_empty() {
+            pricing
+                .available_tenancies
+                .entry(key)
+                .or_default()
+                .extend(entry.available_tenancies.iter().cloned());
+        }
+    }
+}
+
+fn cached_pricing_region_from_live_pricing(
+    region: &str,
+    current_version_url: &str,
+    pricing: &AwsLivePricing,
+    wanted_instance_types: &HashSet<String>,
+) -> AwsPricingCacheRegion {
+    let region_key = region.to_owned();
+    let mut machines = wanted_instance_types
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    machines.extend(
+        pricing
+            .shared_prices
+            .keys()
+            .filter(|(entry_region, _)| entry_region == &region_key)
+            .map(|(_, machine)| machine.clone()),
+    );
+    machines.extend(
+        pricing
+            .available_tenancies
+            .keys()
+            .filter(|(entry_region, _)| entry_region == &region_key)
+            .map(|(_, machine)| machine.clone()),
+    );
+
+    let entries = machines
+        .into_iter()
+        .map(|machine| {
+            let key = (region_key.clone(), machine.clone());
+            let mut available_tenancies = pricing
+                .available_tenancies
+                .get(&key)
+                .map(|tenancies| tenancies.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            available_tenancies.sort();
+            available_tenancies.dedup();
+            AwsPricingCacheEntry {
+                machine,
+                shared_hourly_usd: pricing.shared_prices.get(&key).copied(),
+                available_tenancies,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    AwsPricingCacheRegion {
+        region: region.to_owned(),
+        current_version_url: current_version_url.to_owned(),
+        entries,
+    }
+}
+
+fn merge_live_pricing(pricing: &mut AwsLivePricing, additional: AwsLivePricing) {
+    for (key, hourly_usd) in additional.shared_prices {
+        let current = pricing.shared_prices.entry(key).or_insert(hourly_usd);
+        *current = (*current).min(hourly_usd);
+    }
+    for (key, tenancies) in additional.available_tenancies {
+        pricing
+            .available_tenancies
+            .entry(key)
+            .or_default()
+            .extend(tenancies);
+    }
+}
+
+fn cached_pricing_region_is_complete(
+    cached_region: &AwsPricingCacheRegion,
+    wanted_instance_types: &HashSet<String>,
+) -> bool {
+    let cached_machines = cached_region
+        .entries
+        .iter()
+        .map(|entry| entry.machine.as_str())
+        .collect::<HashSet<_>>();
+    wanted_instance_types
+        .iter()
+        .all(|machine| cached_machines.contains(machine.as_str()))
+}
+
 fn load_live_prices_for_regions(
     regions: &[String],
     instance_types: &[String],
@@ -630,17 +908,65 @@ fn load_live_prices_for_regions(
     }
 
     let client = aws_pricing_http_client()?;
+    let region_versions = aws_region_pricing_versions(&client, regions)?;
     let wanted_instance_types = instance_types.iter().cloned().collect::<HashSet<_>>();
-    let region_price_files = aws_region_price_files(&client, regions)?;
+    let mut pricing = AwsLivePricing::default();
+    let previous_cache = load_pricing_cache_store()?.unwrap_or_default();
+    let requested_regions = regions.iter().map(String::as_str).collect::<HashSet<_>>();
+    let retained_cache_regions = previous_cache
+        .regions
+        .iter()
+        .filter(|cached| !requested_regions.contains(cached.region.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let cached_by_region = previous_cache
+        .regions
+        .iter()
+        .map(|entry| (entry.region.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    let mut next_cache_regions = Vec::new();
+    let mut stale_region_versions = Vec::new();
+
+    for region_version in region_versions {
+        let cached_region = cached_by_region
+            .get(region_version.region.as_str())
+            .filter(|cached| {
+                cached.current_version_url == region_version.current_version_url
+                    && cached_pricing_region_is_complete(cached, &wanted_instance_types)
+            });
+        if let Some(cached_region) = cached_region {
+            merge_cached_pricing_region(&mut pricing, cached_region);
+            next_cache_regions.push((*cached_region).clone());
+        } else {
+            stale_region_versions.push(region_version);
+        }
+    }
+
+    let reused_region_count = next_cache_regions.len();
+    let stale_region_count = stale_region_versions.len();
+    if stale_region_versions.is_empty() {
+        let spinner = spinner("Loading pricing: reusing cached AWS pricing...");
+        spinner.finish_with_message(format!(
+            "Loaded AWS pricing for {} region/type pairs ({} cached regions reused, 0 regions refreshed).",
+            pricing.shared_prices.len(),
+            reused_region_count
+        ));
+        return Ok(pricing);
+    }
+
+    let batches = aws_pricing_query_batches(&stale_region_versions, instance_types)?;
+    let batch_count = batches.len();
     let progress = progress_bar(
         "Loading pricing:",
-        "0 region/type pairs",
-        region_price_files.len() as u64,
+        &format!(
+            "{} cached regions reused, 0 region/type pairs",
+            reused_region_count
+        ),
+        batch_count as u64,
     );
-    let mut pricing = AwsLivePricing::default();
-    let queue = Mutex::new(region_price_files.into_iter().collect::<VecDeque<_>>());
+    let queue = Mutex::new(batches.into_iter().collect::<VecDeque<_>>());
     let (sender, receiver) = mpsc::channel();
-    let worker_count = aws_parallelism(
+    let worker_count = aws_pricing_parallelism(
         queue
             .lock()
             .expect("AWS pricing queue mutex poisoned")
@@ -651,46 +977,67 @@ fn load_live_prices_for_regions(
         for _ in 0..worker_count {
             let sender = sender.clone();
             let queue = &queue;
-            let client = &client;
-            let wanted_instance_types = &wanted_instance_types;
             scope.spawn(move || {
                 loop {
-                    let region_price_file = {
+                    let batch = {
                         let mut guard = queue.lock().expect("AWS pricing queue mutex poisoned");
                         guard.pop_front()
                     };
-                    let Some((region, csv_url)) = region_price_file else {
+                    let Some(batch) = batch else {
                         break;
                     };
-                    let result = load_live_price_file_for_region(
-                        client,
-                        &region,
-                        &csv_url,
-                        wanted_instance_types,
+                    let label = format!(
+                        "{} regions x {} instance types",
+                        batch.region_codes.len(),
+                        batch.instance_types.len()
                     );
-                    let _ = sender.send((region, result));
+                    let result = load_live_price_query_batch(&batch);
+                    let _ = sender.send((label, result));
                 }
             });
         }
         drop(sender);
 
+        let mut stale_pricing = AwsLivePricing::default();
         let mut completed = 0_u64;
-        while let Ok((region, result)) = receiver.recv() {
+        while let Ok((label, result)) = receiver.recv() {
             completed += 1;
             progress.set_position(completed);
-            let region_pricing = result
-                .with_context(|| format!("Failed to load AWS bulk price list in {region}"))?;
-            merge_live_pricing(&mut pricing, region_pricing);
-            progress.set_message(format!("{} region/type pairs", pricing.shared_prices.len()));
+            let batch_pricing =
+                result.with_context(|| format!("Failed to query AWS pricing for {label}"))?;
+            merge_live_pricing(&mut stale_pricing, batch_pricing);
+            progress.set_message(format!(
+                "{} cached regions reused, {} region/type pairs",
+                reused_region_count,
+                pricing.shared_prices.len() + stale_pricing.shared_prices.len()
+            ));
         }
-        Ok(pricing)
+        Ok(stale_pricing)
     });
 
     match result {
-        Ok(pricing) => {
+        Ok(stale_pricing) => {
+            for region_version in &stale_region_versions {
+                let cached_region = cached_pricing_region_from_live_pricing(
+                    &region_version.region,
+                    &region_version.current_version_url,
+                    &stale_pricing,
+                    &wanted_instance_types,
+                );
+                merge_cached_pricing_region(&mut pricing, &cached_region);
+                next_cache_regions.push(cached_region);
+            }
+            next_cache_regions.extend(retained_cache_regions);
+            next_cache_regions.sort_by(|left, right| left.region.cmp(&right.region));
+            save_pricing_cache_store(&AwsPricingCacheStore {
+                regions: next_cache_regions,
+            })?;
             progress.finish_with_message(format!(
-                "Loaded AWS pricing for {} region/type pairs.",
-                pricing.shared_prices.len()
+                "Loaded AWS pricing for {} region/type pairs ({} cached regions reused, {} query batches, {} regions refreshed).",
+                pricing.shared_prices.len(),
+                reused_region_count,
+                batch_count,
+                stale_region_count
             ));
             Ok(pricing)
         }
@@ -701,48 +1048,18 @@ fn load_live_prices_for_regions(
     }
 }
 
-fn merge_live_pricing(pricing: &mut AwsLivePricing, region_pricing: AwsLivePricing) {
-    for (key, hourly_usd) in region_pricing.shared_prices {
-        let entry = pricing.shared_prices.entry(key).or_insert(hourly_usd);
-        *entry = (*entry).min(hourly_usd);
-    }
-    for (key, tenancies) in region_pricing.available_tenancies {
-        pricing
-            .available_tenancies
-            .entry(key)
-            .or_default()
-            .extend(tenancies);
-    }
-}
-
-impl AwsBulkPriceCsvColumns {
-    fn from_headers(headers: &StringRecord) -> Result<Self> {
-        Ok(Self {
-            term_type: csv_header_index(headers, "TermType")?,
-            unit: csv_header_index(headers, "Unit")?,
-            currency: csv_header_index(headers, "Currency")?,
-            price_per_unit: csv_header_index(headers, "PricePerUnit")?,
-            product_family: csv_header_index(headers, "Product Family")?,
-            location_type: csv_header_index(headers, "Location Type")?,
-            instance_type: csv_header_index(headers, "Instance Type")?,
-            tenancy: csv_header_index(headers, "Tenancy")?,
-            operating_system: csv_header_index(headers, "Operating System")?,
-            pre_installed_software: csv_header_index(headers, "Pre Installed S/W")?,
-            capacity_status: csv_header_index(headers, "CapacityStatus")?,
-            region_code: csv_header_index(headers, "Region Code")?,
-        })
-    }
-}
-
 fn aws_pricing_http_client() -> Result<Client> {
     Client::builder()
         .connect_timeout(Duration::from_secs(AWS_PRICING_CONNECT_TIMEOUT_SECS))
         .timeout(Duration::from_secs(AWS_PRICING_REQUEST_TIMEOUT_SECS))
         .build()
-        .context("Failed to build the AWS bulk pricing HTTP client")
+        .context("Failed to build the AWS pricing HTTP client")
 }
 
-fn aws_region_price_files(client: &Client, regions: &[String]) -> Result<Vec<(String, String)>> {
+fn aws_region_pricing_versions(
+    client: &Client,
+    regions: &[String],
+) -> Result<Vec<AwsRegionPricingVersion>> {
     let index = send_aws_pricing_request(
         || client.get(AWS_PRICE_LIST_REGION_INDEX_URL),
         "load the AWS EC2 bulk price list region index",
@@ -762,41 +1079,261 @@ fn aws_region_price_files(client: &Client, regions: &[String]) -> Result<Vec<(St
         ));
     }
 
-    let price_files = regions
+    let region_versions = regions
         .iter()
         .filter_map(|region| {
-            index.regions.get(region).map(|entry| {
-                aws_price_list_csv_url(&entry.current_version_url)
-                    .map(|csv_url| (region.clone(), csv_url))
-            })
+            index
+                .regions
+                .get(region)
+                .map(|entry| AwsRegionPricingVersion {
+                    region: region.clone(),
+                    current_version_url: entry.current_version_url.clone(),
+                })
         })
-        .collect::<Result<Vec<_>>>()?;
-    if price_files.is_empty() {
+        .collect::<Vec<_>>();
+    if region_versions.is_empty() {
         bail!("AWS bulk price list index did not include any of the requested regions.");
     }
-    Ok(price_files)
+    Ok(region_versions)
 }
 
-fn aws_price_list_csv_url(current_version_url: &str) -> Result<String> {
-    let prefix = current_version_url
-        .strip_suffix("/index.json")
-        .ok_or_else(|| anyhow!("Unexpected AWS price list URL `{current_version_url}`."))?;
-    Ok(format!("{AWS_PRICE_LIST_BASE_URL}{prefix}/index.csv"))
+fn aws_pricing_query_batches(
+    stale_region_versions: &[AwsRegionPricingVersion],
+    instance_types: &[String],
+) -> Result<Vec<AwsPricingQueryBatch>> {
+    let region_codes = stale_region_versions
+        .iter()
+        .map(|entry| entry.region.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let region_batches = chunk_aws_any_of_filter_values(&region_codes)?;
+    let instance_type_batches = chunk_aws_any_of_filter_values(instance_types)?;
+    let mut batches = Vec::with_capacity(region_batches.len() * instance_type_batches.len());
+
+    for region_codes in &region_batches {
+        for instance_types in &instance_type_batches {
+            batches.push(AwsPricingQueryBatch {
+                region_codes: region_codes.clone(),
+                instance_types: instance_types.clone(),
+            });
+        }
+    }
+
+    Ok(batches)
 }
 
-fn load_live_price_file_for_region(
-    client: &Client,
-    region: &str,
-    csv_url: &str,
-    wanted_instance_types: &HashSet<String>,
-) -> Result<AwsLivePricing> {
-    let response = send_aws_pricing_request(
-        || client.get(csv_url),
-        &format!("download the AWS EC2 bulk price list for {region}"),
+fn chunk_aws_any_of_filter_values(values: &[String]) -> Result<Vec<Vec<String>>> {
+    let ordered_values = values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut batches = Vec::new();
+    let mut current_batch = Vec::new();
+    let mut current_len = 0_usize;
+
+    for value in ordered_values {
+        if value.len() > AWS_PRICING_FILTER_VALUE_MAX_CHARS {
+            bail!(
+                "AWS pricing filter value `{value}` exceeds the {} character filter limit.",
+                AWS_PRICING_FILTER_VALUE_MAX_CHARS
+            );
+        }
+        let next_len = if current_batch.is_empty() {
+            value.len()
+        } else {
+            current_len + 1 + value.len()
+        };
+        if !current_batch.is_empty() && next_len > AWS_PRICING_FILTER_VALUE_MAX_CHARS {
+            batches.push(current_batch);
+            current_batch = Vec::new();
+            current_len = 0;
+        }
+        if current_batch.is_empty() {
+            current_len = value.len();
+        } else {
+            current_len += 1 + value.len();
+        }
+        current_batch.push(value);
+    }
+
+    if !current_batch.is_empty() {
+        batches.push(current_batch);
+    }
+    Ok(batches)
+}
+
+fn load_live_price_query_batch(batch: &AwsPricingQueryBatch) -> Result<AwsLivePricing> {
+    let mut command = Command::new("aws");
+    command.args(["pricing", "get-products"]);
+    command.args(["--service-code", "AmazonEC2"]);
+    command.args(["--region", AWS_PRICE_LIST_REGION]);
+    command.args(["--format-version", "aws_v1"]);
+    command.args(["--page-size", AWS_PRICING_QUERY_PAGE_SIZE]);
+    command.args([
+        "--cli-connect-timeout",
+        &AWS_PRICING_CONNECT_TIMEOUT_SECS.to_string(),
+    ]);
+    command.args([
+        "--cli-read-timeout",
+        &AWS_PRICING_REQUEST_TIMEOUT_SECS.to_string(),
+    ]);
+    command.args(["--no-cli-pager", "--output", "json"]);
+    let filters = json!([
+        {
+            "Type": "ANY_OF",
+            "Field": "instanceType",
+            "Value": batch.instance_types.join(","),
+        },
+        {
+            "Type": "ANY_OF",
+            "Field": "regionCode",
+            "Value": batch.region_codes.join(","),
+        },
+        {
+            "Type": "TERM_MATCH",
+            "Field": "operatingSystem",
+            "Value": "Linux",
+        },
+        {
+            "Type": "TERM_MATCH",
+            "Field": "preInstalledSw",
+            "Value": "NA",
+        },
+        {
+            "Type": "TERM_MATCH",
+            "Field": "capacitystatus",
+            "Value": "Used",
+        },
+        {
+            "Type": "TERM_MATCH",
+            "Field": "locationType",
+            "Value": AWS_REGION_FILTER_LOCATION_TYPE,
+        }
+    ]);
+    command.args([
+        "--filters",
+        &serde_json::to_string(&filters).context("Failed to serialize AWS pricing filters")?,
+    ]);
+    let value = run_command_json(
+        &mut command,
+        &format!(
+            "query AWS pricing for {} regions and {} instance types",
+            batch.region_codes.len(),
+            batch.instance_types.len()
+        ),
     )?;
+    let wanted_regions = batch.region_codes.iter().cloned().collect::<HashSet<_>>();
+    let wanted_instance_types = batch.instance_types.iter().cloned().collect::<HashSet<_>>();
     let mut pricing = AwsLivePricing::default();
-    ingest_bulk_price_csv(&mut pricing, response, wanted_instance_types)?;
+    ingest_pricing_query_results(
+        &mut pricing,
+        &value,
+        &wanted_regions,
+        &wanted_instance_types,
+    )?;
     Ok(pricing)
+}
+
+fn ingest_pricing_query_results(
+    pricing: &mut AwsLivePricing,
+    value: &Value,
+    wanted_regions: &HashSet<String>,
+    wanted_instance_types: &HashSet<String>,
+) -> Result<()> {
+    let price_list = value
+        .get("PriceList")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("AWS pricing query response did not contain a PriceList array."))?;
+    for item in price_list {
+        let item = item.as_str().ok_or_else(|| {
+            anyhow!("AWS pricing query response contained a non-string PriceList item.")
+        })?;
+        ingest_pricing_query_product(pricing, item, wanted_regions, wanted_instance_types)?;
+    }
+    Ok(())
+}
+
+fn ingest_pricing_query_product(
+    pricing: &mut AwsLivePricing,
+    item: &str,
+    wanted_regions: &HashSet<String>,
+    wanted_instance_types: &HashSet<String>,
+) -> Result<()> {
+    let product = serde_json::from_str::<AwsPricingQueryProduct>(item).with_context(|| {
+        format!(
+            "Failed to parse AWS pricing product {}",
+            truncate_ellipsis(item, 240)
+        )
+    })?;
+    if !matches!(
+        product.product.product_family.as_str(),
+        AWS_COMPUTE_INSTANCE_PRODUCT_FAMILY | AWS_BARE_METAL_PRODUCT_FAMILY
+    ) {
+        return Ok(());
+    }
+
+    let attributes = &product.product.attributes;
+    if query_product_attr(attributes, "operatingSystem") != Some("Linux")
+        || query_product_attr(attributes, "preInstalledSw") != Some("NA")
+        || query_product_attr(attributes, "capacitystatus") != Some("Used")
+        || query_product_attr(attributes, "locationType") != Some(AWS_REGION_FILTER_LOCATION_TYPE)
+    {
+        return Ok(());
+    }
+
+    let Some(region) = query_product_attr(attributes, "regionCode")
+        .filter(|value| wanted_regions.contains(*value))
+    else {
+        return Ok(());
+    };
+    let Some(machine) = query_product_attr(attributes, "instanceType")
+        .filter(|value| wanted_instance_types.contains(*value))
+    else {
+        return Ok(());
+    };
+    let Some(tenancy) = query_product_attr(attributes, "tenancy") else {
+        return Ok(());
+    };
+    let key = (region.to_owned(), machine.to_owned());
+    pricing
+        .available_tenancies
+        .entry(key.clone())
+        .or_default()
+        .insert(tenancy.to_owned());
+    if tenancy != "Shared" {
+        return Ok(());
+    }
+    let Some(hourly_usd) = aws_ondemand_hourly_usd(&product.terms) else {
+        return Ok(());
+    };
+    let current = pricing.shared_prices.entry(key).or_insert(hourly_usd);
+    *current = (*current).min(hourly_usd);
+    Ok(())
+}
+
+fn query_product_attr<'a>(attributes: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    attributes
+        .get(name)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn aws_ondemand_hourly_usd(terms: &AwsPricingQueryTerms) -> Option<f64> {
+    terms
+        .on_demand
+        .values()
+        .flat_map(|term| term.price_dimensions.values())
+        .filter(|dimension| dimension.unit == "Hrs")
+        .filter_map(|dimension| dimension.price_per_unit.get("USD"))
+        .filter_map(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .min_by(|left, right| left.total_cmp(right))
 }
 
 fn send_aws_pricing_request<F>(mut make_request: F, context: &str) -> Result<Response>
@@ -849,111 +1386,78 @@ where
     )
 }
 
-fn ingest_bulk_price_csv(
-    pricing: &mut AwsLivePricing,
-    reader: impl Read,
-    wanted_instance_types: &HashSet<String>,
-) -> Result<()> {
-    let mut reader = BufReader::new(reader);
-    skip_bulk_price_csv_metadata(&mut reader)?;
-    let mut csv_reader = csv::ReaderBuilder::new().flexible(true).from_reader(reader);
-    let columns = AwsBulkPriceCsvColumns::from_headers(
-        csv_reader
-            .headers()
-            .context("Failed to read the AWS bulk price list CSV header")?,
-    )?;
-    for row in csv_reader.records() {
-        let row = row.context("Failed to parse an AWS bulk price list CSV row")?;
-        ingest_bulk_price_csv_row(pricing, &row, columns, wanted_instance_types);
-    }
-    Ok(())
-}
-
-fn skip_bulk_price_csv_metadata(reader: &mut impl BufRead) -> Result<()> {
-    let mut line = String::new();
-    for _ in 0..AWS_PRICE_LIST_CSV_METADATA_ROWS {
-        line.clear();
-        if reader
-            .read_line(&mut line)
-            .context("Failed to read the AWS bulk price list CSV metadata")?
-            == 0
-        {
-            bail!("AWS bulk price list CSV ended before the header row.");
+fn load_machine_shapes_for_offerings(
+    config: &IceConfig,
+    region_offerings: &HashMap<String, Vec<String>>,
+) -> Result<Vec<AwsMachineShape>> {
+    let mut representative_region_by_machine = BTreeMap::new();
+    for (region, machines) in region_offerings {
+        for machine in machines {
+            representative_region_by_machine
+                .entry(machine.clone())
+                .or_insert_with(|| region.clone());
         }
     }
-    Ok(())
-}
+    if representative_region_by_machine.is_empty() {
+        bail!("AWS region offerings returned no machine types.");
+    }
 
-fn csv_header_index(headers: &StringRecord, name: &str) -> Result<usize> {
-    headers
+    let cache_store = load_machine_shape_cache_store()?;
+    let cache_is_fresh = aws_cache_is_fresh(
+        cache_store.refreshed_at_unix,
+        AWS_MACHINE_SHAPE_CACHE_MAX_AGE_SECS,
+    );
+    let cached_by_machine = cache_store
+        .entries
         .iter()
-        .position(|header| header == name)
-        .ok_or_else(|| anyhow!("AWS bulk price list CSV is missing the `{name}` column."))
-}
-
-fn ingest_bulk_price_csv_row(
-    pricing: &mut AwsLivePricing,
-    row: &StringRecord,
-    columns: AwsBulkPriceCsvColumns,
-    wanted_instance_types: &HashSet<String>,
-) {
-    if csv_field(row, columns.term_type) != Some("OnDemand")
-        || csv_field(row, columns.unit) != Some("Hrs")
-        || csv_field(row, columns.currency) != Some("USD")
-        || !matches!(
-            csv_field(row, columns.product_family),
-            Some(AWS_COMPUTE_INSTANCE_PRODUCT_FAMILY | AWS_BARE_METAL_PRODUCT_FAMILY)
-        )
-        || csv_field(row, columns.location_type) != Some(AWS_REGION_FILTER_LOCATION_TYPE)
-        || csv_field(row, columns.operating_system) != Some("Linux")
-        || csv_field(row, columns.pre_installed_software) != Some("NA")
-        || csv_field(row, columns.capacity_status) != Some("Used")
+        .map(|shape| (shape.machine.as_str(), shape))
+        .collect::<HashMap<_, _>>();
+    if cache_is_fresh
+        && representative_region_by_machine
+            .keys()
+            .all(|machine| cached_by_machine.contains_key(machine.as_str()))
     {
-        return;
+        let shapes = representative_region_by_machine
+            .keys()
+            .filter_map(|machine| cached_by_machine.get(machine.as_str()).copied().cloned())
+            .collect::<Vec<_>>();
+        let spinner = spinner("Loading machine types: reusing cached AWS machine shapes...");
+        spinner.finish_with_message(format!(
+            "Loaded {} AWS machine types from the machine-shape cache.",
+            shapes.len(),
+        ));
+        return Ok(shapes);
     }
 
-    let Some(machine) = csv_field(row, columns.instance_type)
-        .filter(|value| wanted_instance_types.contains(*value))
-    else {
-        return;
-    };
-    let Some(region) = csv_field(row, columns.region_code) else {
-        return;
-    };
-    let Some(tenancy) = csv_field(row, columns.tenancy) else {
-        return;
-    };
-    let Some(hourly_usd) = csv_field(row, columns.price_per_unit)
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value >= 0.0)
-    else {
-        return;
-    };
-    let key = (region.to_owned(), machine.to_owned());
-    pricing
-        .available_tenancies
-        .entry(key.clone())
-        .or_default()
-        .insert(tenancy.to_owned());
-    if tenancy != "Shared" {
-        return;
+    let mut region_batches = Vec::new();
+    for (region, machines) in representative_region_by_machine.iter().fold(
+        BTreeMap::<String, Vec<String>>::new(),
+        |mut grouped, (machine, region)| {
+            grouped
+                .entry(region.clone())
+                .or_default()
+                .push(machine.clone());
+            grouped
+        },
+    ) {
+        for batch in machines.chunks(AWS_INSTANCE_TYPES_PER_REQUEST) {
+            region_batches.push((region.clone(), batch.to_vec()));
+        }
     }
-    let entry = pricing.shared_prices.entry(key).or_insert(hourly_usd);
-    *entry = (*entry).min(hourly_usd);
-}
 
-fn csv_field<'a>(row: &'a StringRecord, index: usize) -> Option<&'a str> {
-    row.get(index)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
-fn load_live_machine_shapes(config: &IceConfig) -> Result<Vec<AwsMachineShape>> {
-    let regions = list_active_regions(config)?;
-    let progress = progress_bar("Loading machine types:", "0 types", regions.len() as u64);
-    let queue = Mutex::new(regions.clone().into_iter().collect::<VecDeque<_>>());
+    let progress = progress_bar(
+        "Loading machine types:",
+        "0 machine shapes",
+        region_batches.len() as u64,
+    );
+    let queue = Mutex::new(region_batches.into_iter().collect::<VecDeque<_>>());
     let (sender, receiver) = mpsc::channel();
-    let worker_count = aws_parallelism(regions.len());
+    let worker_count = aws_parallelism(
+        queue
+            .lock()
+            .expect("AWS machine-shape queue mutex poisoned")
+            .len(),
+    );
 
     let result = thread::scope(|scope| -> Result<Vec<AwsMachineShape>> {
         for _ in 0..worker_count {
@@ -961,17 +1465,19 @@ fn load_live_machine_shapes(config: &IceConfig) -> Result<Vec<AwsMachineShape>> 
             let queue = &queue;
             scope.spawn(move || {
                 loop {
-                    let region = {
+                    let batch = {
                         let mut guard = queue
                             .lock()
                             .expect("AWS machine-shape queue mutex poisoned");
                         guard.pop_front()
                     };
-                    let Some(region) = region else {
+                    let Some((region, instance_types)) = batch else {
                         break;
                     };
-                    let result = load_live_machine_shapes_for_region(config, &region);
-                    let _ = sender.send((region, result));
+                    let label = format!("{region} ({} machine types)", instance_types.len());
+                    let result =
+                        load_live_machine_shapes_for_region(config, &region, &instance_types);
+                    let _ = sender.send((label, result));
                 }
             });
         }
@@ -979,23 +1485,52 @@ fn load_live_machine_shapes(config: &IceConfig) -> Result<Vec<AwsMachineShape>> 
 
         let mut shapes = Vec::new();
         let mut completed = 0_u64;
-        while let Ok((region, result)) = receiver.recv() {
+        while let Ok((label, result)) = receiver.recv() {
             completed += 1;
             progress.set_position(completed);
-            let mut region_shapes =
-                result.with_context(|| format!("Failed to load AWS machine shapes in {region}"))?;
-            shapes.append(&mut region_shapes);
-            progress.set_message(format!("{} types", shapes.len()));
+            let mut batch_shapes =
+                result.with_context(|| format!("Failed to load AWS machine shapes for {label}"))?;
+            shapes.append(&mut batch_shapes);
+            progress.set_message(format!("{} machine shapes", shapes.len()));
         }
         Ok(shapes)
     });
 
     match result {
-        Ok(shapes) => {
+        Ok(mut shapes) => {
+            let missing_machines = representative_region_by_machine
+                .keys()
+                .filter(|machine| !shapes.iter().any(|shape| shape.machine == machine.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing_machines.is_empty() {
+                progress.finish_and_clear();
+                bail!(
+                    "AWS machine-shape refresh did not return {} requested machine types. Examples: {}",
+                    missing_machines.len(),
+                    truncate_ellipsis(
+                        &missing_machines
+                            .iter()
+                            .take(8)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        280
+                    )
+                );
+            }
+            shapes.sort_by(|left, right| left.machine.cmp(&right.machine));
+            save_machine_shape_cache_store(&AwsMachineShapeCacheStore {
+                refreshed_at_unix: now_unix_secs(),
+                entries: shapes.clone(),
+            })?;
             progress.finish_with_message(format!(
-                "Loaded {} AWS machine types from {} regions.",
+                "Loaded {} AWS machine types from {} representative regions.",
                 shapes.len(),
-                regions.len(),
+                representative_region_by_machine
+                    .values()
+                    .collect::<BTreeSet<_>>()
+                    .len(),
             ));
             Ok(shapes)
         }
@@ -1009,6 +1544,7 @@ fn load_live_machine_shapes(config: &IceConfig) -> Result<Vec<AwsMachineShape>> 
 fn load_live_machine_shapes_for_region(
     config: &IceConfig,
     region: &str,
+    instance_types: &[String],
 ) -> Result<Vec<AwsMachineShape>> {
     let mut command = command(config, region);
     command.args([
@@ -1019,33 +1555,67 @@ fn load_live_machine_shapes_for_region(
         "--region",
         region,
     ]);
+    if !instance_types.is_empty() {
+        command.arg("--instance-types");
+        for machine in instance_types {
+            command.arg(machine);
+        }
+    }
     let value = run_command_json(
         &mut command,
-        &format!("describe aws instance types in {region}"),
+        &format!(
+            "describe {} aws instance types in {region}",
+            instance_types.len()
+        ),
     )?;
-    Ok(parse_machine_shapes(&value, region))
+    let shapes = parse_machine_shapes(&value);
+    let parsed_machines = shapes
+        .iter()
+        .map(|shape| shape.machine.as_str())
+        .collect::<HashSet<_>>();
+    let missing = instance_types
+        .iter()
+        .filter(|machine| !parsed_machines.contains(machine.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "AWS describe-instance-types in {region} did not return {} requested machine types. Examples: {}",
+            missing.len(),
+            truncate_ellipsis(
+                &missing
+                    .iter()
+                    .take(8)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                280
+            )
+        );
+    }
+    Ok(shapes)
 }
 
 #[cfg(test)]
-fn parse_machine_shape(value: &Value, region: &str) -> Option<AwsMachineShape> {
+fn parse_machine_shape(value: &Value) -> Option<AwsMachineShape> {
     value
         .get("InstanceTypes")
         .and_then(Value::as_array)
         .and_then(|rows| rows.first())
-        .and_then(|row| parse_machine_shape_row(row, region))
+        .and_then(parse_machine_shape_row)
 }
 
-fn parse_machine_shapes(value: &Value, region: &str) -> Vec<AwsMachineShape> {
+fn parse_machine_shapes(value: &Value) -> Vec<AwsMachineShape> {
     value
         .get("InstanceTypes")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|row| parse_machine_shape_row(row, region))
+        .filter_map(parse_machine_shape_row)
         .collect()
 }
 
-fn parse_machine_shape_row(row: &Value, region: &str) -> Option<AwsMachineShape> {
+fn parse_machine_shape_row(row: &Value) -> Option<AwsMachineShape> {
     let machine = row.get("InstanceType")?.as_str()?.to_owned();
     let vcpus = row
         .get("VCpuInfo")?
@@ -1066,7 +1636,6 @@ fn parse_machine_shape_row(row: &Value, region: &str) -> Option<AwsMachineShape>
 
     Some(AwsMachineShape {
         machine,
-        region: region.to_owned(),
         vcpus,
         ram_mb: ((f64::from(ram_mib)) * 1.048_576).round() as u32,
         gpus,
@@ -1162,6 +1731,251 @@ fn aws_catalog_path() -> Result<PathBuf> {
     runtime_provider_data_path(Cloud::Aws, "machine-catalog.toml")
 }
 
+fn aws_machine_pricing_map_path() -> Result<PathBuf> {
+    runtime_provider_data_path(Cloud::Aws, "machine-pricing-map.toml")
+}
+
+fn aws_machine_shape_cache_path() -> Result<PathBuf> {
+    runtime_provider_data_path(Cloud::Aws, "machine-shapes.toml")
+}
+
+fn aws_region_offerings_cache_path() -> Result<PathBuf> {
+    runtime_provider_data_path(Cloud::Aws, "region-offerings.toml")
+}
+
+fn aws_pricing_cache_path() -> Result<PathBuf> {
+    runtime_provider_data_path(Cloud::Aws, "pricing-cache.toml")
+}
+
+fn aws_zone_offerings_cache_path() -> Result<PathBuf> {
+    runtime_provider_data_path(Cloud::Aws, "zone-offerings.toml")
+}
+
+fn load_pricing_cache_store() -> Result<Option<AwsPricingCacheStore>> {
+    let path = aws_pricing_cache_path()?;
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("Failed to read AWS pricing cache at {}", path.display())
+            });
+        }
+    };
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+    let store = toml::from_str::<AwsPricingCacheStore>(&content)
+        .with_context(|| format!("Failed to parse AWS pricing cache at {}", path.display()))?;
+    Ok(Some(store))
+}
+
+fn save_pricing_cache_store(store: &AwsPricingCacheStore) -> Result<PathBuf> {
+    let path = aws_pricing_cache_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Invalid AWS pricing cache path {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
+    let content = toml::to_string_pretty(store).context("Failed to serialize AWS pricing cache")?;
+    fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+fn load_machine_shape_cache_store() -> Result<Arc<AwsMachineShapeCacheStore>> {
+    load_cached_arc(
+        &AWS_MACHINE_SHAPE_CACHE_STORE_CACHE,
+        || {
+            let path = aws_machine_shape_cache_path()?;
+            let content = match fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    return Ok(AwsMachineShapeCacheStore::default());
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "Failed to read AWS machine-shape cache at {}",
+                            path.display()
+                        )
+                    });
+                }
+            };
+            if content.trim().is_empty() {
+                return Ok(AwsMachineShapeCacheStore::default());
+            }
+            toml::from_str::<AwsMachineShapeCacheStore>(&content).with_context(|| {
+                format!(
+                    "Failed to parse AWS machine-shape cache at {}",
+                    path.display()
+                )
+            })
+        },
+        "AWS runtime-data",
+    )
+}
+
+fn save_machine_shape_cache_store(store: &AwsMachineShapeCacheStore) -> Result<PathBuf> {
+    let path = aws_machine_shape_cache_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Invalid AWS machine-shape cache path {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
+    let content =
+        toml::to_string_pretty(store).context("Failed to serialize AWS machine-shape cache")?;
+    fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+    clear_cached_arc(&AWS_MACHINE_SHAPE_CACHE_STORE_CACHE, "AWS runtime-data")?;
+    Ok(path)
+}
+
+fn load_machine_pricing_map_store() -> Result<Arc<AwsMachinePricingMapStore>> {
+    load_cached_arc(
+        &AWS_MACHINE_PRICING_MAP_STORE_CACHE,
+        || {
+            let path = aws_machine_pricing_map_path()?;
+            let content = match fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    return Ok(AwsMachinePricingMapStore::default());
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("Failed to read AWS pricing map at {}", path.display())
+                    });
+                }
+            };
+            if content.trim().is_empty() {
+                return Ok(AwsMachinePricingMapStore::default());
+            }
+            let store =
+                toml::from_str::<AwsMachinePricingMapStore>(&content).with_context(|| {
+                    format!("Failed to parse AWS pricing map at {}", path.display())
+                })?;
+            build_machine_region_index(&store.entries, |key| {
+                format!(
+                    "Duplicate AWS pricing map entry for `{}` in `{}`.",
+                    key.machine, key.region
+                )
+            })?;
+            if store
+                .entries
+                .iter()
+                .any(|entry| entry.skip_reason.trim().is_empty())
+            {
+                bail!(
+                    "AWS pricing map at {} contains an empty skip reason.",
+                    path.display()
+                );
+            }
+            Ok(store)
+        },
+        "AWS runtime-data",
+    )
+}
+
+fn save_machine_pricing_map_store(store: &AwsMachinePricingMapStore) -> Result<PathBuf> {
+    let path = aws_machine_pricing_map_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Invalid AWS pricing map path {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
+    let content = toml::to_string_pretty(store).context("Failed to serialize AWS pricing map")?;
+    fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+    clear_cached_arc(&AWS_MACHINE_PRICING_MAP_STORE_CACHE, "AWS runtime-data")?;
+    Ok(path)
+}
+
+fn load_region_offerings_cache_store() -> Result<Arc<AwsRegionOfferingsCacheStore>> {
+    load_cached_arc(
+        &AWS_REGION_OFFERINGS_CACHE_STORE_CACHE,
+        || {
+            let path = aws_region_offerings_cache_path()?;
+            let content = match fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    return Ok(AwsRegionOfferingsCacheStore::default());
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "Failed to read AWS region-offerings cache at {}",
+                            path.display()
+                        )
+                    });
+                }
+            };
+            if content.trim().is_empty() {
+                return Ok(AwsRegionOfferingsCacheStore::default());
+            }
+            toml::from_str::<AwsRegionOfferingsCacheStore>(&content).with_context(|| {
+                format!(
+                    "Failed to parse AWS region-offerings cache at {}",
+                    path.display()
+                )
+            })
+        },
+        "AWS runtime-data",
+    )
+}
+
+fn save_region_offerings_cache_store(store: &AwsRegionOfferingsCacheStore) -> Result<PathBuf> {
+    let path = aws_region_offerings_cache_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Invalid AWS region-offerings cache path {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
+    let content =
+        toml::to_string_pretty(store).context("Failed to serialize AWS region-offerings cache")?;
+    fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+    clear_cached_arc(&AWS_REGION_OFFERINGS_CACHE_STORE_CACHE, "AWS runtime-data")?;
+    Ok(path)
+}
+
+fn load_zone_offerings_cache_store() -> Result<Arc<AwsZoneOfferingsCacheStore>> {
+    load_cached_arc(
+        &AWS_ZONE_OFFERINGS_CACHE_STORE_CACHE,
+        || {
+            let path = aws_zone_offerings_cache_path()?;
+            let content = match fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    return Ok(AwsZoneOfferingsCacheStore::default());
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "Failed to read AWS zone-offerings cache at {}",
+                            path.display()
+                        )
+                    });
+                }
+            };
+            if content.trim().is_empty() {
+                return Ok(AwsZoneOfferingsCacheStore::default());
+            }
+            toml::from_str::<AwsZoneOfferingsCacheStore>(&content).with_context(|| {
+                format!(
+                    "Failed to parse AWS zone-offerings cache at {}",
+                    path.display()
+                )
+            })
+        },
+        "AWS runtime-data",
+    )
+}
+
+fn save_zone_offerings_cache_store(store: &AwsZoneOfferingsCacheStore) -> Result<PathBuf> {
+    let path = aws_zone_offerings_cache_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Invalid AWS zone-offerings cache path {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
+    let content =
+        toml::to_string_pretty(store).context("Failed to serialize AWS zone-offerings cache")?;
+    fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+    clear_cached_arc(&AWS_ZONE_OFFERINGS_CACHE_STORE_CACHE, "AWS runtime-data")?;
+    Ok(path)
+}
+
 fn load_local_catalog_store() -> Result<Arc<AwsMachineCatalogStore>> {
     load_cached_arc(
         &AWS_LOCAL_CATALOG_STORE_CACHE,
@@ -1186,8 +2000,7 @@ fn load_local_catalog_store() -> Result<Arc<AwsMachineCatalogStore>> {
                 );
             }
             if store.entries.iter().any(|entry| {
-                entry.zone.trim().is_empty()
-                    || entry.ram_mb == 0
+                entry.ram_mb == 0
                     || entry.architecture.trim().is_empty()
                     || entry.virtualization_types.is_empty()
             }) {
@@ -1250,55 +2063,115 @@ fn warn_if_catalog_stale(store: &AwsMachineCatalogStore) {
     }
 }
 
+fn aws_cache_is_fresh(refreshed_at_unix: u64, max_age_secs: u64) -> bool {
+    refreshed_at_unix != 0 && now_unix_secs().saturating_sub(refreshed_at_unix) <= max_age_secs
+}
+
 fn changed_catalog_entry_count(
     previous: &[AwsMachineCatalogEntry],
     current: &[AwsMachineCatalogEntry],
 ) -> usize {
-    let previous_by_key = previous
-        .iter()
-        .map(|entry| {
-            (
-                (
-                    entry.region.clone(),
-                    entry.zone.clone(),
-                    entry.machine.clone(),
-                ),
-                entry,
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let current_by_key = current
-        .iter()
-        .map(|entry| {
-            (
-                (
-                    entry.region.clone(),
-                    entry.zone.clone(),
-                    entry.machine.clone(),
-                ),
-                entry,
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let updated_or_added = current_by_key
-        .iter()
-        .filter(|(key, entry)| match previous_by_key.get(*key) {
-            Some(previous_entry) => *previous_entry != **entry,
-            None => true,
-        })
-        .count();
-    let deleted = previous_by_key
+    changed_entry_count_by_key(previous, current, |entry| {
+        (
+            entry.region.clone(),
+            entry.zone.clone(),
+            entry.machine.clone(),
+        )
+    })
+}
+
+fn aws_machine_pricing_skip_reason(warning: &AwsCatalogWarning) -> Option<&'static str> {
+    match warning {
+        AwsCatalogWarning::PricingMapEntryNowPriced { .. }
+        | AwsCatalogWarning::StaleMachinePricingMap { .. } => None,
+        AwsCatalogWarning::MissingPrice { .. } => Some(
+            "intentionally skipped from the local AWS catalog because the AWS Pricing API returned no live Shared Linux/NA/Used on-demand price for this machine/region during refresh",
+        ),
+        AwsCatalogWarning::HostTenancyPriceOnly { .. } => Some(
+            "intentionally skipped from the local AWS catalog because the AWS Pricing API only returned Host-tenancy pricing for this machine/region, and ice does not provision dedicated hosts",
+        ),
+    }
+}
+
+fn build_machine_pricing_map_store(
+    warnings: &BTreeMap<AwsCatalogWarning, Vec<String>>,
+) -> AwsMachinePricingMapStore {
+    let mut entries = warnings
         .keys()
-        .filter(|key| !current_by_key.contains_key(*key))
-        .count();
-    updated_or_added + deleted
+        .filter_map(|warning| {
+            aws_machine_pricing_skip_reason(warning).map(|skip_reason| match warning {
+                AwsCatalogWarning::MissingPrice { machine, region }
+                | AwsCatalogWarning::HostTenancyPriceOnly { machine, region } => {
+                    AwsMachinePricingMapEntry {
+                        machine: machine.clone(),
+                        region: region.clone(),
+                        skip_reason: skip_reason.to_owned(),
+                    }
+                }
+                AwsCatalogWarning::PricingMapEntryNowPriced { .. }
+                | AwsCatalogWarning::StaleMachinePricingMap { .. } => unreachable!(),
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        left.region
+            .cmp(&right.region)
+            .then_with(|| left.machine.cmp(&right.machine))
+    });
+    AwsMachinePricingMapStore {
+        refreshed_at_unix: now_unix_secs(),
+        entries,
+    }
+}
+
+fn aws_machine_pricing_skip_note(machine: &str, region: &str) -> Option<String> {
+    let store = load_machine_pricing_map_store().ok()?;
+    machine_region_skip_reason(&store.entries, machine, region)
+}
+
+fn missing_catalog_entry_error(machine: &str, region: &str, zone: Option<&str>) -> anyhow::Error {
+    if let Some(skip_reason) = aws_machine_pricing_skip_note(machine, region) {
+        return match zone {
+            Some(zone) => anyhow!(
+                "Machine type `{machine}` in `{region}` / `{zone}` is not present in the local AWS catalog. {skip_reason}."
+            ),
+            None => anyhow!(
+                "Machine type `{machine}` in `{region}` is not present in the local AWS catalog. {skip_reason}."
+            ),
+        };
+    }
+    match zone {
+        Some(zone) => anyhow!(
+            "Machine type `{machine}` in `{region}` / `{zone}` is not present in the local AWS catalog. Run `ice refresh-catalog --cloud aws`."
+        ),
+        None => anyhow!(
+            "Machine type `{machine}` in `{region}` is not present in the local AWS catalog. Run `ice refresh-catalog --cloud aws`."
+        ),
+    }
+}
+
+fn ensure_machine_offered_in_zone(
+    config: &IceConfig,
+    region: &str,
+    zone: &str,
+    machine: &str,
+) -> Result<()> {
+    let offered_machines = load_zone_instance_offerings(config, region, zone)?;
+    if offered_machines
+        .iter()
+        .any(|item| item.eq_ignore_ascii_case(machine))
+    {
+        return Ok(());
+    }
+    bail!("Machine type `{machine}` is not currently offered in `{region}` / `{zone}`.")
 }
 
 fn aws_catalog_warning_priority(warning: &AwsCatalogWarning) -> u8 {
     match warning {
-        AwsCatalogWarning::MissingPrice { .. } => 0,
-        AwsCatalogWarning::MissingInstanceOffering { .. } => 1,
-        AwsCatalogWarning::HostTenancyPriceOnly { .. } => 2,
+        AwsCatalogWarning::PricingMapEntryNowPriced { .. } => 0,
+        AwsCatalogWarning::StaleMachinePricingMap { .. } => 1,
+        AwsCatalogWarning::MissingPrice { .. } => 2,
+        AwsCatalogWarning::HostTenancyPriceOnly { .. } => 3,
     }
 }
 
@@ -1319,44 +2192,85 @@ fn render_catalog_warnings(warnings: &BTreeMap<AwsCatalogWarning, Vec<String>>) 
     sorted_catalog_warnings(warnings)
         .into_iter()
         .take(8)
-        .map(|(warning, zones)| match warning {
-            AwsCatalogWarning::MissingInstanceOffering { machine, region } => format!(
-                "missing AWS zone offering for `{machine}` in `{region}`: returned by the live instance-type list but not by the zone-offering list."
+        .map(|(warning, details)| match warning {
+            AwsCatalogWarning::PricingMapEntryNowPriced { machine, region } => format!(
+                "stale pricing map for `{machine}` in `{region}`: AWS now returns a live Shared Linux/NA/Used on-demand price."
             ),
-            AwsCatalogWarning::MissingPrice { machine, region } => {
-                let preview = zones.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
-                format!(
-                    "{} zones: missing live AWS price for `{machine}` in `{region}`. Examples: {preview}",
-                    zones.len()
-                )
-            }
-            AwsCatalogWarning::HostTenancyPriceOnly { machine, region } => {
-                let preview = zones.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
-                format!(
-                    "{} zones: live AWS price for `{machine}` in `{region}` exists only with `Host` tenancy. Examples: {preview}",
-                    zones.len()
-                )
-            }
+            AwsCatalogWarning::StaleMachinePricingMap { machine, region } => format!(
+                "stale pricing map for `{machine}` in `{region}`: not returned by the live AWS region-offerings list."
+            ),
+            AwsCatalogWarning::MissingPrice { machine, region } => details
+                .first()
+                .map(|detail| format!("missing live AWS price for `{machine}` in `{region}`. {detail}"))
+                .unwrap_or_else(|| format!("missing live AWS price for `{machine}` in `{region}`.")),
+            AwsCatalogWarning::HostTenancyPriceOnly { machine, region } => details
+                .first()
+                .map(|detail| {
+                    format!(
+                        "live AWS price for `{machine}` in `{region}` exists only with `Host` tenancy. {detail}"
+                    )
+                })
+                .unwrap_or_else(|| {
+                    format!("live AWS price for `{machine}` in `{region}` exists only with `Host` tenancy.")
+                }),
         })
         .collect()
+}
+
+fn reconcile_aws_catalog_warnings(
+    previous: &AwsMachinePricingMapStore,
+    current_skip_warnings: &BTreeMap<AwsCatalogWarning, Vec<String>>,
+    current_offered_keys: &HashSet<MachineRegionKey>,
+    prices: &AwsLivePricing,
+) -> BTreeMap<AwsCatalogWarning, Vec<String>> {
+    let previous_skip_keys = skipped_machine_region_key_set(&previous.entries);
+    let current_skip_keys = current_skip_warnings
+        .keys()
+        .map(AwsCatalogWarning::machine_region_key)
+        .collect::<HashSet<_>>();
+    let mut warnings = current_skip_warnings
+        .iter()
+        .filter(|(warning, _)| !previous_skip_keys.contains(&warning.machine_region_key()))
+        .map(|(warning, details)| (warning.clone(), details.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    for entry in &previous.entries {
+        let key = entry.machine_region_key();
+        if current_skip_keys.contains(&key) {
+            continue;
+        }
+        if prices
+            .shared_prices
+            .contains_key(&(entry.region.clone(), entry.machine.clone()))
+        {
+            warnings
+                .entry(AwsCatalogWarning::PricingMapEntryNowPriced {
+                    machine: entry.machine.clone(),
+                    region: entry.region.clone(),
+                })
+                .or_default();
+            continue;
+        }
+        if !current_offered_keys.contains(&key) {
+            warnings
+                .entry(AwsCatalogWarning::StaleMachinePricingMap {
+                    machine: entry.machine.clone(),
+                    region: entry.region.clone(),
+                })
+                .or_default();
+        }
+    }
+    warnings
 }
 
 fn catalog_entry_for_candidate<'a>(
     catalog: &'a AwsMachineCatalogStore,
     candidate: &CloudMachineCandidate,
 ) -> Option<&'a AwsMachineCatalogEntry> {
-    catalog
-        .entries
-        .iter()
-        .filter(|entry| {
-            entry.machine.eq_ignore_ascii_case(&candidate.machine)
-                && entry.region.eq_ignore_ascii_case(&candidate.region)
-                && candidate
-                    .zone
-                    .as_deref()
-                    .is_none_or(|zone| entry.zone.eq_ignore_ascii_case(zone))
-        })
-        .min_by(|left, right| left.zone.cmp(&right.zone))
+    catalog.entries.iter().find(|entry| {
+        entry.machine.eq_ignore_ascii_case(&candidate.machine)
+            && entry.region.eq_ignore_ascii_case(&candidate.region)
+    })
 }
 
 fn catalog_entry_matches_image_requirements(
@@ -1379,6 +2293,7 @@ fn select_cheapest_machine_candidate(
     image_requirements: &[AwsImageRequirements],
     preferred_region: Option<&str>,
     search_zone: Option<&str>,
+    zone_offered_machines: Option<&HashSet<String>>,
 ) -> Result<CloudMachineCandidate> {
     let override_name = machine_override
         .map(str::trim)
@@ -1393,8 +2308,7 @@ fn select_cheapest_machine_candidate(
         .map(|gpu| normalize_gpu_name_token(&gpu))
         .collect::<HashSet<_>>();
     let min_ram_mb = req.min_ram_gb * 1000.0;
-    let mut unique_region_matches = BTreeMap::new();
-    let mut zonal_matches = Vec::new();
+    let mut matches_by_region_machine = BTreeMap::new();
 
     for entry in catalog {
         if let Some(region) = preferred_region
@@ -1402,8 +2316,8 @@ fn select_cheapest_machine_candidate(
         {
             continue;
         }
-        if let Some(zone) = search_zone
-            && !entry.zone.eq_ignore_ascii_case(zone)
+        if search_zone.is_some()
+            && zone_offered_machines.is_some_and(|machines| !machines.contains(&entry.machine))
         {
             continue;
         }
@@ -1432,20 +2346,12 @@ fn select_cheapest_machine_candidate(
                 continue;
             }
         }
-        if search_zone.is_some() {
-            zonal_matches.push(entry.clone());
-        } else {
-            unique_region_matches
-                .entry((entry.region.clone(), entry.machine.clone()))
-                .or_insert_with(|| entry.clone());
-        }
+        matches_by_region_machine
+            .entry((entry.region.clone(), entry.machine.clone()))
+            .or_insert_with(|| entry.clone());
     }
 
-    let mut candidates = if search_zone.is_some() {
-        zonal_matches
-    } else {
-        unique_region_matches.into_values().collect::<Vec<_>>()
-    };
+    let mut candidates = matches_by_region_machine.into_values().collect::<Vec<_>>();
 
     if candidates.is_empty() {
         bail!(
@@ -1471,18 +2377,8 @@ fn select_cheapest_machine_candidate(
                     .unwrap_or(false);
                 right_pref.cmp(&left_pref)
             })
-            .then_with(|| {
-                let left_pref = search_zone
-                    .map(|zone| left.zone.eq_ignore_ascii_case(zone))
-                    .unwrap_or(false);
-                let right_pref = search_zone
-                    .map(|zone| right.zone.eq_ignore_ascii_case(zone))
-                    .unwrap_or(false);
-                right_pref.cmp(&left_pref)
-            })
             .then_with(|| left.region.cmp(&right.region))
             .then_with(|| left.machine.cmp(&right.machine))
-            .then_with(|| left.zone.cmp(&right.zone))
     });
 
     let winner = candidates
@@ -1496,25 +2392,76 @@ fn select_cheapest_machine_candidate(
         gpus: winner.gpus,
         hourly_usd: winner.hourly_usd,
         region: winner.region,
-        zone: search_zone.map(|_| winner.zone),
+        zone: search_zone.map(str::to_owned),
     })
 }
 
-fn load_live_instance_offerings(
+fn load_region_instance_offerings(
     config: &IceConfig,
     regions: &[String],
-) -> Result<HashMap<(String, String), Vec<String>>> {
+) -> Result<HashMap<String, Vec<String>>> {
+    if regions.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let previous_cache = load_region_offerings_cache_store()?;
+    let cached_by_region = previous_cache
+        .entries
+        .iter()
+        .map(|entry| (entry.region.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    let requested_regions = regions.iter().map(String::as_str).collect::<HashSet<_>>();
+    let retained_cache_entries = previous_cache
+        .entries
+        .iter()
+        .filter(|entry| !requested_regions.contains(entry.region.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut offerings = HashMap::<String, Vec<String>>::new();
+    let mut next_cache_entries = Vec::new();
+    let mut stale_regions = Vec::new();
+
+    for region in regions {
+        let cached = cached_by_region
+            .get(region.as_str())
+            .filter(|entry| {
+                aws_cache_is_fresh(
+                    entry.refreshed_at_unix,
+                    AWS_REGION_OFFERINGS_CACHE_MAX_AGE_SECS,
+                ) && !entry.machines.is_empty()
+            })
+            .copied();
+        if let Some(cached) = cached {
+            offerings.insert(region.clone(), cached.machines.clone());
+            next_cache_entries.push(cached.clone());
+        } else {
+            stale_regions.push(region.clone());
+        }
+    }
+
+    if stale_regions.is_empty() {
+        let entry_count = offerings.values().map(Vec::len).sum::<usize>();
+        let spinner = spinner("Loading offerings: reusing cached AWS region offerings...");
+        spinner.finish_with_message(format!(
+            "Loaded AWS region offerings for {entry_count} region/type pairs ({} cached regions reused, 0 regions refreshed).",
+            next_cache_entries.len(),
+        ));
+        return Ok(offerings);
+    }
+
     let progress = progress_bar(
         "Loading offerings:",
-        "0 region/type pairs",
-        regions.len() as u64,
+        &format!(
+            "{} cached regions reused, 0 region/type pairs",
+            next_cache_entries.len()
+        ),
+        stale_regions.len() as u64,
     );
-    let mut offerings = HashMap::<(String, String), BTreeSet<String>>::new();
-    let queue = Mutex::new(regions.iter().cloned().collect::<VecDeque<_>>());
+    let queue = Mutex::new(stale_regions.clone().into_iter().collect::<VecDeque<_>>());
     let (sender, receiver) = mpsc::channel();
-    let worker_count = aws_parallelism(regions.len());
+    let worker_count = aws_parallelism(stale_regions.len());
 
-    let result = thread::scope(|scope| -> Result<HashMap<(String, String), Vec<String>>> {
+    let result = thread::scope(|scope| -> Result<HashMap<String, Vec<String>>> {
         for _ in 0..worker_count {
             let sender = sender.clone();
             let queue = &queue;
@@ -1527,7 +2474,8 @@ fn load_live_instance_offerings(
                     let Some(region) = region else {
                         break;
                     };
-                    let result = load_live_instance_offerings_for_region(config, &region);
+                    let result =
+                        load_live_region_instance_offerings_for_region(config, &region, None);
                     let _ = sender.send((region, result));
                 }
             });
@@ -1535,27 +2483,46 @@ fn load_live_instance_offerings(
         drop(sender);
 
         let mut completed = 0_u64;
+        let mut refreshed = HashMap::new();
         while let Ok((region, result)) = receiver.recv() {
             completed += 1;
             progress.set_position(completed);
-            for (key, zones) in result
-                .with_context(|| format!("Failed to load AWS instance offerings in {region}"))?
-            {
-                offerings.entry(key).or_default().extend(zones);
-            }
-            progress.set_message(format!("{} region/type pairs", offerings.len()));
+            let machines = result
+                .with_context(|| format!("Failed to load AWS region offerings in {region}"))?
+                .into_iter()
+                .collect::<Vec<_>>();
+            progress.set_message(format!(
+                "{} cached regions reused, {} region/type pairs",
+                next_cache_entries.len(),
+                offerings.values().map(Vec::len).sum::<usize>()
+                    + refreshed.values().map(Vec::len).sum::<usize>()
+                    + machines.len()
+            ));
+            refreshed.insert(region, machines);
         }
-        Ok(offerings
-            .into_iter()
-            .map(|(key, zones)| (key, zones.into_iter().collect()))
-            .collect())
+        Ok(refreshed)
     });
 
     match result {
-        Ok(offerings) => {
+        Ok(refreshed) => {
+            for (region, machines) in refreshed {
+                offerings.insert(region.clone(), machines.clone());
+                next_cache_entries.push(AwsRegionOfferingsCacheEntry {
+                    region,
+                    refreshed_at_unix: now_unix_secs(),
+                    machines,
+                });
+            }
+            next_cache_entries.extend(retained_cache_entries);
+            next_cache_entries.sort_by(|left, right| left.region.cmp(&right.region));
+            save_region_offerings_cache_store(&AwsRegionOfferingsCacheStore {
+                entries: next_cache_entries,
+            })?;
+            let entry_count = offerings.values().map(Vec::len).sum::<usize>();
             progress.finish_with_message(format!(
-                "Loaded AWS instance offerings for {} region/type pairs.",
-                offerings.len(),
+                "Loaded AWS region offerings for {entry_count} region/type pairs ({} cached regions reused, {} regions refreshed).",
+                regions.len().saturating_sub(stale_regions.len()),
+                stale_regions.len(),
             ));
             Ok(offerings)
         }
@@ -1566,16 +2533,106 @@ fn load_live_instance_offerings(
     }
 }
 
-fn load_live_instance_offerings_for_region(
+fn load_live_region_instance_offerings_for_region(
     config: &IceConfig,
     region: &str,
-) -> Result<HashMap<(String, String), BTreeSet<String>>> {
+    instance_types: Option<&[String]>,
+) -> Result<BTreeSet<String>> {
+    let mut command = command(config, region);
+    command.args([
+        "ec2",
+        "describe-instance-type-offerings",
+        "--location-type",
+        "region",
+        "--output",
+        "json",
+        "--region",
+        region,
+    ]);
+    if let Some(instance_types) = instance_types
+        && !instance_types.is_empty()
+    {
+        command.arg("--filters").arg(format!(
+            "Name=instance-type,Values={}",
+            instance_types.join(",")
+        ));
+    }
+    let value = run_command_json(
+        &mut command,
+        &format!("describe aws region instance type offerings in {region}"),
+    )?;
+    let machines = parse_instance_offering_machines(&value, Some(region));
+    if instance_types.is_none() && machines.is_empty() {
+        bail!("AWS region offerings in {region} returned no machine types.");
+    }
+    Ok(machines)
+}
+
+fn load_zone_instance_offerings(
+    config: &IceConfig,
+    region: &str,
+    zone: &str,
+) -> Result<HashSet<String>> {
+    let cache_store = load_zone_offerings_cache_store()?;
+    if let Some(entry) = cache_store.entries.iter().find(|entry| {
+        entry.region.eq_ignore_ascii_case(region)
+            && entry.zone.eq_ignore_ascii_case(zone)
+            && aws_cache_is_fresh(
+                entry.refreshed_at_unix,
+                AWS_ZONE_OFFERINGS_CACHE_MAX_AGE_SECS,
+            )
+    }) {
+        return Ok(entry.machines.iter().cloned().collect());
+    }
+
+    let spinner = spinner(&format!(
+        "Loading AWS zone offerings for {region} / {zone}..."
+    ));
+    let machines = load_live_zone_instance_offerings_for_zone(config, region, zone)?;
+    let mut next_entries = cache_store
+        .entries
+        .iter()
+        .filter(|entry| {
+            !(entry.region.eq_ignore_ascii_case(region) && entry.zone.eq_ignore_ascii_case(zone))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut sorted_machines = machines.iter().cloned().collect::<Vec<_>>();
+    sorted_machines.sort();
+    next_entries.push(AwsZoneOfferingsCacheEntry {
+        region: region.to_owned(),
+        zone: zone.to_owned(),
+        refreshed_at_unix: now_unix_secs(),
+        machines: sorted_machines,
+    });
+    next_entries.sort_by(|left, right| {
+        left.region
+            .cmp(&right.region)
+            .then_with(|| left.zone.cmp(&right.zone))
+    });
+    save_zone_offerings_cache_store(&AwsZoneOfferingsCacheStore {
+        entries: next_entries,
+    })?;
+    spinner.finish_with_message(format!(
+        "Loaded AWS zone offerings for {} machine types in {region} / {zone}.",
+        machines.len()
+    ));
+    Ok(machines)
+}
+
+fn load_live_zone_instance_offerings_for_zone(
+    config: &IceConfig,
+    region: &str,
+    zone: &str,
+) -> Result<HashSet<String>> {
     let mut command = command(config, region);
     command.args([
         "ec2",
         "describe-instance-type-offerings",
         "--location-type",
         "availability-zone",
+        "--filters",
+        &format!("Name=location,Values={zone}"),
         "--output",
         "json",
         "--region",
@@ -1583,15 +2640,34 @@ fn load_live_instance_offerings_for_region(
     ]);
     let value = run_command_json(
         &mut command,
-        &format!("describe aws instance type offerings in {region}"),
+        &format!("describe aws zone instance type offerings in {region} / {zone}"),
     )?;
-    let mut offerings = HashMap::<(String, String), BTreeSet<String>>::new();
+    let machines = parse_instance_offering_machines(&value, Some(zone));
+    if machines.is_empty() {
+        bail!("AWS zone offerings in {region} / {zone} returned no machine types.");
+    }
+    Ok(machines.into_iter().collect())
+}
+
+fn parse_instance_offering_machines(
+    value: &Value,
+    expected_location: Option<&str>,
+) -> BTreeSet<String> {
+    let mut machines = BTreeSet::new();
     for row in value
         .get("InstanceTypeOfferings")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
     {
+        if let Some(location) = expected_location
+            && !row
+                .get("Location")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case(location))
+        {
+            continue;
+        }
         let Some(machine) = row
             .get("InstanceType")
             .and_then(Value::as_str)
@@ -1601,21 +2677,9 @@ fn load_live_instance_offerings_for_region(
         else {
             continue;
         };
-        let Some(zone) = row
-            .get("Location")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-        else {
-            continue;
-        };
-        offerings
-            .entry((region.to_owned(), machine))
-            .or_default()
-            .insert(zone);
+        machines.insert(machine);
     }
-    Ok(offerings)
+    machines
 }
 
 pub(crate) fn refresh_local_catalog(config: &IceConfig) -> Result<RefreshCatalogOutcome> {
@@ -1629,62 +2693,73 @@ pub(crate) fn refresh_local_catalog(config: &IceConfig) -> Result<RefreshCatalog
             None
         }
     };
-    let shapes = load_live_machine_shapes(config)?;
-    let regions = shapes
+    let previous_pricing_map = match load_machine_pricing_map_store() {
+        Ok(store) => store,
+        Err(err) => {
+            print_warning(&format!(
+                "Failed to load the previous AWS pricing map before refresh: {err:#}. \
+                 Skip invalidation warnings may be incomplete."
+            ));
+            Arc::new(AwsMachinePricingMapStore::default())
+        }
+    };
+    let regions = list_active_regions(config)?;
+    let offerings = load_region_instance_offerings(config, &regions)?;
+    let shapes = load_machine_shapes_for_offerings(config, &offerings)?;
+    let shapes_by_machine = shapes
         .iter()
-        .map(|shape| shape.region.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let offerings = load_live_instance_offerings(config, &regions)?;
-    let unique_types = shapes
-        .iter()
-        .map(|shape| shape.machine.clone())
+        .map(|shape| (shape.machine.as_str(), shape))
+        .collect::<HashMap<_, _>>();
+    let unique_types = offerings
+        .values()
+        .flatten()
+        .cloned()
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
     let prices = load_live_prices_for_regions(&regions, &unique_types)?;
-    let mut warnings = BTreeMap::<AwsCatalogWarning, Vec<String>>::new();
+    let current_offered_keys = offerings
+        .iter()
+        .flat_map(|(region, machines)| {
+            machines
+                .iter()
+                .map(|machine| MachineRegionKey::new(region.clone(), machine.clone()))
+        })
+        .collect::<HashSet<_>>();
+    let mut current_skip_warnings = BTreeMap::<AwsCatalogWarning, Vec<String>>::new();
     let mut entries = Vec::new();
 
-    for shape in shapes {
-        let key = (shape.region.clone(), shape.machine.clone());
-        let Some(zones) = offerings.get(&key) else {
-            warnings
-                .entry(AwsCatalogWarning::MissingInstanceOffering {
-                    machine: shape.machine,
-                    region: shape.region,
-                })
-                .or_default();
-            continue;
-        };
-        let Some(hourly_usd) = prices.shared_prices.get(&key).copied() else {
-            let warning = if prices
-                .available_tenancies
-                .get(&key)
-                .is_some_and(|tenancies| tenancies.contains("Host"))
-            {
-                AwsCatalogWarning::HostTenancyPriceOnly {
-                    machine: shape.machine,
-                    region: shape.region,
-                }
-            } else {
-                AwsCatalogWarning::MissingPrice {
-                    machine: shape.machine,
-                    region: shape.region,
-                }
+    for (region, machines) in &offerings {
+        for machine in machines {
+            let shape = shapes_by_machine.get(machine.as_str()).copied().ok_or_else(|| {
+                anyhow!(
+                    "AWS machine-shape cache is missing metadata for `{machine}` while building the refreshed catalog."
+                )
+            })?;
+            let key = (region.clone(), machine.clone());
+            let Some(hourly_usd) = prices.shared_prices.get(&key).copied() else {
+                let warning = if prices
+                    .available_tenancies
+                    .get(&key)
+                    .is_some_and(|tenancies| tenancies.contains("Host"))
+                {
+                    AwsCatalogWarning::HostTenancyPriceOnly {
+                        machine: machine.clone(),
+                        region: region.clone(),
+                    }
+                } else {
+                    AwsCatalogWarning::MissingPrice {
+                        machine: machine.clone(),
+                        region: region.clone(),
+                    }
+                };
+                current_skip_warnings.entry(warning).or_default();
+                continue;
             };
-            warnings
-                .entry(warning)
-                .or_default()
-                .extend(zones.iter().cloned());
-            continue;
-        };
-        for zone in zones {
             entries.push(AwsMachineCatalogEntry {
                 machine: shape.machine.clone(),
-                region: shape.region.clone(),
-                zone: zone.clone(),
+                region: region.clone(),
+                zone: None,
                 vcpus: shape.vcpus,
                 ram_mb: shape.ram_mb,
                 gpus: shape.gpus.clone(),
@@ -1695,6 +2770,12 @@ pub(crate) fn refresh_local_catalog(config: &IceConfig) -> Result<RefreshCatalog
             });
         }
     }
+    let warnings = reconcile_aws_catalog_warnings(
+        &previous_pricing_map,
+        &current_skip_warnings,
+        &current_offered_keys,
+        &prices,
+    );
 
     entries.sort_by(|left, right| {
         left.machine
@@ -1716,8 +2797,9 @@ pub(crate) fn refresh_local_catalog(config: &IceConfig) -> Result<RefreshCatalog
         .map_or(store.entries.len(), |previous| {
             changed_catalog_entry_count(&previous.entries, &store.entries)
         });
+    save_machine_pricing_map_store(&build_machine_pricing_map_store(&current_skip_warnings))?;
     let path = save_local_catalog_store(&store)?;
-    let warning_count = warnings.values().map(|zones| zones.len().max(1)).sum();
+    let warning_count = warnings.len();
     let warning_summary = render_catalog_warnings(&warnings);
     Ok(RefreshCatalogOutcome {
         path,
@@ -1867,17 +2949,38 @@ pub(crate) fn wait_for_state(
 }
 
 pub(crate) fn open_shell(config: &IceConfig, instance: &AwsInstance) -> Result<()> {
-    let remote_command = match instance.workload.as_ref() {
-        Some(InstanceWorkload::Unpack(_)) => {
-            unpack_shell_remote_command(&remote_unpack_dir_for_aws(instance))
-        }
-        Some(workload) => instance_shell_remote_command(workload),
+    run_ssh_command(config, instance, &shell_remote_command(instance)?, true)
+}
+
+fn shell_remote_command(instance: &AwsInstance) -> Result<String> {
+    match instance.workload.as_ref() {
+        Some(InstanceWorkload::Unpack(_)) => Ok(unpack_shell_remote_command(
+            &remote_unpack_dir_for_aws(instance),
+        )),
+        Some(workload) => Ok(instance_shell_remote_command(workload)),
         None => bail!(
             "Instance `{}` is missing workload metadata; refuse to guess its shell mode.",
             instance.instance_id
         ),
-    };
-    run_ssh_command(config, instance, &remote_command, true)
+    }
+}
+
+fn build_shell_connect_command(config: &IceConfig, instance: &AwsInstance) -> Result<String> {
+    let key_path = ssh_key_path(config)?;
+    let user = ssh_user(config);
+    let host = ssh_host(instance)?;
+    Ok(render_command_line(
+        "ssh",
+        [
+            "-i".to_owned(),
+            key_path.display().to_string(),
+            "-o".to_owned(),
+            "StrictHostKeyChecking=accept-new".to_owned(),
+            "-t".to_owned(),
+            format!("{user}@{host}"),
+            shell_remote_command(instance)?,
+        ],
+    ))
 }
 
 pub(crate) fn download(
@@ -1925,6 +3028,9 @@ pub(crate) fn create_instance(
     workload: &InstanceWorkload,
 ) -> Result<AwsInstance> {
     let region = candidate.region.clone();
+    if let Some(zone) = candidate.zone.as_deref() {
+        ensure_machine_offered_in_zone(config, &region, zone, &candidate.machine)?;
+    }
     let ami = if let Some(ami) = config
         .default
         .aws
@@ -1938,11 +3044,7 @@ pub(crate) fn create_instance(
             || "AWS create uses the local catalog only. Run `ice refresh-catalog --cloud aws` first.",
         )?;
         let entry = catalog_entry_for_candidate(&catalog, candidate).ok_or_else(|| {
-            anyhow!(
-                "Machine type `{}` in `{}` is not present in the local AWS catalog. Run `ice refresh-catalog --cloud aws`.",
-                candidate.machine,
-                candidate.region
-            )
+            missing_catalog_entry_error(&candidate.machine, &candidate.region, None)
         })?;
         lookup_default_ami(config, &region, &entry.architecture)?
     };
@@ -2453,7 +3555,7 @@ mod tests {
     fn test_catalog_entry(
         machine: &str,
         region: &str,
-        zone: &str,
+        zone: Option<&str>,
         gpus: &[&str],
         has_accelerators: bool,
         architecture: &str,
@@ -2462,7 +3564,7 @@ mod tests {
         AwsMachineCatalogEntry {
             machine: machine.to_owned(),
             region: region.to_owned(),
-            zone: zone.to_owned(),
+            zone: zone.map(str::to_owned),
             vcpus: 4,
             ram_mb: 16_384,
             gpus: gpus.iter().map(|gpu| (*gpu).to_owned()).collect(),
@@ -2471,6 +3573,45 @@ mod tests {
             virtualization_types: vec![AWS_DEFAULT_VIRTUALIZATION_TYPE.to_owned()],
             hourly_usd,
         }
+    }
+
+    fn pricing_query_product_fixture(
+        product_family: &str,
+        machine: &str,
+        region: &str,
+        tenancy: &str,
+        operating_system: &str,
+        price_per_hour: &str,
+    ) -> String {
+        json!({
+            "product": {
+                "productFamily": product_family,
+                "attributes": {
+                    "capacitystatus": "Used",
+                    "instanceType": machine,
+                    "locationType": AWS_REGION_FILTER_LOCATION_TYPE,
+                    "operatingSystem": operating_system,
+                    "preInstalledSw": "NA",
+                    "regionCode": region,
+                    "tenancy": tenancy,
+                }
+            },
+            "terms": {
+                "OnDemand": {
+                    "sku.ondemand": {
+                        "priceDimensions": {
+                            "sku.ondemand.hourly": {
+                                "unit": "Hrs",
+                                "pricePerUnit": {
+                                    "USD": price_per_hour,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .to_string()
     }
 
     #[test]
@@ -2491,9 +3632,8 @@ mod tests {
             }]
         });
 
-        let shape = parse_machine_shape(&value, "us-east-1").expect("shape should parse");
+        let shape = parse_machine_shape(&value).expect("shape should parse");
         assert_eq!(shape.machine, "g5.12xlarge");
-        assert_eq!(shape.region, "us-east-1");
         assert_eq!(shape.vcpus, 48);
         assert_eq!(shape.ram_mb, 206_158);
         assert_eq!(shape.gpus, vec!["A10", "A10", "A10", "A10"]);
@@ -2565,7 +3705,7 @@ mod tests {
             test_catalog_entry(
                 "g5.xlarge",
                 "us-east-1",
-                "us-east-1a",
+                None,
                 &["A10"],
                 true,
                 AWS_DEFAULT_IMAGE_ARCHITECTURE,
@@ -2574,7 +3714,7 @@ mod tests {
             test_catalog_entry(
                 "c7i.large",
                 "us-east-1",
-                "us-east-1a",
+                None,
                 &[],
                 false,
                 AWS_DEFAULT_IMAGE_ARCHITECTURE,
@@ -2591,6 +3731,7 @@ mod tests {
                 virtualization_type: AWS_DEFAULT_VIRTUALIZATION_TYPE.to_owned(),
             }],
             Some("us-east-1"),
+            None,
             None,
         )
         .expect("candidate");
@@ -2610,7 +3751,7 @@ mod tests {
             test_catalog_entry(
                 "g5.xlarge",
                 "us-east-1",
-                "us-east-1a",
+                None,
                 &["NVIDIA A10G Tensor Core"],
                 true,
                 AWS_DEFAULT_IMAGE_ARCHITECTURE,
@@ -2619,7 +3760,7 @@ mod tests {
             test_catalog_entry(
                 "c7i.large",
                 "us-east-1",
-                "us-east-1a",
+                None,
                 &[],
                 false,
                 AWS_DEFAULT_IMAGE_ARCHITECTURE,
@@ -2636,6 +3777,7 @@ mod tests {
                 virtualization_type: AWS_DEFAULT_VIRTUALIZATION_TYPE.to_owned(),
             }],
             Some("us-east-1"),
+            None,
             None,
         )
         .expect("candidate");
@@ -2654,7 +3796,7 @@ mod tests {
             test_catalog_entry(
                 "c7g.large",
                 "us-east-1",
-                "us-east-1a",
+                None,
                 &[],
                 false,
                 AWS_ARM64_IMAGE_ARCHITECTURE,
@@ -2663,22 +3805,14 @@ mod tests {
             test_catalog_entry(
                 "c7i.large",
                 "us-east-1",
-                "us-east-1b",
-                &[],
-                false,
-                AWS_DEFAULT_IMAGE_ARCHITECTURE,
-                0.08,
-            ),
-            test_catalog_entry(
-                "c7i.large",
-                "us-east-1",
-                "us-east-1a",
+                None,
                 &[],
                 false,
                 AWS_DEFAULT_IMAGE_ARCHITECTURE,
                 0.08,
             ),
         ];
+        let zone_offered_machines = HashSet::from(["c7i.large".to_owned()]);
 
         let candidate = select_cheapest_machine_candidate(
             &catalog,
@@ -2690,6 +3824,7 @@ mod tests {
             }],
             Some("us-east-1"),
             Some("us-east-1a"),
+            Some(&zone_offered_machines),
         )
         .expect("candidate");
         assert_eq!(candidate.machine, "c7i.large");
@@ -2697,28 +3832,62 @@ mod tests {
     }
 
     #[test]
-    fn bulk_price_csv_ingest_accepts_standard_and_bare_metal_linux_rows() {
-        let csv = r#""FormatVersion","v1.0"
-"Disclaimer","test"
-"Publication Date","2026-03-05T20:59:55Z"
-"Version","20260305205955"
-"OfferCode","AmazonEC2"
-"SKU","OfferTermCode","RateCode","TermType","PriceDescription","EffectiveDate","StartingRange","EndingRange","Unit","PricePerUnit","Currency","Product Family","Location Type","Instance Type","Tenancy","Operating System","Pre Installed S/W","CapacityStatus","Region Code"
-"sku-1","term","rate","OnDemand","desc","2026-03-01","0","Inf","Hrs","0.1234000000","USD","Compute Instance","AWS Region","c7i.large","Shared","Linux","NA","Used","us-east-1"
-"sku-2","term","rate","OnDemand","desc","2026-03-01","0","Inf","Hrs","0.4567000000","USD","Compute Instance","AWS Region","c7i.large","Dedicated","Linux","NA","Used","us-east-1"
-"sku-3","term","rate","OnDemand","desc","2026-03-01","0","Inf","Hrs","0.7890000000","USD","Compute Instance","AWS Region","m7i.large","Shared","Windows","NA","Used","us-east-1"
-"sku-4","term","rate","OnDemand","desc","2026-03-01","0","Inf","Hrs","0.1111000000","USD","Compute Instance","AWS Region","c7i.large","Shared","Linux","NA","Used","us-east-1"
-"sku-5","term","rate","OnDemand","desc","2026-03-01","0","Inf","Hrs","4.0800000000","USD","Compute Instance (bare metal)","AWS Region","c5.metal","Shared","Linux","NA","Used","us-east-1"
-"#;
+    fn pricing_query_ingest_accepts_standard_and_bare_metal_linux_rows() {
+        let value = json!({
+            "PriceList": [
+                pricing_query_product_fixture(
+                    AWS_COMPUTE_INSTANCE_PRODUCT_FAMILY,
+                    "c7i.large",
+                    "us-east-1",
+                    "Shared",
+                    "Linux",
+                    "0.1234000000",
+                ),
+                pricing_query_product_fixture(
+                    AWS_COMPUTE_INSTANCE_PRODUCT_FAMILY,
+                    "c7i.large",
+                    "us-east-1",
+                    "Dedicated",
+                    "Linux",
+                    "0.4567000000",
+                ),
+                pricing_query_product_fixture(
+                    AWS_COMPUTE_INSTANCE_PRODUCT_FAMILY,
+                    "m7i.large",
+                    "us-east-1",
+                    "Shared",
+                    "Windows",
+                    "0.7890000000",
+                ),
+                pricing_query_product_fixture(
+                    AWS_COMPUTE_INSTANCE_PRODUCT_FAMILY,
+                    "c7i.large",
+                    "us-east-1",
+                    "Shared",
+                    "Linux",
+                    "0.1111000000",
+                ),
+                pricing_query_product_fixture(
+                    AWS_BARE_METAL_PRODUCT_FAMILY,
+                    "c5.metal",
+                    "us-east-1",
+                    "Shared",
+                    "Linux",
+                    "4.0800000000",
+                )
+            ]
+        });
+        let wanted_regions = HashSet::from(["us-east-1".to_owned()]);
         let wanted_instance_types = HashSet::from(["c5.metal".to_owned(), "c7i.large".to_owned()]);
         let mut pricing = AwsLivePricing::default();
 
-        ingest_bulk_price_csv(
+        ingest_pricing_query_results(
             &mut pricing,
-            std::io::Cursor::new(csv.as_bytes()),
+            &value,
+            &wanted_regions,
             &wanted_instance_types,
         )
-        .expect("AWS bulk price CSV should parse");
+        .expect("AWS pricing query result should parse");
 
         assert_eq!(
             pricing
@@ -2736,28 +3905,80 @@ mod tests {
     }
 
     #[test]
-    fn bulk_price_csv_ingest_tracks_host_only_rows() {
-        let csv = r#""FormatVersion","v1.0"
-"Disclaimer","test"
-"Publication Date","2026-03-05T20:59:55Z"
-"Version","20260305205955"
-"OfferCode","AmazonEC2"
-"SKU","OfferTermCode","RateCode","TermType","PriceDescription","EffectiveDate","StartingRange","EndingRange","Unit","PricePerUnit","Currency","Product Family","Location Type","Instance Type","Tenancy","Operating System","Pre Installed S/W","CapacityStatus","Region Code"
-"sku-1","term","rate","OnDemand","desc","2026-03-01","0","Inf","Hrs","14.0000000000","USD","Compute Instance (bare metal)","AWS Region","mac2.metal","Host","Linux","NA","Used","us-east-1"
-"#;
+    fn pricing_query_ingest_tracks_host_only_rows() {
+        let value = json!({
+            "PriceList": [
+                pricing_query_product_fixture(
+                    AWS_BARE_METAL_PRODUCT_FAMILY,
+                    "mac2.metal",
+                    "us-east-1",
+                    "Host",
+                    "Linux",
+                    "14.0000000000",
+                )
+            ]
+        });
+        let wanted_regions = HashSet::from(["us-east-1".to_owned()]);
         let wanted_instance_types = HashSet::from(["mac2.metal".to_owned()]);
         let mut pricing = AwsLivePricing::default();
 
-        ingest_bulk_price_csv(
+        ingest_pricing_query_results(
             &mut pricing,
-            std::io::Cursor::new(csv.as_bytes()),
+            &value,
+            &wanted_regions,
             &wanted_instance_types,
         )
-        .expect("AWS bulk price CSV should parse");
+        .expect("AWS pricing query result should parse");
 
         assert!(pricing.shared_prices.is_empty());
         assert!(
             pricing
+                .available_tenancies
+                .get(&(String::from("us-east-1"), String::from("mac2.metal")))
+                .is_some_and(|tenancies| tenancies.contains("Host"))
+        );
+    }
+
+    #[test]
+    fn pricing_cache_region_round_trip_preserves_shared_and_host_only_entries() {
+        let mut pricing = AwsLivePricing::default();
+        pricing
+            .shared_prices
+            .insert(("us-east-1".to_owned(), "c7i.large".to_owned()), 0.1111);
+        pricing
+            .available_tenancies
+            .entry(("us-east-1".to_owned(), "c7i.large".to_owned()))
+            .or_default()
+            .extend(["Dedicated".to_owned(), "Shared".to_owned()]);
+        pricing
+            .available_tenancies
+            .entry(("us-east-1".to_owned(), "mac2.metal".to_owned()))
+            .or_default()
+            .insert("Host".to_owned());
+
+        let cached_region = cached_pricing_region_from_live_pricing(
+            "us-east-1",
+            "/offers/v1.0/aws/AmazonEC2/20260305205955/us-east-1/index.json",
+            &pricing,
+            &HashSet::from(["c7i.large".to_owned(), "mac2.metal".to_owned()]),
+        );
+        let mut merged = AwsLivePricing::default();
+        merge_cached_pricing_region(&mut merged, &cached_region);
+
+        assert_eq!(
+            merged
+                .shared_prices
+                .get(&(String::from("us-east-1"), String::from("c7i.large"))),
+            Some(&0.1111)
+        );
+        assert!(
+            merged
+                .available_tenancies
+                .get(&(String::from("us-east-1"), String::from("c7i.large")))
+                .is_some_and(|tenancies| tenancies.contains("Shared"))
+        );
+        assert!(
+            merged
                 .available_tenancies
                 .get(&(String::from("us-east-1"), String::from("mac2.metal")))
                 .is_some_and(|tenancies| tenancies.contains("Host"))
@@ -2790,13 +4011,144 @@ mod tests {
     }
 
     #[test]
-    fn price_list_csv_url_uses_versioned_region_file_path() {
-        assert_eq!(
-            aws_price_list_csv_url(
-                "/offers/v1.0/aws/AmazonEC2/20260305205955/us-east-1/index.json"
-            )
-            .expect("CSV URL should parse"),
-            "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/20260305205955/us-east-1/index.csv"
+    fn machine_pricing_map_store_records_intentional_aws_skips() {
+        let mut warnings = BTreeMap::new();
+        warnings.insert(
+            AwsCatalogWarning::HostTenancyPriceOnly {
+                machine: "mac2.metal".to_owned(),
+                region: "us-east-1".to_owned(),
+            },
+            vec!["us-east-1a".to_owned(), "us-east-1b".to_owned()],
         );
+        warnings.insert(
+            AwsCatalogWarning::MissingPrice {
+                machine: "trn2.3xlarge".to_owned(),
+                region: "sa-east-1".to_owned(),
+            },
+            vec!["sa-east-1a".to_owned()],
+        );
+
+        let store = build_machine_pricing_map_store(&warnings);
+
+        assert_eq!(store.entries.len(), 2);
+        assert_eq!(
+            store.entries,
+            vec![
+                AwsMachinePricingMapEntry {
+                    machine: "trn2.3xlarge".to_owned(),
+                    region: "sa-east-1".to_owned(),
+                    skip_reason: aws_machine_pricing_skip_reason(
+                        &AwsCatalogWarning::MissingPrice {
+                            machine: String::new(),
+                            region: String::new(),
+                        }
+                    )
+                    .expect("skip reason")
+                    .to_owned(),
+                },
+                AwsMachinePricingMapEntry {
+                    machine: "mac2.metal".to_owned(),
+                    region: "us-east-1".to_owned(),
+                    skip_reason: aws_machine_pricing_skip_reason(
+                        &AwsCatalogWarning::HostTenancyPriceOnly {
+                            machine: String::new(),
+                            region: String::new(),
+                        },
+                    )
+                    .expect("skip reason")
+                    .to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reconcile_aws_catalog_warnings_suppresses_known_skips_and_reports_invalidated_entries() {
+        let previous = AwsMachinePricingMapStore {
+            refreshed_at_unix: 1,
+            entries: vec![
+                AwsMachinePricingMapEntry {
+                    machine: "mac2.metal".to_owned(),
+                    region: "us-east-1".to_owned(),
+                    skip_reason: "host-only".to_owned(),
+                },
+                AwsMachinePricingMapEntry {
+                    machine: "trn2.3xlarge".to_owned(),
+                    region: "sa-east-1".to_owned(),
+                    skip_reason: "missing-price".to_owned(),
+                },
+                AwsMachinePricingMapEntry {
+                    machine: "c7i.large".to_owned(),
+                    region: "us-east-1".to_owned(),
+                    skip_reason: "old-missing-price".to_owned(),
+                },
+            ],
+        };
+        let current_skip_warnings = BTreeMap::from([
+            (
+                AwsCatalogWarning::HostTenancyPriceOnly {
+                    machine: "mac2.metal".to_owned(),
+                    region: "us-east-1".to_owned(),
+                },
+                Vec::new(),
+            ),
+            (
+                AwsCatalogWarning::MissingPrice {
+                    machine: "p5e.48xlarge".to_owned(),
+                    region: "us-west-2".to_owned(),
+                },
+                Vec::new(),
+            ),
+        ]);
+        let current_offered_keys = HashSet::from([
+            MachineRegionKey::new("us-east-1", "mac2.metal"),
+            MachineRegionKey::new("us-west-2", "p5e.48xlarge"),
+            MachineRegionKey::new("us-east-1", "c7i.large"),
+        ]);
+        let mut prices = AwsLivePricing::default();
+        prices
+            .shared_prices
+            .insert(("us-east-1".to_owned(), "c7i.large".to_owned()), 14.0);
+
+        let warnings = reconcile_aws_catalog_warnings(
+            &previous,
+            &current_skip_warnings,
+            &current_offered_keys,
+            &prices,
+        );
+
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings.contains_key(&AwsCatalogWarning::MissingPrice {
+            machine: "p5e.48xlarge".to_owned(),
+            region: "us-west-2".to_owned(),
+        }));
+        assert!(
+            warnings.contains_key(&AwsCatalogWarning::StaleMachinePricingMap {
+                machine: "trn2.3xlarge".to_owned(),
+                region: "sa-east-1".to_owned(),
+            })
+        );
+        assert!(
+            warnings.contains_key(&AwsCatalogWarning::PricingMapEntryNowPriced {
+                machine: "c7i.large".to_owned(),
+                region: "us-east-1".to_owned(),
+            })
+        );
+        assert!(
+            !warnings.contains_key(&AwsCatalogWarning::HostTenancyPriceOnly {
+                machine: "mac2.metal".to_owned(),
+                region: "us-east-1".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn aws_any_of_filter_chunking_respects_the_1024_character_limit() {
+        let values = vec!["a".repeat(700), "b".repeat(300), "c".repeat(100)];
+        let batches = chunk_aws_any_of_filter_values(&values).expect("batches");
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0], vec!["a".repeat(700), "b".repeat(300)]);
+        assert_eq!(batches[1], vec!["c".repeat(100)]);
     }
 }
