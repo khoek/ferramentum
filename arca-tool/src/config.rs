@@ -1,3 +1,5 @@
+use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -59,6 +61,10 @@ pub fn load_global_config() -> Result<ArcaConfig> {
     load_toml_or_default(&global_config_path()?)
 }
 
+pub fn acquire_global_config_lock(wait: bool) -> Result<capulus::InvocationLock> {
+    Ok(capulus::acquire_named("arca.config", wait)?)
+}
+
 pub fn save_global_config(config: &ArcaConfig) -> Result<PathBuf> {
     let path = global_config_path()?;
     write_toml_file(&path, config)?;
@@ -79,6 +85,17 @@ pub fn load_project_config(crate_dir: &Path) -> Result<ProjectConfig> {
     load_toml_or_default(&project_config_path(crate_dir))
 }
 
+pub fn acquire_project_config_lock(
+    crate_dir: &Path,
+    wait: bool,
+) -> Result<capulus::InvocationLock> {
+    let lock_id = hash_path_component(crate_dir);
+    Ok(capulus::acquire_named(
+        &format!("arca.project-config.{lock_id}"),
+        wait,
+    )?)
+}
+
 pub fn save_project_config(crate_dir: &Path, config: &ProjectConfig) -> Result<PathBuf> {
     let path = project_config_path(crate_dir);
     write_toml_file(&path, config)?;
@@ -92,4 +109,22 @@ pub fn project_config_path(crate_dir: &Path) -> PathBuf {
 fn write_toml_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_shared_toml_file(path, value, None, None)
         .with_context(|| format!("Failed to write config file: {}", path.display()))
+}
+
+pub fn acquire_gcp_token_lock(wait: bool) -> Result<capulus::InvocationLock> {
+    Ok(capulus::acquire_named("arca.gcp-token", wait)?)
+}
+
+pub fn acquire_artifact_lock(artifact_id: &str, wait: bool) -> Result<capulus::InvocationLock> {
+    Ok(capulus::acquire_named(
+        &format!("arca.artifact.{artifact_id}"),
+        wait,
+    )?)
+}
+
+fn hash_path_component(path: &Path) -> String {
+    let normalized = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    normalized.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }

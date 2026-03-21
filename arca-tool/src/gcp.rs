@@ -20,7 +20,7 @@ use crate::artifact::{
     artifact_summary_from_labels, save_metadata, tracking_tag,
 };
 use crate::command::{ensure_command_available, run_command_status, run_command_text};
-use crate::config::{ArcaConfig, ensure_cache_root, save_global_config};
+use crate::config::{ArcaConfig, acquire_gcp_token_lock, ensure_cache_root, save_global_config};
 use crate::runtime::ContainerRuntime;
 use crate::ui::{
     detail, maybe_open_browser, prompt_theme, require_interactive, spinner, stage, success,
@@ -800,6 +800,7 @@ fn configure_registry_login(
 }
 
 fn gcp_access_token(config: &ArcaConfig) -> Result<String> {
+    let _token_lock = acquire_gcp_token_lock(true)?;
     let cache_path = access_token_cache_path()?;
     gcp::access_token(AccessTokenRequest {
         configured_credentials_path: config.auth.gcp.service_account_json.as_deref(),

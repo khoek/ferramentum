@@ -11,7 +11,7 @@ members = [
 publish = true
 
 [workspace.dependencies]
-capulus = "0.2.1"
+capulus = "0.2.2"
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

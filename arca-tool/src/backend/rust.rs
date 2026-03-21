@@ -21,7 +21,8 @@ use crate::command::{
     ensure_command_available, run_command_output, run_command_status_streaming, run_command_text,
 };
 use crate::config::{
-    ProjectConfig, RustProjectConfig, ensure_cache_root, load_project_config, save_project_config,
+    ProjectConfig, RustProjectConfig, acquire_project_config_lock, ensure_cache_root,
+    load_project_config, save_project_config,
 };
 use crate::runtime::{ContainerMount, ContainerRuntime};
 use crate::ui::{detail, spinner, stage, success};
@@ -303,11 +304,33 @@ impl RustBackend {
             );
         }
 
-        let loaded_config = load_project_config(&crate_dir)?;
-        let profile = resolve_profile(&args, &loaded_config)?;
-        let features = resolve_features(&args, &loaded_config)?;
-        let binary_name = resolve_binary_name(&args, &loaded_config, &binary_targets)?;
-        let base_image = resolve_base_image(&args, &loaded_config)?;
+        let (profile, features, binary_name, base_image) = if args.save_defaults {
+            let _project_config_lock = acquire_project_config_lock(&crate_dir, true)?;
+            let loaded_config = load_project_config(&crate_dir)?;
+            let profile = resolve_profile(&args, &loaded_config)?;
+            let features = resolve_features(&args, &loaded_config)?;
+            let binary_name = resolve_binary_name(&args, &loaded_config, &binary_targets)?;
+            let base_image = resolve_base_image(&args, &loaded_config)?;
+
+            let mut project_config = loaded_config;
+            project_config.rust = RustProjectConfig {
+                profile: Some(profile.clone()),
+                bin: Some(binary_name.clone()),
+                features: Some(features.clone()),
+                base_image: Some(base_image.clone()),
+            };
+            save_project_config(&crate_dir, &project_config)?;
+
+            (profile, features, binary_name, base_image)
+        } else {
+            let loaded_config = load_project_config(&crate_dir)?;
+            (
+                resolve_profile(&args, &loaded_config)?,
+                resolve_features(&args, &loaded_config)?,
+                resolve_binary_name(&args, &loaded_config, &binary_targets)?,
+                resolve_base_image(&args, &loaded_config)?,
+            )
+        };
         let local_dependency_dirs = local_dependency_directories(&metadata, &package.id)?;
         let build_mode = if args.host_build {
             RustBuildMode::Host {
@@ -337,17 +360,6 @@ impl RustBackend {
             &base_image,
             &build_mode,
         )?;
-
-        if args.save_defaults {
-            let mut project_config = loaded_config;
-            project_config.rust = RustProjectConfig {
-                profile: Some(profile.clone()),
-                bin: Some(binary_name.clone()),
-                features: Some(features.clone()),
-                base_image: Some(base_image.clone()),
-            };
-            save_project_config(&crate_dir, &project_config)?;
-        }
 
         Ok(Self {
             plan: RustBuildPlan {

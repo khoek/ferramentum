@@ -529,6 +529,10 @@ pub(crate) fn load_config() -> Result<IceConfig> {
     capulus::store::load_toml_or_default(&config_path()?)
 }
 
+pub(crate) fn acquire_config_lock(wait: bool) -> Result<capulus::InvocationLock> {
+    Ok(capulus::acquire_named("ice.config", wait)?)
+}
+
 pub(crate) fn save_config(config: &IceConfig) -> Result<PathBuf> {
     let path = config_path()?;
     capulus::store::write_toml_file(&path, config, None, None)

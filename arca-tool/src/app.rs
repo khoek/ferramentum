@@ -13,7 +13,7 @@ use crate::artifact::{
 use crate::backend::GeneratorBackend;
 use crate::backend::rust::{RustBackend, builder_image_tag_for_runtime_image};
 use crate::cli::{BuildCommands, Cli, Commands, PruneArgs, PruneTarget};
-use crate::config::load_global_config;
+use crate::config::{acquire_artifact_lock, acquire_global_config_lock, load_global_config};
 use crate::gcp::{
     RemoteArtifact, RemoteArtifactEvent, console_url_for_remote_ref, delete_remote_artifact,
     is_publish_configured, load_remote_artifacts, login, print_login_outcome, push_artifact,
@@ -52,7 +52,6 @@ enum BuilderStatus {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
-    let _instance_lock = capulus::acquire("arca", true)?;
     match cli.command {
         Commands::Login(args) => cmd_login(args),
         Commands::Build(command) => cmd_build(command),
@@ -229,6 +228,7 @@ fn cmd_list_interactive(
 }
 
 fn cmd_login(args: crate::cli::LoginArgs) -> Result<()> {
+    let _config_lock = acquire_global_config_lock(true)?;
     let runtime = ContainerRuntime::detect()?;
     let mut config = load_global_config()?;
     let outcome = login(&mut config, args.force, args.repo, runtime)?;
@@ -249,6 +249,7 @@ fn cmd_push(args: crate::cli::PushArgs) -> Result<()> {
     }
 
     for artifact in &mut artifacts {
+        let _artifact_lock = acquire_artifact_lock(&artifact.metadata.artifact_id, true)?;
         let remote_ref = push_artifact(&config, runtime, artifact)?;
         println!(
             "Pushed `{}` as `{remote_ref}`.",
@@ -854,6 +855,7 @@ fn prune_local_artifact_set(
         stale_artifacts.len()
     ));
     for artifact in stale_artifacts {
+        let _artifact_lock = acquire_artifact_lock(&artifact.metadata.artifact_id, true)?;
         if runtime.image_exists(&artifact.metadata.local_tag)? {
             runtime.remove_image(&artifact.metadata.local_tag)?;
         }
@@ -999,6 +1001,7 @@ fn clear_deleted_uploaded_refs(deleted_refs: &HashSet<String>) -> Result<()> {
             .as_ref()
             .is_some_and(|uploaded_ref| deleted_refs.contains(uploaded_ref))
         {
+            let _artifact_lock = acquire_artifact_lock(&artifact.metadata.artifact_id, true)?;
             artifact.metadata.uploaded_ref = None;
             artifact.metadata.uploaded_at_epoch_ms = None;
             save_metadata(&artifact.dir, &artifact.metadata)?;

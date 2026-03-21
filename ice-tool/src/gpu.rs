@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use anyhow::{Context, Result, anyhow};
@@ -69,6 +69,7 @@ static VAST_GPU_ALIASES: LazyLock<ProviderGpuAliasStore> =
     LazyLock::new(|| load_provider_gpu_aliases(Cloud::VastAi, BUNDLED_VAST_GPU_ALIASES));
 
 pub(crate) fn ensure_runtime_gpu_data_files() -> Result<()> {
+    let _migration_lock = capulus::acquire_named("ice.gpu-data-migration", true)?;
     ensure_gpu_catalog_file()?;
     ensure_provider_alias_file(Cloud::Aws, BUNDLED_AWS_GPU_ALIASES)?;
     ensure_gcp_machine_pricing_map_file()?;
@@ -301,11 +302,10 @@ fn seed_file(path: PathBuf, bundled: &str) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
-    let Some(parent) = path.parent() else {
+    let Some(_parent) = path.parent() else {
         return Err(anyhow!("Invalid GPU data path {}", path.display()));
     };
-    fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
-    fs::write(&path, bundled).with_context(|| format!("Failed to write {}", path.display()))?;
+    write_runtime_data(&path, bundled)?;
     Ok(())
 }
 
@@ -346,7 +346,7 @@ fn ensure_gcp_machine_pricing_map_file() -> Result<()> {
 }
 
 fn upgrade_top_level_prefix(
-    path: &PathBuf,
+    path: &Path,
     bundled: &str,
     marker: &str,
     field_name: &str,
@@ -354,7 +354,7 @@ fn upgrade_top_level_prefix(
     let content =
         fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
     if content.trim().is_empty() {
-        fs::write(path, bundled).with_context(|| format!("Failed to write {}", path.display()))?;
+        write_runtime_data(path, bundled)?;
         return Ok(());
     }
     let Some(index) = bundled.find(marker) else {
@@ -371,8 +371,13 @@ fn upgrade_top_level_prefix(
         ));
     }
     let upgraded = format!("{prefix}\n\n{}", content.trim_start());
-    fs::write(path, upgraded).with_context(|| format!("Failed to write {}", path.display()))?;
+    write_runtime_data(path, &upgraded)?;
     Ok(())
+}
+
+fn write_runtime_data(path: &Path, content: &str) -> Result<()> {
+    capulus::store::atomic_write(path, content.as_bytes(), None, None)
+        .with_context(|| format!("Failed to write {}", path.display()))
 }
 
 fn gpu_catalog_path() -> Result<PathBuf> {

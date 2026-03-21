@@ -16,6 +16,7 @@ use walkdir::WalkDir;
 const COMMON_WORDS_MAX_ATTEMPTS: usize = 512;
 const DEFAULT_WORKTREE_ROOT: &str = ".worktrees";
 const KAI_CONFIG_REL_PATH: &str = ".kai/config.toml";
+const KAI_WORKSPACE_ADMIN_LOCK_FILE: &str = ".workspace.lock";
 const SUBMODULE_POINTER_COMMIT_MESSAGE: &str = "chore: bump submodule commit pointers";
 const WARNING_ANSI_BOLD_YELLOW: &str = "\x1b[1;33m";
 const WARNING_ANSI_RESET: &str = "\x1b[0m";
@@ -794,7 +795,9 @@ fn kai_init(args: InitArgs) -> Result<()> {
         bail!("Aborted.");
     }
 
-    let kai_dir = cwd.join(".kai");
+    let _workspace_admin_lock = acquire_workspace_admin_lock(&repo_root)?;
+
+    let kai_dir = repo_root.join(".kai");
     fs::create_dir_all(&kai_dir)
         .with_context(|| format!("Failed to create directory: {}", kai_dir.display()))?;
     let config_path = kai_dir.join("config.toml");
@@ -806,7 +809,7 @@ fn kai_init(args: InitArgs) -> Result<()> {
     }
 
     let content = build_kai_config_toml(&worktree_root);
-    fs::write(&config_path, content)
+    capulus::store::atomic_write(&config_path, content.as_bytes(), None, None)
         .with_context(|| format!("Failed to write config: {}", config_path.display()))?;
 
     eprintln!("Created {}", config_path.display());
@@ -874,6 +877,7 @@ fn bump_commit_message(submodule_paths: &[String]) -> String {
 fn worktree_create(args: WorktreeCreateArgs) -> Result<()> {
     let context = load_worktree_invocation_context()?;
     let workspace = &context.workspace;
+    let _workspace_admin_lock = acquire_workspace_admin_lock(&workspace.repo_root)?;
 
     let delete = args.delete || args.delete_force;
     let force = args.force || args.delete_force;
@@ -1040,6 +1044,7 @@ fn worktree_delete_in_workspace(
     workspace: &WorktreeWorkspace,
 ) -> Result<()> {
     validate_worktree_name(&args.name, &workspace.repo_root)?;
+    let _workspace_admin_lock = acquire_workspace_admin_lock(&workspace.repo_root)?;
     let worktree_path = workspace.worktrees_dir.join(&args.name);
     let metadata = fs::symlink_metadata(&worktree_path).with_context(|| {
         format!(
@@ -1050,6 +1055,14 @@ fn worktree_delete_in_workspace(
     if !metadata.is_dir() {
         bail!(
             "Worktree path exists but is not a directory: {}",
+            worktree_path.display()
+        );
+    }
+
+    if worktree_is_locked(&worktree_path)? && !args.force {
+        bail!(
+            "Refusing to delete worktree `{}` because it is currently open in kai: {}\nUse --force to bypass this safety check.",
+            args.name,
             worktree_path.display()
         );
     }
@@ -1195,6 +1208,7 @@ fn ensure_worktree(
     branch_mode: WorktreeBranchMode,
     force: bool,
 ) -> Result<(PathBuf, bool)> {
+    let _workspace_admin_lock = acquire_workspace_admin_lock(&workspace.repo_root)?;
     let name = resolve_worktree_name(name, &workspace.repo_root, &workspace.worktrees_dir)?;
     let worktree_path = workspace.worktrees_dir.join(&name);
 
@@ -1656,6 +1670,28 @@ fn acquire_worktree_lock(worktree_path: &Path, multiple: bool) -> Result<Worktre
     }
 
     Ok(WorktreeLockGuard { _file: file })
+}
+
+struct WorkspaceAdminLockGuard {
+    _file: fs::File,
+}
+
+fn acquire_workspace_admin_lock(repo_root: &Path) -> Result<WorkspaceAdminLockGuard> {
+    let kai_dir = repo_root.join(".kai");
+    fs::create_dir_all(&kai_dir)
+        .with_context(|| format!("Failed to create directory: {}", kai_dir.display()))?;
+
+    let lock_path = kai_dir.join(KAI_WORKSPACE_ADMIN_LOCK_FILE);
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("Failed to open lock file: {}", lock_path.display()))?;
+    fs2::FileExt::lock_exclusive(&file)
+        .with_context(|| format!("Failed to lock: {}", lock_path.display()))?;
+    Ok(WorkspaceAdminLockGuard { _file: file })
 }
 
 fn worktree_is_locked(worktree_path: &Path) -> Result<bool> {
@@ -2706,7 +2742,7 @@ fn ensure_gitignore_has_worktrees(repo_root: &Path, worktrees_dir: &Path) -> Res
     updated.push_str(&gitignore_entry_with_slash);
     updated.push('\n');
 
-    fs::write(&gitignore_path, updated)
+    capulus::store::atomic_write(&gitignore_path, updated.as_bytes(), None, None)
         .with_context(|| format!("Failed to write .gitignore: {}", gitignore_path.display()))?;
 
     Ok(())

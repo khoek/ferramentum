@@ -71,6 +71,9 @@ where
         .iter()
         .filter_map(|instance| M::entry_from_instance(instance, observed_at_unix, context))
         .collect::<Vec<_>>();
+    let Some(_lock) = try_acquire_cloud_cache_lock(M::CLOUD) else {
+        return;
+    };
     let mut store = M::Store::default();
     *M::entries_mut(&mut store) = entries;
     save_cloud_cache_best_effort(M::CLOUD, &store);
@@ -89,6 +92,9 @@ where
     M: CloudCacheModel,
 {
     let Some(entry) = M::entry_from_instance(instance, now_unix_secs(), context) else {
+        return;
+    };
+    let Some(_lock) = try_acquire_cloud_cache_lock(M::CLOUD) else {
         return;
     };
     let key = M::key_for_entry(&entry);
@@ -115,6 +121,9 @@ pub(crate) fn remove_key<M>(key: &str)
 where
     M: CloudCacheModel,
 {
+    let Some(_lock) = try_acquire_cloud_cache_lock(M::CLOUD) else {
+        return;
+    };
     let mut store = load_cache_store::<M>();
     M::entries_mut(&mut store).retain(|entry| M::key_for_entry(entry) != key);
     save_cloud_cache_best_effort(M::CLOUD, &store);
@@ -145,6 +154,11 @@ where
         return T::default();
     };
     load_toml_or_default(&path).unwrap_or_default()
+}
+
+fn try_acquire_cloud_cache_lock(cloud: Cloud) -> Option<capulus::InvocationLock> {
+    let name = format!("ice.instance-cache.{}", cloud_cache_slug(cloud));
+    capulus::acquire_named(&name, false).ok()
 }
 
 fn save_cloud_cache_best_effort<T>(cloud: Cloud, value: &T)

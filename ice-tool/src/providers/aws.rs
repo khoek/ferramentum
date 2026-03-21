@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
+use capulus::store::write_toml_file;
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
@@ -1781,12 +1782,8 @@ fn load_pricing_cache_store() -> Result<Option<AwsPricingCacheStore>> {
 
 fn save_pricing_cache_store(store: &AwsPricingCacheStore) -> Result<PathBuf> {
     let path = aws_pricing_cache_path()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("Invalid AWS pricing cache path {}", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
-    let content = toml::to_string_pretty(store).context("Failed to serialize AWS pricing cache")?;
-    fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+    write_toml_file(&path, store, None, None)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(path)
 }
 
@@ -1825,13 +1822,8 @@ fn load_machine_shape_cache_store() -> Result<Arc<AwsMachineShapeCacheStore>> {
 
 fn save_machine_shape_cache_store(store: &AwsMachineShapeCacheStore) -> Result<PathBuf> {
     let path = aws_machine_shape_cache_path()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("Invalid AWS machine-shape cache path {}", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
-    let content =
-        toml::to_string_pretty(store).context("Failed to serialize AWS machine-shape cache")?;
-    fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+    write_toml_file(&path, store, None, None)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
     clear_cached_arc(&AWS_MACHINE_SHAPE_CACHE_STORE_CACHE, "AWS runtime-data")?;
     Ok(path)
 }
@@ -1883,12 +1875,8 @@ fn load_machine_pricing_map_store() -> Result<Arc<AwsMachinePricingMapStore>> {
 
 fn save_machine_pricing_map_store(store: &AwsMachinePricingMapStore) -> Result<PathBuf> {
     let path = aws_machine_pricing_map_path()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("Invalid AWS pricing map path {}", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
-    let content = toml::to_string_pretty(store).context("Failed to serialize AWS pricing map")?;
-    fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+    write_toml_file(&path, store, None, None)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
     clear_cached_arc(&AWS_MACHINE_PRICING_MAP_STORE_CACHE, "AWS runtime-data")?;
     Ok(path)
 }
@@ -1928,13 +1916,8 @@ fn load_region_offerings_cache_store() -> Result<Arc<AwsRegionOfferingsCacheStor
 
 fn save_region_offerings_cache_store(store: &AwsRegionOfferingsCacheStore) -> Result<PathBuf> {
     let path = aws_region_offerings_cache_path()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("Invalid AWS region-offerings cache path {}", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
-    let content =
-        toml::to_string_pretty(store).context("Failed to serialize AWS region-offerings cache")?;
-    fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+    write_toml_file(&path, store, None, None)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
     clear_cached_arc(&AWS_REGION_OFFERINGS_CACHE_STORE_CACHE, "AWS runtime-data")?;
     Ok(path)
 }
@@ -1974,13 +1957,8 @@ fn load_zone_offerings_cache_store() -> Result<Arc<AwsZoneOfferingsCacheStore>> 
 
 fn save_zone_offerings_cache_store(store: &AwsZoneOfferingsCacheStore) -> Result<PathBuf> {
     let path = aws_zone_offerings_cache_path()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("Invalid AWS zone-offerings cache path {}", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
-    let content =
-        toml::to_string_pretty(store).context("Failed to serialize AWS zone-offerings cache")?;
-    fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+    write_toml_file(&path, store, None, None)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
     clear_cached_arc(&AWS_ZONE_OFFERINGS_CACHE_STORE_CACHE, "AWS runtime-data")?;
     Ok(path)
 }
@@ -2045,12 +2023,8 @@ fn load_previous_local_catalog_store() -> Result<Option<AwsMachineCatalogStore>>
 
 fn save_local_catalog_store(store: &AwsMachineCatalogStore) -> Result<PathBuf> {
     let path = aws_catalog_path()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("Invalid AWS catalog path {}", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
-    let content = toml::to_string_pretty(store).context("Failed to serialize local AWS catalog")?;
-    fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+    write_toml_file(&path, store, None, None)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
     clear_cached_arc(&AWS_LOCAL_CATALOG_STORE_CACHE, "AWS runtime-data")?;
     Ok(path)
 }

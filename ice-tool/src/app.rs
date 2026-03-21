@@ -11,8 +11,8 @@ use crate::cli::{
     CreateArgs, LoginArgs, RefreshCatalogArgs,
 };
 use crate::config_store::{
-    get_config_value, load_config, normalize_config_key, parse_key_value_pair, save_config,
-    set_config_value, supported_config_keys, unset_config_value,
+    acquire_config_lock, get_config_value, load_config, normalize_config_key, parse_key_value_pair,
+    save_config, set_config_value, supported_config_keys, unset_config_value,
 };
 use crate::gpu::{canonicalize_gpu_name, ensure_runtime_gpu_data_files};
 use crate::local::detect_local_container_runtime;
@@ -147,7 +147,6 @@ pub(crate) fn main() -> ExitCode {
 }
 
 pub(crate) fn run() -> Result<ExitCode> {
-    let _instance_lock = capulus::acquire("ice", true)?;
     let cli = Cli::parse();
     ensure_runtime_gpu_data_files()?;
     let mut config = load_config()?;
@@ -171,6 +170,8 @@ pub(crate) fn run() -> Result<ExitCode> {
 }
 
 fn cmd_login(args: LoginArgs, config: &mut IceConfig) -> Result<()> {
+    let _config_lock = acquire_config_lock(true)?;
+    *config = load_config()?;
     let cloud = resolve_cloud(args.cloud, config)?;
     ensure_provider_cli_installed(cloud)?;
     let outcome = match cloud {
@@ -206,6 +207,8 @@ fn cmd_config_get(args: ConfigGetArgs, config: &IceConfig) -> Result<()> {
 }
 
 fn cmd_config_set(args: ConfigSetArgs, config: &mut IceConfig) -> Result<()> {
+    let _config_lock = acquire_config_lock(true)?;
+    *config = load_config()?;
     let (key, value) = parse_key_value_pair(&args.pair)?;
     let rendered = set_config_value(config, &key, &value)?;
     let path = save_config(config)?;
@@ -214,6 +217,8 @@ fn cmd_config_set(args: ConfigSetArgs, config: &mut IceConfig) -> Result<()> {
 }
 
 fn cmd_config_unset(args: ConfigUnsetArgs, config: &mut IceConfig) -> Result<()> {
+    let _config_lock = acquire_config_lock(true)?;
+    *config = load_config()?;
     let key = normalize_config_key(&args.key)?;
     unset_config_value(config, &key)?;
     let path = save_config(config)?;
@@ -327,11 +332,16 @@ where
     <P as CloudProvider>::Instance: CloudInstance,
     P: 'static,
 {
-    let mut effective_config = config.clone();
-    apply_create_search_overrides(&mut effective_config, P::CLOUD, args)?;
     P::ensure_cli()?;
     let gpu_options = load_gpu_options(P::CLOUD, None);
-    ensure_default_create_config(&mut effective_config, P::CLOUD, &gpu_options)?;
+    let effective_config = {
+        let _config_lock = acquire_config_lock(true)?;
+        let mut effective_config = load_config()?;
+        apply_create_search_overrides(&mut effective_config, P::CLOUD, args)?;
+        ensure_default_create_config(&mut effective_config, P::CLOUD, &gpu_options)?;
+        config.clone_from(&effective_config);
+        effective_config
+    };
     let hours = resolve_deploy_hours(&effective_config, args.hours)?;
     let workload = resolve_deploy_workload(&args.target_request())?;
     let mut search = build_search_requirements(&effective_config, P::CLOUD)?;

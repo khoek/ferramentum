@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use capulus::gcp::{self, AccessTokenRequest};
+use capulus::store::write_toml_file;
 use indicatif::ProgressBar;
 use reqwest::{Url, blocking::Client};
 use serde::{Deserialize, Serialize};
@@ -962,37 +963,23 @@ fn load_previous_local_catalog_store() -> Result<Option<GcpMachineCatalogStore>>
 
 fn save_local_catalog_store(store: &GcpMachineCatalogStore) -> Result<PathBuf> {
     let path = local_catalog_path()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("Invalid GCP catalog path {}", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
-    let content = toml::to_string_pretty(store).context("Failed to serialize local GCP catalog")?;
-    fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+    write_toml_file(&path, store, None, None)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
     clear_cached_arc(&GCP_LOCAL_CATALOG_STORE_CACHE, "GCP runtime-data")?;
     Ok(path)
 }
 
 fn save_machine_shape_cache_store(store: &GcpMachineShapeCacheStore) -> Result<PathBuf> {
     let path = gcp_machine_shape_cache_path()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("Invalid GCP machine-shape cache path {}", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
-    let content =
-        toml::to_string_pretty(store).context("Failed to serialize GCP machine-shape cache")?;
-    fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+    write_toml_file(&path, store, None, None)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(path)
 }
 
 fn save_sku_pricing_cache_store(store: &GcpSkuPricingCacheStore) -> Result<PathBuf> {
     let path = gcp_sku_pricing_cache_path()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("Invalid GCP SKU cache path {}", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
-    let content =
-        toml::to_string_pretty(store).context("Failed to serialize GCP SKU pricing cache")?;
-    fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+    write_toml_file(&path, store, None, None)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
     clear_cached_arc(&GCP_SKU_PRICING_CACHE_STORE_CACHE, "GCP runtime-data")?;
     clear_cached_arc(&GCP_SKU_PRICING_CACHE_INDEX_CACHE, "GCP runtime-data")?;
     Ok(path)
