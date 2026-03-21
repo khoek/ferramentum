@@ -10,7 +10,7 @@ mod ui;
 use clap::Parser;
 use tracing::level_filters::LevelFilter;
 
-use crate::cli::{Args, AuthenticateOutputFormat, LogLevel};
+use crate::cli::{Args, AuthenticateOutputFormat, LogLevel, normalize_tunnel_route_targets};
 use crate::config::{CachedAuth, ConfigStore, LastConnect, StoredLogLevel};
 use crate::error::AppError;
 
@@ -62,6 +62,8 @@ fn run(args: Args) -> Result<i32, AppError> {
     if interactive {
         ui::interactive::run(&mut args, config_store.cfg())?;
     }
+    args.tunnel_routes =
+        normalize_tunnel_route_targets(&args.tunnel_routes).map_err(AppError::Config)?;
 
     init_tracing(args.log_level);
 
@@ -162,6 +164,8 @@ fn run(args: Args) -> Result<i32, AppError> {
             (!args.on_disconnect.trim().is_empty()).then_some(args.on_disconnect.as_str()),
             interactive,
             args.log_level,
+            args.routes,
+            &args.tunnel_routes,
         )?;
 
         if res.auth_failed {
@@ -288,6 +292,8 @@ fn run(args: Args) -> Result<i32, AppError> {
         (!args.on_disconnect.trim().is_empty()).then_some(args.on_disconnect.as_str()),
         interactive,
         args.log_level,
+        args.routes,
+        &args.tunnel_routes,
     )?;
 
     if let Some(remote) = config_store.cfg_mut().remote_mut(&config_key) {
@@ -321,6 +327,8 @@ fn persist_last_connect(
         browser_timeout_secs: args.browser_timeout.as_secs().max(1),
         on_disconnect: args.on_disconnect.clone(),
         log_level: to_stored_log_level(args.log_level),
+        routes: args.routes,
+        tunnel_routes: args.tunnel_routes.clone(),
         openconnect_args: openconnect_args.to_vec(),
     });
     if let Err(err) = config_store.save() {

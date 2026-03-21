@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -52,6 +52,22 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = LogLevel::Info)]
     pub log_level: LogLevel,
 
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RoutesMode::Add,
+        help = "How vpnc-script installs routes: add preserves existing routes, replace matches legacy behavior"
+    )]
+    pub routes: RoutesMode,
+
+    #[arg(
+        long = "only-tunnel",
+        value_delimiter = ',',
+        value_parser = parse_tunnel_route_target,
+        help = "Route only these IPs, CIDRs, or domain names through the tunnel; repeat or comma-separate"
+    )]
+    pub tunnel_routes: Vec<String>,
+
     #[arg(long, help = "Path to a Chrome/Chromium executable")]
     pub chrome_path: Option<PathBuf>,
 
@@ -83,6 +99,27 @@ fn parse_timeout_seconds(s: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(secs))
 }
 
+fn parse_tunnel_route_target(s: &str) -> Result<String, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("only-tunnel target cannot be empty".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+pub fn normalize_tunnel_route_targets(values: &[String]) -> Result<Vec<String>, String> {
+    let mut normalized = Vec::new();
+    for value in values {
+        for target in value.split(',') {
+            let target = parse_tunnel_route_target(target)?;
+            if !normalized.contains(&target) {
+                normalized.push(target);
+            }
+        }
+    }
+    Ok(normalized)
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum AuthenticateOutputFormat {
     Shell,
@@ -98,9 +135,39 @@ pub enum LogLevel {
     Trace,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutesMode {
+    #[default]
+    Add,
+    Replace,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AuthDetails {
     pub host: String,
     pub cookie: String,
     pub fingerprint: String,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn normalize_tunnel_route_targets_splits_commas_and_deduplicates() {
+        let normalized = super::normalize_tunnel_route_targets(&[
+            " 140.247.39.160 ".to_string(),
+            "example.com,10.0.0.0/8".to_string(),
+            "example.com".to_string(),
+        ])
+        .expect("normalize tunnel routes");
+
+        assert_eq!(
+            normalized,
+            vec![
+                "140.247.39.160".to_string(),
+                "example.com".to_string(),
+                "10.0.0.0/8".to_string(),
+            ]
+        );
+    }
 }

@@ -1,5 +1,8 @@
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
+use std::net::{IpAddr, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -8,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use indicatif::ProgressBar;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use openconnect_core::config::{ConfigBuilder, EntrypointBuilder, LogLevel as CoreLogLevel};
 use openconnect_core::events::EventHandlers;
 use openconnect_core::protocols::get_anyconnect_protocol;
@@ -17,14 +21,18 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 #[cfg(not(target_os = "windows"))]
+use tempfile::{Builder as TempDirBuilder, TempDir};
+#[cfg(not(target_os = "windows"))]
 use which::which;
 
 use crate::anyconnect::AuthComplete;
-use crate::cli::LogLevel;
+use crate::cli::{LogLevel, RoutesMode};
 use crate::error::AppError;
 use crate::shell;
 
 const PRIVILEGED_HANDOFF_FILE_EXTENSION: &str = "toml";
+#[cfg(not(target_os = "windows"))]
+const VPNSCRIPT_HOOKS_DIR_MARKER: &str = "HOOKS_DIR=/etc/vpnc";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenConnectResult {
@@ -43,14 +51,152 @@ struct PrivilegedConnectPayload {
     version: String,
     args: Vec<String>,
     #[serde(default)]
+    routes: RoutesMode,
+    #[serde(default)]
+    selective_routes: SelectiveRoutes,
+    #[serde(default)]
     interactive: bool,
     result_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct SelectiveRoutes {
+    #[serde(default)]
+    ipv4: Vec<Ipv4Net>,
+    #[serde(default)]
+    ipv6: Vec<Ipv6Net>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PeerCertHashes {
     sha1: String,
     sha256: String,
+}
+
+impl SelectiveRoutes {
+    fn resolve(raw_targets: &[String]) -> Result<Self, AppError> {
+        let mut ipv4 = BTreeSet::new();
+        let mut ipv6 = BTreeSet::new();
+
+        for target in raw_targets {
+            match resolve_tunnel_route_target(target)? {
+                ResolvedTunnelRouteTarget::Ipv4(net) => {
+                    ipv4.insert(net);
+                }
+                ResolvedTunnelRouteTarget::Ipv6(net) => {
+                    ipv6.insert(net);
+                }
+                ResolvedTunnelRouteTarget::Mixed {
+                    ipv4: nets4,
+                    ipv6: nets6,
+                } => {
+                    ipv4.extend(nets4);
+                    ipv6.extend(nets6);
+                }
+            }
+        }
+
+        Ok(Self {
+            ipv4: ipv4.into_iter().collect(),
+            ipv6: ipv6.into_iter().collect(),
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ipv4.is_empty() && self.ipv6.is_empty()
+    }
+}
+
+enum ResolvedTunnelRouteTarget {
+    Ipv4(Ipv4Net),
+    Ipv6(Ipv6Net),
+    Mixed {
+        ipv4: BTreeSet<Ipv4Net>,
+        ipv6: BTreeSet<Ipv6Net>,
+    },
+}
+
+fn resolve_tunnel_route_target(target: &str) -> Result<ResolvedTunnelRouteTarget, AppError> {
+    if let Some(route) = parse_literal_tunnel_route(target)? {
+        return Ok(route);
+    }
+
+    let mut ipv4 = BTreeSet::new();
+    let mut ipv6 = BTreeSet::new();
+    let resolved: Vec<IpAddr> = (target, 0)
+        .to_socket_addrs()
+        .map_err(|err| {
+            AppError::Config(format!(
+                "failed to resolve only-tunnel target '{target}': {err}"
+            ))
+        })?
+        .map(|addr| addr.ip())
+        .collect();
+
+    if resolved.is_empty() {
+        return Err(AppError::Config(format!(
+            "only-tunnel target '{target}' resolved to no addresses"
+        )));
+    }
+
+    for addr in resolved {
+        insert_host_route(addr, &mut ipv4, &mut ipv6);
+    }
+
+    tracing::debug!(
+        target,
+        ipv4 = ?ipv4,
+        ipv6 = ?ipv6,
+        "Resolved selective tunnel route target"
+    );
+
+    Ok(ResolvedTunnelRouteTarget::Mixed { ipv4, ipv6 })
+}
+
+fn parse_literal_tunnel_route(target: &str) -> Result<Option<ResolvedTunnelRouteTarget>, AppError> {
+    if target.contains('/') {
+        return target
+            .parse::<IpNet>()
+            .map(truncate_resolved_route)
+            .map(Some)
+            .map_err(|err| {
+                AppError::Config(format!("invalid only-tunnel target '{target}': {err}"))
+            });
+    }
+
+    Ok(target.parse::<IpAddr>().ok().map(host_route))
+}
+
+fn truncate_resolved_route(net: IpNet) -> ResolvedTunnelRouteTarget {
+    match net {
+        IpNet::V4(net) => ResolvedTunnelRouteTarget::Ipv4(net.trunc()),
+        IpNet::V6(net) => ResolvedTunnelRouteTarget::Ipv6(net.trunc()),
+    }
+}
+
+fn host_route(addr: IpAddr) -> ResolvedTunnelRouteTarget {
+    match addr {
+        IpAddr::V4(addr) => ResolvedTunnelRouteTarget::Ipv4(
+            Ipv4Net::new(addr, 32).expect("32-bit IPv4 host route should always be valid"),
+        ),
+        IpAddr::V6(addr) => ResolvedTunnelRouteTarget::Ipv6(
+            Ipv6Net::new(addr, 128).expect("128-bit IPv6 host route should always be valid"),
+        ),
+    }
+}
+
+fn insert_host_route(addr: IpAddr, ipv4: &mut BTreeSet<Ipv4Net>, ipv6: &mut BTreeSet<Ipv6Net>) {
+    match host_route(addr) {
+        ResolvedTunnelRouteTarget::Ipv4(net) => {
+            ipv4.insert(net);
+        }
+        ResolvedTunnelRouteTarget::Ipv6(net) => {
+            ipv6.insert(net);
+        }
+        ResolvedTunnelRouteTarget::Mixed { .. } => {
+            unreachable!("host route cannot resolve to multiple routes")
+        }
+    }
 }
 
 pub fn run_openconnect(
@@ -62,7 +208,19 @@ pub fn run_openconnect(
     on_disconnect: Option<&str>,
     interactive: bool,
     log_level: LogLevel,
+    routes: RoutesMode,
+    tunnel_routes: &[String],
 ) -> Result<OpenConnectResult, AppError> {
+    let selective_routes = SelectiveRoutes::resolve(tunnel_routes)?;
+    if !selective_routes.is_empty() {
+        tracing::info!(
+            ipv4_routes = selective_routes.ipv4.len(),
+            ipv6_routes = selective_routes.ipv6.len(),
+            "Using selective tunnel routes"
+        );
+        tracing::debug!(targets = ?tunnel_routes, ?selective_routes, "Resolved selective tunnel routes");
+    }
+
     #[cfg(unix)]
     {
         if unsafe { libc::geteuid() } != 0 {
@@ -75,6 +233,8 @@ pub fn run_openconnect(
                 on_disconnect,
                 interactive,
                 log_level,
+                routes,
+                &selective_routes,
             );
         }
     }
@@ -88,6 +248,8 @@ pub fn run_openconnect(
         on_disconnect,
         interactive,
         log_level,
+        routes,
+        &selective_routes,
     )
 }
 
@@ -113,6 +275,8 @@ pub fn run_privileged_payload(payload_path: &Path, log_level: LogLevel) -> Resul
         None,
         payload.interactive,
         log_level,
+        payload.routes,
+        &payload.selective_routes,
     )?;
 
     if let Err(err) = write_toml_file(&payload.result_path, &result, 0o666) {
@@ -168,7 +332,16 @@ fn run_openconnect_local(
     on_disconnect: Option<&str>,
     interactive: bool,
     log_level: LogLevel,
+    routes: RoutesMode,
+    selective_routes: &SelectiveRoutes,
 ) -> Result<OpenConnectResult, AppError> {
+    #[cfg(target_os = "windows")]
+    if !selective_routes.is_empty() {
+        return Err(AppError::Config(
+            "selective tunnel routes are not supported on Windows yet".to_string(),
+        ));
+    }
+
     if !args.is_empty() {
         tracing::warn!(
             "--openconnect-args passthrough is not supported with libopenconnect; ignoring: {:?}",
@@ -183,7 +356,7 @@ fn run_openconnect_local(
     if let Some(proxy) = proxy {
         builder.http_proxy(proxy);
     }
-    let _vpnc_capture = configure_vpnc_script(&mut builder);
+    let _vpnc_capture = configure_vpnc_script(&mut builder, routes, selective_routes)?;
 
     let config = builder
         .build()
@@ -292,6 +465,8 @@ fn run_openconnect_via_elevated_child(
     on_disconnect: Option<&str>,
     interactive: bool,
     log_level: LogLevel,
+    routes: RoutesMode,
+    selective_routes: &SelectiveRoutes,
 ) -> Result<OpenConnectResult, AppError> {
     let (program, prefix_args) = privileged_command_prefix()?;
     let payload_path =
@@ -305,6 +480,8 @@ fn run_openconnect_via_elevated_child(
         proxy: proxy.map(|s| s.to_string()),
         version: version.to_string(),
         args: args.to_vec(),
+        routes,
+        selective_routes: selective_routes.clone(),
         interactive,
         result_path: result_path.clone(),
     };
@@ -429,8 +606,367 @@ fn to_core_log_level(level: LogLevel) -> CoreLogLevel {
 }
 
 #[cfg(not(target_os = "windows"))]
+const OCULAR_ADD_ROUTES_HOOK: &str = r#"if [ -z "$IPROUTE" ]; then
+	echo "ocular: --routes add requires iproute2; falling back to stock vpnc-script routing" >&2
+	return 0
+fi
+
+OCULAR_ROUTE_STATE_FILE="/var/run/vpnc/ocular-routes.$VPNPID"
+OCULAR_ROUTE_PROTO=186
+
+unset INTERNAL_IP4_NETMASK INTERNAL_IP4_NETMASKLEN INTERNAL_IP4_NETADDR INTERNAL_IP6_NETMASK
+
+ocular_log() {
+	echo "ocular: $*" >&2
+}
+
+ocular_default_metric() {
+	FAMILY="$1"
+	if [ "$FAMILY" = "6" ]; then
+		BEST="$(
+			$IPROUTE -6 route show default |
+				awk -v tun="$TUNDEV" '
+					$0 !~ ("(^| )dev " tun "($| )") {
+						if (match($0, /metric [0-9]+/)) {
+							print substr($0, RSTART + 7, RLENGTH - 7)
+						} else {
+							print 0
+						}
+					}
+				' |
+				sort -n |
+				head -n 1
+		)"
+	else
+		BEST="$(
+			$IPROUTE route show default |
+				awk -v tun="$TUNDEV" '
+					$0 !~ ("(^| )dev " tun "($| )") {
+						if (match($0, /metric [0-9]+/)) {
+							print substr($0, RSTART + 7, RLENGTH - 7)
+						} else {
+							print 0
+						}
+					}
+				' |
+				sort -n |
+				head -n 1
+		)"
+	fi
+
+	case "$BEST" in
+	"")
+		echo 50
+		;;
+	0)
+		echo 0
+		;;
+	*)
+		expr "$BEST" - 1
+		;;
+	esac
+}
+
+ocular_record_route() {
+	umask 077
+	printf '%s\n' "$*" >>"$OCULAR_ROUTE_STATE_FILE"
+}
+
+ocular_delete_recorded_routes() {
+	FAMILY="$1"
+	MATCH_KIND="$2"
+	MATCH_VALUE="$3"
+	[ -f "$OCULAR_ROUTE_STATE_FILE" ] || return 0
+
+	TMP="${OCULAR_ROUTE_STATE_FILE}.tmp.$$"
+	umask 077
+	: >"$TMP" || return 1
+
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		LINE_FAMILY=${line%% *}
+		LINE_SPEC=${line#* }
+
+		MATCHED=0
+		if [ "$LINE_FAMILY" = "$FAMILY" ]; then
+			case "$MATCH_KIND" in
+			exact)
+				[ "$LINE_SPEC" = "$MATCH_VALUE" ] && MATCHED=1
+				;;
+			prefix)
+				case "$LINE_SPEC" in
+				"$MATCH_VALUE"*) MATCHED=1 ;;
+				esac
+				;;
+			esac
+		fi
+
+		if [ "$MATCHED" = 1 ]; then
+			if [ "$FAMILY" = "6" ]; then
+				$IPROUTE -6 route del $LINE_SPEC 2>/dev/null
+			else
+				$IPROUTE route del $LINE_SPEC 2>/dev/null
+			fi
+		else
+			printf '%s\n' "$line" >>"$TMP"
+		fi
+	done <"$OCULAR_ROUTE_STATE_FILE"
+
+	mv "$TMP" "$OCULAR_ROUTE_STATE_FILE"
+	[ -s "$OCULAR_ROUTE_STATE_FILE" ] || rm -f -- "$OCULAR_ROUTE_STATE_FILE"
+	if [ "$FAMILY" = "6" ]; then
+		$IPROUTE -6 route flush cache 2>/dev/null
+	fi
+}
+
+ocular_try_add_route() {
+	FAMILY="$1"
+	shift
+	if [ "$FAMILY" = "6" ]; then
+		OUTPUT="$($IPROUTE -6 route add "$@" 2>&1)"
+	else
+		OUTPUT="$($IPROUTE route add "$@" 2>&1)"
+	fi
+	STATUS=$?
+	if [ $STATUS -eq 0 ]; then
+		ocular_record_route "$FAMILY $*"
+		if [ "$FAMILY" = "6" ]; then
+			$IPROUTE -6 route flush cache 2>/dev/null
+		fi
+		return 0
+	fi
+
+	case "$OUTPUT" in
+	*"File exists"*)
+		ocular_log "preserving existing route: $*"
+		return 1
+		;;
+	*)
+		ocular_log "failed to add route '$*': $OUTPUT"
+		return $STATUS
+		;;
+	esac
+}
+
+ocular_has_non_tunnel_exact_route() {
+	FAMILY="$1"
+	TARGET="$2"
+	if [ "$FAMILY" = "6" ]; then
+		$IPROUTE -6 route show exact "$TARGET" |
+			awk -v tun="$TUNDEV" 'NF && $0 !~ ("(^| )dev " tun "($| )") { found = 1 } END { exit(found ? 0 : 1) }'
+	else
+		$IPROUTE route show exact "$TARGET" |
+			awk -v tun="$TUNDEV" 'NF && $0 !~ ("(^| )dev " tun "($| )") { found = 1 } END { exit(found ? 0 : 1) }'
+	fi
+}
+
+ocular_set_ipv4_default_route() {
+	METRIC="$(ocular_default_metric 4)"
+	ocular_try_add_route 4 default dev "$TUNDEV" metric "$METRIC" proto "$OCULAR_ROUTE_PROTO"
+}
+
+ocular_set_ipv4_network_route() {
+	NETWORK="$1"
+	NETMASKLEN="$3"
+	NETDEV="$4"
+	NETGW="$5"
+	PREFIX="$NETWORK/$NETMASKLEN"
+
+	if ocular_has_non_tunnel_exact_route 4 "$PREFIX"; then
+		ocular_log "preserving existing route: $PREFIX"
+		return 0
+	fi
+
+	if [ -n "$NETGW" ]; then
+		ocular_try_add_route 4 "$PREFIX" dev "$NETDEV" via "$NETGW" proto "$OCULAR_ROUTE_PROTO"
+	else
+		ocular_try_add_route 4 "$PREFIX" dev "$NETDEV" proto "$OCULAR_ROUTE_PROTO"
+	fi
+}
+
+ocular_reset_ipv4_default_route() {
+	rm -f -- "$DEFAULT_ROUTE_FILE"
+	ocular_delete_recorded_routes 4 prefix "default dev $TUNDEV "
+}
+
+ocular_del_ipv4_network_route() {
+	NETWORK="$1"
+	NETMASKLEN="$3"
+	NETDEV="$4"
+	NETGW="$5"
+	PREFIX="$NETWORK/$NETMASKLEN"
+
+	if [ -n "$NETGW" ]; then
+		ocular_delete_recorded_routes 4 exact "$PREFIX dev $NETDEV via $NETGW proto $OCULAR_ROUTE_PROTO"
+	else
+		ocular_delete_recorded_routes 4 exact "$PREFIX dev $NETDEV proto $OCULAR_ROUTE_PROTO"
+	fi
+}
+
+set_ipv4_default_route() {
+	ocular_set_ipv4_default_route "$@"
+}
+
+set_default_route() {
+	ocular_set_ipv4_default_route "$@"
+}
+
+set_ipv4_network_route() {
+	ocular_set_ipv4_network_route "$@"
+}
+
+set_network_route() {
+	ocular_set_ipv4_network_route "$@"
+}
+
+reset_ipv4_default_route() {
+	ocular_reset_ipv4_default_route "$@"
+}
+
+reset_default_route() {
+	ocular_reset_ipv4_default_route "$@"
+}
+
+del_ipv4_network_route() {
+	ocular_del_ipv4_network_route "$@"
+}
+
+del_network_route() {
+	ocular_del_ipv4_network_route "$@"
+}
+
+set_ipv6_default_route() {
+	METRIC="$(ocular_default_metric 6)"
+	ocular_try_add_route 6 default dev "$TUNDEV" metric "$METRIC" proto "$OCULAR_ROUTE_PROTO"
+}
+
+set_ipv6_network_route() {
+	NETWORK="$1"
+	NETMASKLEN="$2"
+	NETDEV="$3"
+	NETGW="$4"
+	PREFIX="$NETWORK/$NETMASKLEN"
+
+	if ocular_has_non_tunnel_exact_route 6 "$PREFIX"; then
+		ocular_log "preserving existing route: $PREFIX"
+		return 0
+	fi
+
+	if [ -n "$NETGW" ]; then
+		ocular_try_add_route 6 "$PREFIX" dev "$NETDEV" via "$NETGW" proto "$OCULAR_ROUTE_PROTO"
+	else
+		ocular_try_add_route 6 "$PREFIX" dev "$NETDEV" proto "$OCULAR_ROUTE_PROTO"
+	fi
+}
+
+reset_ipv6_default_route() {
+	rm -f -- "$DEFAULT_ROUTE_FILE_IPV6"
+	ocular_delete_recorded_routes 6 prefix "default dev $TUNDEV "
+}
+
+del_ipv6_network_route() {
+	NETWORK="$1"
+	NETMASKLEN="$2"
+	NETDEV="$3"
+	NETGW="$4"
+	PREFIX="$NETWORK/$NETMASKLEN"
+
+	if [ -n "$NETGW" ]; then
+		ocular_delete_recorded_routes 6 exact "$PREFIX dev $NETDEV via $NETGW proto $OCULAR_ROUTE_PROTO"
+	else
+		ocular_delete_recorded_routes 6 exact "$PREFIX dev $NETDEV proto $OCULAR_ROUTE_PROTO"
+	fi
+}
+"#;
+
+#[cfg(not(target_os = "windows"))]
+fn build_selective_routes_hook(routes: &SelectiveRoutes) -> String {
+    let mut hook = String::from(
+        "unset INTERNAL_IP4_NETMASK INTERNAL_IP4_NETMASKLEN INTERNAL_IP4_NETADDR INTERNAL_IP6_NETMASK\n\
+unset INTERNAL_IP4_DNS INTERNAL_IP4_NBNS INTERNAL_IP6_DNS CISCO_DEF_DOMAIN CISCO_SPLIT_DNS\n\
+CISCO_SPLIT_EXC=0\n\
+export CISCO_SPLIT_EXC\n\
+CISCO_IPV6_SPLIT_EXC=0\n\
+export CISCO_IPV6_SPLIT_EXC\n",
+    );
+
+    writeln!(&mut hook, "CISCO_SPLIT_INC={}", routes.ipv4.len())
+        .expect("write selective IPv4 route count");
+    hook.push_str("export CISCO_SPLIT_INC\n");
+    for (index, net) in routes.ipv4.iter().enumerate() {
+        let prefix_len = net.prefix_len().to_string();
+        writeln!(
+            &mut hook,
+            "CISCO_SPLIT_INC_{index}_ADDR={}",
+            shell::sh_quote(&net.network().to_string())
+        )
+        .expect("write selective IPv4 route address");
+        writeln!(
+            &mut hook,
+            "CISCO_SPLIT_INC_{index}_MASK={}",
+            shell::sh_quote(&net.netmask().to_string())
+        )
+        .expect("write selective IPv4 route netmask");
+        writeln!(
+            &mut hook,
+            "CISCO_SPLIT_INC_{index}_MASKLEN={}",
+            shell::sh_quote(&prefix_len)
+        )
+        .expect("write selective IPv4 route prefix length");
+        writeln!(
+            &mut hook,
+            "export CISCO_SPLIT_INC_{index}_ADDR CISCO_SPLIT_INC_{index}_MASK CISCO_SPLIT_INC_{index}_MASKLEN"
+        )
+        .expect("write selective IPv4 export");
+    }
+
+    writeln!(&mut hook, "CISCO_IPV6_SPLIT_INC={}", routes.ipv6.len())
+        .expect("write selective IPv6 route count");
+    hook.push_str("export CISCO_IPV6_SPLIT_INC\n");
+    for (index, net) in routes.ipv6.iter().enumerate() {
+        let prefix_len = net.prefix_len().to_string();
+        writeln!(
+            &mut hook,
+            "CISCO_IPV6_SPLIT_INC_{index}_ADDR={}",
+            shell::sh_quote(&net.network().to_string())
+        )
+        .expect("write selective IPv6 route address");
+        writeln!(
+            &mut hook,
+            "CISCO_IPV6_SPLIT_INC_{index}_MASKLEN={}",
+            shell::sh_quote(&prefix_len)
+        )
+        .expect("write selective IPv6 route prefix length");
+        writeln!(
+            &mut hook,
+            "export CISCO_IPV6_SPLIT_INC_{index}_ADDR CISCO_IPV6_SPLIT_INC_{index}_MASKLEN"
+        )
+        .expect("write selective IPv6 export");
+    }
+
+    hook
+}
+
+#[cfg(not(target_os = "windows"))]
+fn build_vpnc_hook_content(
+    routes_mode: RoutesMode,
+    selective_routes: &SelectiveRoutes,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if !selective_routes.is_empty() {
+        parts.push(build_selective_routes_hook(selective_routes));
+    }
+    if routes_mode == RoutesMode::Add {
+        parts.push(OCULAR_ADD_ROUTES_HOOK.to_string());
+    }
+
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+#[cfg(not(target_os = "windows"))]
 #[derive(Debug)]
 struct VpncScriptCapture {
+    _temp_dir: TempDir,
     wrapper_path: PathBuf,
     log_path: PathBuf,
 }
@@ -441,21 +977,32 @@ struct VpncScriptCapture;
 
 #[cfg(not(target_os = "windows"))]
 impl VpncScriptCapture {
-    fn new(vpnc_script: &str) -> Result<Self, AppError> {
-        let wrapper_path = create_secure_temp_file("vpnc-wrapper", "sh", 0o700)?;
-        let log_path = create_secure_temp_file("vpnc-script", "log", 0o600)?;
+    fn new(
+        vpnc_script: &str,
+        routes: RoutesMode,
+        selective_routes: &SelectiveRoutes,
+    ) -> Result<Self, AppError> {
+        let temp_dir = TempDirBuilder::new().prefix("ocular-vpnc-").tempdir()?;
+        let wrapper_path = temp_dir.path().join("vpnc-wrapper.sh");
+        let log_path = temp_dir.path().join("vpnc-script.log");
+        let script_path = match build_vpnc_hook_content(routes, selective_routes) {
+            Some(hook_content) => {
+                prepare_patched_vpnc_script(temp_dir.path(), vpnc_script, &hook_content)?
+            }
+            None => PathBuf::from(vpnc_script),
+        };
 
         let log_path_str = log_path.to_string_lossy().to_string();
         let script_body = format!(
             "#!/bin/sh\nexec {} \"$@\" >>{} 2>&1\n",
-            shell::sh_quote(vpnc_script),
+            shell::sh_quote(&script_path.to_string_lossy()),
             shell::sh_quote(&log_path_str),
         );
-        fs::write(&wrapper_path, script_body)?;
-        #[cfg(unix)]
-        fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o700))?;
+        write_file_with_mode(&log_path, "", 0o600)?;
+        write_file_with_mode(&wrapper_path, &script_body, 0o700)?;
 
         Ok(Self {
+            _temp_dir: temp_dir,
             wrapper_path,
             log_path,
         })
@@ -493,42 +1040,111 @@ impl VpncScriptCapture {
 impl Drop for VpncScriptCapture {
     fn drop(&mut self) {
         self.emit_debug_logs();
-        cleanup_temp_file(&self.wrapper_path);
-        cleanup_temp_file(&self.log_path);
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn configure_vpnc_script(builder: &mut ConfigBuilder) -> Option<VpncScriptCapture> {
+fn configure_vpnc_script(
+    builder: &mut ConfigBuilder,
+    routes: RoutesMode,
+    selective_routes: &SelectiveRoutes,
+) -> Result<Option<VpncScriptCapture>, AppError> {
+    let requires_patch = !selective_routes.is_empty();
     if let Some(vpnc_script) = discover_vpnc_script() {
-        match VpncScriptCapture::new(&vpnc_script) {
+        match VpncScriptCapture::new(&vpnc_script, routes, selective_routes) {
             Ok(capture) => {
-                tracing::debug!(script = %vpnc_script, "Using vpnc-script wrapper");
+                tracing::debug!(
+                    script = %vpnc_script,
+                    ?routes,
+                    selective = !selective_routes.is_empty(),
+                    "Using vpnc-script wrapper"
+                );
                 let wrapper = capture.wrapper_path_str();
                 builder.vpncscript(&wrapper);
-                Some(capture)
+                Ok(Some(capture))
             }
             Err(err) => {
+                if requires_patch {
+                    return Err(err);
+                }
                 tracing::warn!(
                     %err,
                     script = %vpnc_script,
                     "Failed to prepare vpnc-script wrapper; using script directly"
                 );
                 builder.vpncscript(&vpnc_script);
-                None
+                Ok(None)
             }
         }
     } else {
+        if requires_patch {
+            return Err(AppError::Config(
+                "vpnc-script is required for selective tunnel routes but was not found".to_string(),
+            ));
+        }
         tracing::warn!(
             "vpnc-script was not found in PATH/common locations; set OCULAR_VPNC_SCRIPT to avoid './vpnc-script' failures"
         );
-        None
+        Ok(None)
     }
 }
 
 #[cfg(target_os = "windows")]
-fn configure_vpnc_script(_builder: &mut ConfigBuilder) -> Option<VpncScriptCapture> {
-    None
+fn configure_vpnc_script(
+    _builder: &mut ConfigBuilder,
+    _routes: RoutesMode,
+    _selective_routes: &SelectiveRoutes,
+) -> Result<Option<VpncScriptCapture>, AppError> {
+    Ok(None)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn prepare_patched_vpnc_script(
+    temp_dir: &Path,
+    vpnc_script: &str,
+    hook_content: &str,
+) -> Result<PathBuf, AppError> {
+    let hooks_root = temp_dir.join("hooks");
+    fs::create_dir_all(hooks_root.join("connect.d"))?;
+    fs::create_dir_all(hooks_root.join("disconnect.d"))?;
+    let hook_path = "ocular-routes.sh";
+    write_file_with_mode(
+        &hooks_root.join("connect.d").join(hook_path),
+        hook_content,
+        0o600,
+    )?;
+    write_file_with_mode(
+        &hooks_root.join("disconnect.d").join(hook_path),
+        hook_content,
+        0o600,
+    )?;
+
+    let original = fs::read_to_string(vpnc_script)?;
+    let patched = original.replacen(
+        VPNSCRIPT_HOOKS_DIR_MARKER,
+        &format!(
+            "HOOKS_DIR={}",
+            shell::sh_quote(&hooks_root.to_string_lossy()),
+        ),
+        1,
+    );
+    if patched == original {
+        return Err(AppError::Config(format!(
+            "could not patch HOOKS_DIR in {}",
+            vpnc_script
+        )));
+    }
+
+    let patched_script = temp_dir.join("vpnc-script");
+    write_file_with_mode(&patched_script, &patched, 0o700)?;
+    Ok(patched_script)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn write_file_with_mode(path: &Path, content: &str, mode: u32) -> Result<(), AppError> {
+    fs::write(path, content)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    Ok(())
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -793,10 +1409,14 @@ fn is_probably_auth_failure(err: &OpenconnectError) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
 
+    use ipnet::{Ipv4Net, Ipv6Net};
+
     use super::{
-        OpenConnectResult, PRIVILEGED_HANDOFF_FILE_EXTENSION, create_secure_temp_file,
+        OpenConnectResult, PRIVILEGED_HANDOFF_FILE_EXTENSION, RoutesMode, SelectiveRoutes,
+        build_selective_routes_hook, build_vpnc_hook_content, create_secure_temp_file,
         read_toml_file, write_toml_file,
     };
 
@@ -839,6 +1459,115 @@ mod tests {
         assert_eq!(
             read_toml_file::<OpenConnectResult>(&path.0).expect("read toml"),
             Some(expected)
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn additive_vpnc_script_redirects_hooks_and_writes_hook_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source-vpnc-script");
+        fs::write(&source, "#!/bin/sh\nHOOKS_DIR=/etc/vpnc\n").expect("write source");
+        let hook_content = build_vpnc_hook_content(RoutesMode::Add, &SelectiveRoutes::default())
+            .expect("hook content");
+
+        let patched = super::prepare_patched_vpnc_script(
+            temp.path(),
+            source.to_str().expect("utf-8 path"),
+            &hook_content,
+        )
+        .expect("patch script");
+        let hooks_root = temp.path().join("hooks");
+        let expected_hooks_dir = format!(
+            "HOOKS_DIR={}",
+            crate::shell::sh_quote(&hooks_root.to_string_lossy()),
+        );
+        let patched_raw = fs::read_to_string(&patched).expect("read patched script");
+        let hook_name = "ocular-routes.sh";
+        let connect_hook = fs::read_to_string(hooks_root.join("connect.d").join(hook_name))
+            .expect("read connect hook");
+
+        assert!(patched_raw.contains(&expected_hooks_dir));
+        assert!(connect_hook.contains("set_ipv4_default_route()"));
+        assert!(connect_hook.contains("set_default_route()"));
+        assert!(connect_hook.contains("set_ipv4_network_route()"));
+        assert!(connect_hook.contains("set_network_route()"));
+        assert!(connect_hook.contains("reset_ipv4_default_route()"));
+        assert!(connect_hook.contains("reset_default_route()"));
+        assert!(connect_hook.contains("del_ipv4_network_route()"));
+        assert!(connect_hook.contains("del_network_route()"));
+        assert!(hooks_root.join("connect.d").join(hook_name).is_file());
+        assert!(hooks_root.join("disconnect.d").join(hook_name).is_file());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn selective_routes_hook_rewrites_split_include_env() {
+        let routes = SelectiveRoutes {
+            ipv4: vec![
+                Ipv4Net::new("140.247.39.160".parse().expect("ipv4"), 32).expect("host net"),
+                Ipv4Net::new("10.7.0.12".parse().expect("ipv4"), 24)
+                    .expect("prefix net")
+                    .trunc(),
+            ],
+            ipv6: vec![
+                Ipv6Net::new("2001:db8::1".parse().expect("ipv6"), 64)
+                    .expect("prefix net")
+                    .trunc(),
+            ],
+        };
+        let hook = build_selective_routes_hook(&routes);
+
+        assert!(hook.contains("unset INTERNAL_IP4_NETMASK INTERNAL_IP4_NETMASKLEN INTERNAL_IP4_NETADDR INTERNAL_IP6_NETMASK"));
+        assert!(hook.contains("unset INTERNAL_IP4_DNS INTERNAL_IP4_NBNS INTERNAL_IP6_DNS CISCO_DEF_DOMAIN CISCO_SPLIT_DNS"));
+        assert!(hook.contains("CISCO_SPLIT_EXC=0"));
+        assert!(hook.contains("CISCO_SPLIT_INC=2"));
+        assert!(hook.contains(&format!(
+            "CISCO_SPLIT_INC_0_ADDR={}",
+            crate::shell::sh_quote("140.247.39.160")
+        )));
+        assert!(hook.contains(&format!(
+            "CISCO_SPLIT_INC_1_ADDR={}",
+            crate::shell::sh_quote("10.7.0.0")
+        )));
+        assert!(hook.contains(&format!(
+            "CISCO_SPLIT_INC_1_MASK={}",
+            crate::shell::sh_quote("255.255.255.0")
+        )));
+        assert!(hook.contains(&format!(
+            "CISCO_SPLIT_INC_1_MASKLEN={}",
+            crate::shell::sh_quote("24")
+        )));
+        assert!(hook.contains("CISCO_IPV6_SPLIT_INC=1"));
+        assert!(hook.contains(&format!(
+            "CISCO_IPV6_SPLIT_INC_0_ADDR={}",
+            crate::shell::sh_quote("2001:db8::")
+        )));
+        assert!(hook.contains(&format!(
+            "CISCO_IPV6_SPLIT_INC_0_MASKLEN={}",
+            crate::shell::sh_quote("64")
+        )));
+    }
+
+    #[test]
+    fn selective_routes_resolve_literals_and_truncate_prefixes() {
+        let resolved = SelectiveRoutes::resolve(&[
+            "140.247.39.160".to_string(),
+            "10.7.0.12/24".to_string(),
+            "2001:db8::1234/64".to_string(),
+        ])
+        .expect("resolve tunnel routes");
+
+        assert_eq!(
+            resolved.ipv4,
+            vec![
+                Ipv4Net::new("10.7.0.0".parse().expect("ipv4"), 24).expect("prefix net"),
+                Ipv4Net::new("140.247.39.160".parse().expect("ipv4"), 32).expect("host net"),
+            ]
+        );
+        assert_eq!(
+            resolved.ipv6,
+            vec![Ipv6Net::new("2001:db8::".parse().expect("ipv6"), 64).expect("prefix net")]
         );
     }
 

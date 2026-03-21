@@ -236,23 +236,22 @@ fn read_devtools_ws_url(devtools_port_file: &Path) -> Result<Option<String>, App
 
 fn connect_browser(ws_url: &str, idle_timeout: Duration) -> Result<Browser, AppError> {
     let deadline = Instant::now() + BROWSER_CONNECT_TIMEOUT;
-    let mut last_error = None;
-    loop {
-        match Browser::connect_with_timeout(ws_url.to_string(), idle_timeout) {
+    let detail = loop {
+        let err = match Browser::connect_with_timeout(ws_url.to_string(), idle_timeout) {
             Ok(browser) => return Ok(browser),
-            Err(err) => {
-                last_error = Some(err.to_string());
-                if Instant::now() >= deadline {
-                    let detail = last_error
-                        .unwrap_or_else(|| "unknown browser connection error".to_string());
-                    return Err(AppError::Browser(format!(
-                        "failed to connect to Chrome DevTools at `{ws_url}`: {detail}"
-                    )));
-                }
-                thread::sleep(PROCESS_POLL_INTERVAL);
-            }
+            Err(err) => err,
+        };
+
+        if Instant::now() >= deadline {
+            break err.to_string();
         }
-    }
+
+        thread::sleep(PROCESS_POLL_INTERVAL);
+    };
+
+    Err(AppError::Browser(format!(
+        "failed to connect to Chrome DevTools at `{ws_url}`: {detail}"
+    )))
 }
 
 fn terminate_browser_process(child: &mut Child) -> io::Result<()> {

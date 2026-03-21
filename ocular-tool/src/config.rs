@@ -6,6 +6,7 @@ use capulus::store::{load_toml_or_default, write_toml_file};
 use serde::{Deserialize, Serialize};
 
 use crate::anyconnect;
+use crate::cli::RoutesMode;
 use crate::error::AppError;
 
 const CONFIG_FILE: &str = "config.toml";
@@ -188,6 +189,12 @@ pub struct LastConnect {
 
     #[serde(default)]
     pub log_level: StoredLogLevel,
+
+    #[serde(default)]
+    pub routes: RoutesMode,
+
+    #[serde(default)]
+    pub tunnel_routes: Vec<String>,
 
     #[serde(default)]
     pub openconnect_args: Vec<String>,

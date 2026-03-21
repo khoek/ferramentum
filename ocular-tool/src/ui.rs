@@ -3,7 +3,9 @@ pub mod interactive {
 
     use dialoguer::{Confirm, Input, Select};
 
-    use crate::cli::{Args, AuthenticateOutputFormat, LogLevel};
+    use crate::cli::{
+        Args, AuthenticateOutputFormat, LogLevel, RoutesMode, normalize_tunnel_route_targets,
+    };
     use crate::config;
     use crate::error::AppError;
 
@@ -34,6 +36,10 @@ pub mod interactive {
                 args.browser_timeout = Duration::from_secs(last.browser_timeout_secs.max(1));
                 args.on_disconnect = last.on_disconnect.clone();
                 args.log_level = stored_to_cli_log_level(last.log_level);
+                args.routes = last.routes;
+                if args.tunnel_routes.is_empty() {
+                    args.tunnel_routes = last.tunnel_routes.clone();
+                }
                 if args.openconnect_args.is_empty() {
                     args.openconnect_args = last.openconnect_args.clone();
                 }
@@ -207,6 +213,39 @@ pub mod interactive {
                 .default(current)
                 .interact()?;
             args.log_level = log_levels[idx].0;
+
+            let route_modes = [(RoutesMode::Add, "add"), (RoutesMode::Replace, "replace")];
+            let route_labels: Vec<&str> = route_modes.iter().map(|(_, s)| *s).collect();
+            let current = route_modes
+                .iter()
+                .position(|(mode, _)| *mode == args.routes)
+                .unwrap_or(0);
+            let idx = Select::with_theme(theme)
+                .with_prompt("Route mode")
+                .items(&route_labels)
+                .default(current)
+                .interact()?;
+            args.routes = route_modes[idx].0;
+
+            let tunnel_routes_initial = args.tunnel_routes.join(", ");
+            let tunnel_routes: String = Input::with_theme(theme)
+                .with_prompt("Only tunnel these targets (optional; comma-separated)")
+                .with_initial_text(tunnel_routes_initial)
+                .allow_empty(true)
+                .validate_with(|input: &String| {
+                    if input.trim().is_empty() {
+                        return Ok(());
+                    }
+                    normalize_tunnel_route_targets(std::slice::from_ref(input))
+                        .map(|_| ())
+                        .map_err(|err| err)
+                })
+                .interact_text()?;
+            args.tunnel_routes = if tunnel_routes.trim().is_empty() {
+                Vec::new()
+            } else {
+                normalize_tunnel_route_targets(&[tunnel_routes]).map_err(AppError::Config)?
+            };
         }
 
         Ok(())
