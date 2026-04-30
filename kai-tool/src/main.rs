@@ -20,6 +20,7 @@ const KAI_WORKSPACE_ADMIN_LOCK_FILE: &str = ".workspace.lock";
 const SUBMODULE_POINTER_COMMIT_MESSAGE: &str = "chore: bump submodule commit pointers";
 const WARNING_ANSI_BOLD_YELLOW: &str = "\x1b[1;33m";
 const WARNING_ANSI_RESET: &str = "\x1b[0m";
+const GIT_TERMINAL_PROMPT_ENV: &str = "GIT_TERMINAL_PROMPT";
 const SUBMODULE_CHANGED_FILES_PREVIEW_LIMIT: usize = 8;
 const WORKTREE_CREATE_PROGRESS_BASE_STEPS: u64 = 5;
 const COMMON_WORDS: &[&str] = &[
@@ -666,8 +667,19 @@ fn eprintln_warning(message: &str) {
     eprintln!("{} {message}", warning_label());
 }
 
+fn disable_git_terminal_prompts(command: &mut Command) -> &mut Command {
+    command.env(GIT_TERMINAL_PROMPT_ENV, "0")
+}
+
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    command.stdin(Stdio::null());
+    disable_git_terminal_prompts(&mut command);
+    command
+}
+
 fn git_superproject_root(repo_root: &Path) -> Result<Option<PathBuf>> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["rev-parse", "--show-superproject-working-tree"])
         .current_dir(repo_root)
         .output()
@@ -691,7 +703,7 @@ fn git_superproject_root(repo_root: &Path) -> Result<Option<PathBuf>> {
 }
 
 fn try_git_toplevel(cwd: &Path) -> Result<Option<PathBuf>> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(cwd)
         .output()
@@ -922,7 +934,7 @@ fn build_agent_command(
     model: WorktreeAgentModel,
     resume_mode: AgentResumeMode,
 ) -> (&'static str, Command) {
-    match model {
+    let (tool, mut command) = match model {
         WorktreeAgentModel::Codex => {
             let mut command = Command::new("codex");
             if matches!(
@@ -948,7 +960,9 @@ fn build_agent_command(
             command.arg("--dangerously-skip-permissions");
             ("claude", command)
         }
-    }
+    };
+    disable_git_terminal_prompts(&mut command);
+    (tool, command)
 }
 
 fn agent(args: AgentArgs) -> Result<ExitCode> {
@@ -1424,7 +1438,9 @@ Rules:
 ";
 
     let output_file = NamedTempFile::new().context("Failed to create temporary codex output")?;
-    let status = Command::new(codex_path)
+    let mut command = Command::new(codex_path);
+    disable_git_terminal_prompts(&mut command);
+    let status = command
         .arg("exec")
         .args(["--sandbox", "read-only"])
         .arg("-c")
@@ -1723,7 +1739,7 @@ fn worktree_is_locked(worktree_path: &Path) -> Result<bool> {
 }
 
 fn git_repo_root(cwd: &Path) -> Result<PathBuf> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["rev-parse", "--git-common-dir"])
         .current_dir(cwd)
         .output()
@@ -1868,7 +1884,7 @@ fn git_submodule_pointer_changes_from_diff(
     args: &[&str],
     reason: &str,
 ) -> Result<Vec<String>> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(args)
         .current_dir(repo_root)
         .output()
@@ -1890,7 +1906,7 @@ fn git_submodule_pointer_changes_from_diff(
 }
 
 fn git_submodule_pointer_paths_from_diff(repo_root: &Path, args: &[&str]) -> Result<Vec<String>> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(args)
         .current_dir(repo_root)
         .output()
@@ -1912,7 +1928,7 @@ fn git_submodule_pointer_paths_from_diff(repo_root: &Path, args: &[&str]) -> Res
 }
 
 fn git_staged_changes(repo_root: &Path) -> Result<Vec<String>> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["diff", "--cached", "--name-status", "--"])
         .current_dir(repo_root)
         .output()
@@ -1940,7 +1956,7 @@ fn git_stage_paths(repo_root: &Path, paths: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let mut command = Command::new("git");
+    let mut command = git_command();
     command.arg("add").arg("--");
     for path in paths {
         command.arg(path);
@@ -1960,7 +1976,7 @@ fn git_stage_paths(repo_root: &Path, paths: &[String]) -> Result<()> {
 }
 
 fn git_commit(repo_root: &Path, message: &str) -> Result<()> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["commit", "-m", message])
         .current_dir(repo_root)
         .output()
@@ -1980,7 +1996,7 @@ fn git_commit(repo_root: &Path, message: &str) -> Result<()> {
 }
 
 fn git_push(repo_root: &Path) -> Result<()> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-c")
         .arg("push.recurseSubmodules=no")
         .arg("push")
@@ -2003,7 +2019,7 @@ fn git_push(repo_root: &Path) -> Result<()> {
 
 fn git_submodule_paths(repo_root: &Path) -> Result<Vec<String>> {
     let probe = r#"printf "%s\n" "$sm_path""#;
-    let output = Command::new("git")
+    let output = git_command()
         .args(["submodule", "foreach", "--recursive", "--quiet", probe])
         .current_dir(repo_root)
         .output()
@@ -2032,7 +2048,7 @@ fn git_submodule_uncommitted_changes(
     submodule_path: &str,
 ) -> Result<Option<SubmoduleUncommittedChanges>> {
     let submodule_root = repo_root.join(submodule_path);
-    let output = Command::new("git")
+    let output = git_command()
         .args(["status", "--porcelain", "--untracked-files=all"])
         .current_dir(&submodule_root)
         .output()
@@ -2208,7 +2224,7 @@ fn validate_worktree_name(name: &str, repo_root: &Path) -> Result<()> {
 }
 
 fn validate_git_branch_name(repo_root: &Path, name: &str) -> Result<()> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["check-ref-format", "--branch", name])
         .current_dir(repo_root)
         .output()
@@ -2251,7 +2267,7 @@ fn pick_random_session_name(repo_root: &Path, worktrees_dir: &Path) -> Result<St
 
 fn git_local_branch_exists(repo_root: &Path, name: &str) -> Result<bool> {
     let ref_name = format!("refs/heads/{name}");
-    let output = Command::new("git")
+    let output = git_command()
         .args(["show-ref", "--verify", "--quiet", &ref_name])
         .current_dir(repo_root)
         .output()
@@ -2297,7 +2313,7 @@ fn worktree_delete_blockers(repo_root: &Path, worktree_path: &Path) -> Result<Ve
 }
 
 fn git_worktree_unstaged_changes(worktree_path: &Path) -> Result<Vec<String>> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["status", "--porcelain"])
         .current_dir(worktree_path)
         .output()
@@ -2325,7 +2341,7 @@ fn git_worktree_unstaged_changes(worktree_path: &Path) -> Result<Vec<String>> {
 }
 
 fn git_commits_not_merged_into_master(worktree_path: &Path) -> Result<Vec<String>> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["log", "--oneline", "--reverse", "master..HEAD"])
         .current_dir(worktree_path)
         .output()
@@ -2356,7 +2372,7 @@ fn preview_items(items: &[String], max_items: usize) -> String {
 }
 
 fn git_worktree_remove(repo_root: &Path, worktree_path: &Path, force: bool) -> Result<()> {
-    let mut command = Command::new("git");
+    let mut command = git_command();
     command.arg("worktree").arg("remove");
     if force {
         command.arg("--force");
@@ -2384,7 +2400,7 @@ fn git_worktree_remove(repo_root: &Path, worktree_path: &Path, force: bool) -> R
 }
 
 fn git_worktree_prune(repo_root: &Path) -> Result<()> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["worktree", "prune"])
         .current_dir(repo_root)
         .output()
@@ -2399,7 +2415,7 @@ fn git_worktree_prune(repo_root: &Path) -> Result<()> {
 }
 
 fn git_top_level_submodule_paths(worktree_path: &Path) -> Result<Vec<String>> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-c")
         .arg("protocol.file.allow=always")
         .args(["submodule", "status"])
@@ -2448,7 +2464,7 @@ fn git_submodule_update_init_recursive_for_path(
     submodule_path: &str,
     reference_repo: Option<&Path>,
 ) -> Result<()> {
-    let mut command = Command::new("git");
+    let mut command = git_command();
     command
         .arg("-c")
         .arg("protocol.file.allow=always")
@@ -2485,7 +2501,7 @@ fn git_submodule_update_init_recursive_for_path(
 
 fn delete_local_branch(repo_root: &Path, name: &str, force: bool) -> Result<()> {
     let delete_flag = if force { "-D" } else { "-d" };
-    let output = Command::new("git")
+    let output = git_command()
         .args(["branch", delete_flag, name])
         .current_dir(repo_root)
         .output()
@@ -2581,7 +2597,7 @@ fn create_worktree(
         }
 
         worktree_create_progress_update(&progress, 3, "Running `git worktree add`");
-        let mut command = Command::new("git");
+        let mut command = git_command();
         command.arg("worktree").arg("add");
         match branch_mode {
             WorktreeBranchMode::UseExisting => {
@@ -2676,6 +2692,7 @@ fn maybe_spawn_background_cargo_build(worktree_path: &Path) {
     if is_workspace {
         command.arg("--workspace");
     }
+    disable_git_terminal_prompts(&mut command);
     command
         .current_dir(worktree_path)
         .stdin(Stdio::null())
@@ -2973,7 +2990,7 @@ mod tests {
     use super::*;
 
     fn run_git(path: &Path, args: &[&str]) {
-        let status = Command::new("git")
+        let status = git_command()
             .arg("-c")
             .arg("commit.gpgsign=false")
             .args(args)
@@ -2989,7 +3006,7 @@ mod tests {
     }
 
     fn run_git_allow_file(path: &Path, args: &[&str]) {
-        let status = Command::new("git")
+        let status = git_command()
             .arg("-c")
             .arg("commit.gpgsign=false")
             .arg("-c")
@@ -3007,7 +3024,7 @@ mod tests {
     }
 
     fn run_git_output(path: &Path, args: &[&str]) -> std::process::Output {
-        Command::new("git")
+        git_command()
             .arg("-c")
             .arg("commit.gpgsign=false")
             .args(args)
@@ -3412,6 +3429,20 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(args, vec!["--dangerously-skip-permissions"]);
+    }
+
+    #[test]
+    fn build_agent_command_disables_git_terminal_prompts() {
+        for model in [WorktreeAgentModel::Codex, WorktreeAgentModel::Claude] {
+            let (_, command) = build_agent_command(model, AgentResumeMode::Off);
+            let git_terminal_prompt = command
+                .get_envs()
+                .find_map(|(key, value)| {
+                    (key == std::ffi::OsStr::new(GIT_TERMINAL_PROMPT_ENV)).then_some(value)
+                })
+                .flatten();
+            assert_eq!(git_terminal_prompt, Some(std::ffi::OsStr::new("0")));
+        }
     }
 
     #[test]
