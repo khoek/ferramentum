@@ -86,11 +86,11 @@ fn main() {
         println!("cargo:rustc-link-search=/usr/lib");
         println!("cargo:rustc-link-search=/usr/lib/x86_64-linux-gnu");
         println!("cargo:rustc-link-search=/lib/x86_64-linux-gnu");
-        println!("cargo:rustc-link-lib=dylib=crypto");
-        println!("cargo:rustc-link-lib=dylib=ssl");
-        println!("cargo:rustc-link-lib=dylib=xml2");
+        link_linux_system_lib("crypto");
+        link_linux_system_lib("ssl");
+        link_linux_system_lib("xml2");
         println!("cargo:rustc-link-lib=dylib=z");
-        println!("cargo:rustc-link-lib=dylib=lzma");
+        link_linux_system_lib("lzma");
         link_linux_system_lib("lz4");
         link_linux_system_lib("icui18n");
         link_linux_system_lib("icudata");
@@ -166,6 +166,20 @@ fn main() {
         }
     }
 
+    let bindings_path = manifest_dir.join(format!(
+        "src/bindings_{}_{}{}.rs",
+        target_arch,
+        target_os,
+        if target_env.is_empty() {
+            "".to_string()
+        } else {
+            format!("_{}", target_env)
+        }
+    ));
+    if bindings_path.exists() {
+        return;
+    }
+
     // Finish the builder and generate the bindings.
     let bindings = bindings_builder
         .generate()
@@ -174,16 +188,7 @@ fn main() {
 
     // Write the bindings to the $OUT_DIR/bindings.rs file.
     bindings
-        .write_to_file(manifest_dir.join(format!(
-            "src/bindings_{}_{}{}.rs",
-            target_arch,
-            target_os,
-            if target_env.is_empty() {
-                "".to_string()
-            } else {
-                format!("_{}", target_env)
-            }
-        )))
+        .write_to_file(bindings_path)
         .expect("Couldn't write bindings!");
 }
 

@@ -12,9 +12,6 @@ keywords = ["openconnect", "vpn", "networking", "security"]
 documentation = "https://docs.rs/openconnect-sys"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-[dependencies]
-openssl-sys = "0.9.101"
-
 [lib]
 crate-type = ["lib"]
 
@@ -23,7 +20,12 @@ bindgen = "0.69.4"
 cc = "1.0.90"
 pkg-config = "0.3.30"
 home = "0.5.9"
-reqwest = { version = "0.12.2", features = ["multipart", "blocking", "cookies"] }
+reqwest = { version = "0.12.2", default-features = false, features = [
+    "blocking",
+    "cookies",
+    "multipart",
+    "rustls-tls",
+] }
 zip = "0.6.6"
 
 [package.metadata.docs.rs]

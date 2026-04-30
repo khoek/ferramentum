@@ -1,4 +1,4 @@
-[patch.crates-io]
+[patch."https://github.com/khoek/Openconnect-RS.git"]
 openconnect-core = { path = "vendor/openconnect-rs/crates/openconnect-core" }
 openconnect-sys = { path = "vendor/openconnect-rs/crates/openconnect-sys" }
 
