@@ -14,7 +14,7 @@ Installed command: `kai`
 
 - `kai llm-get` (`lg`) for LLM-friendly file listings
 - `kai init` to write `.kai/config.toml`
-- `kai agent` (`a`) to launch codex or claude
+- `kai agent` (`a`, `ar` for `--resume-all`) to launch codex or claude
 - `kai worktree` (`wc|wa|wo|wd`) to manage worktrees
 
 ## License

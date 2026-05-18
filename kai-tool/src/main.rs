@@ -53,7 +53,7 @@ const COMMON_WORDS: &[&str] = &[
 #[command(
     name = "kai",
     about = "Utilities for AI and coding workflows.",
-    after_help = "Shorthands:\n  lg  llm-get\n  a   agent\n  wc  worktree create\n  wa  worktree agent\n  wo  worktree open\n  wd  worktree delete\n\nWorkspace setup:\n  init        Create .kai/config.toml in the current repo root\n"
+    after_help = "Shorthands:\n  lg  llm-get\n  a   agent\n  ar  agent --resume-all\n  wc  worktree create\n  wa  worktree agent\n  wo  worktree open\n  wd  worktree delete\n\nWorkspace setup:\n  init        Create .kai/config.toml in the current repo root\n"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -90,6 +90,13 @@ enum Commands {
         after_help = "Shorthand: a"
     )]
     Agent(AgentArgs),
+
+    #[command(
+        name = "ar",
+        hide = true,
+        about = "Shorthand for `agent --resume-all`."
+    )]
+    Ar(AgentResumeAllArgs),
 
     #[command(
         name = "worktree",
@@ -229,6 +236,13 @@ struct AgentArgs {
     /// Resume picker across all conversations (codex: `resume --all`).
     #[arg(long = "resume-all", conflicts_with = "resume")]
     resume_all: bool,
+}
+
+#[derive(Debug, Args)]
+struct AgentResumeAllArgs {
+    /// Which tool to run (default: codex).
+    #[arg(long = "model", value_enum, default_value_t = WorktreeAgentModel::Codex)]
+    model: WorktreeAgentModel,
 }
 
 #[derive(Debug, Args)]
@@ -492,6 +506,11 @@ fn run() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Agent(args) => agent(args),
+        Commands::Ar(args) => agent(AgentArgs {
+            model: args.model,
+            resume: false,
+            resume_all: true,
+        }),
         Commands::Worktree(args) => match args.command {
             WorktreeCommands::Create(args) => {
                 worktree_create(args)?;
@@ -3864,6 +3883,28 @@ mod tests {
                 resume: false,
                 resume_all: true,
                 ..
+            })
+        ));
+    }
+
+    #[test]
+    fn top_level_agent_resume_all_alias_parses() {
+        let cli = Cli::try_parse_from(["kai", "ar"]).expect("parse ar shorthand");
+        assert!(matches!(
+            command_or_default(cli),
+            Commands::Ar(AgentResumeAllArgs {
+                model: WorktreeAgentModel::Codex,
+            })
+        ));
+    }
+
+    #[test]
+    fn top_level_agent_resume_all_alias_model_parses() {
+        let cli = Cli::try_parse_from(["kai", "ar", "--model", "claude"]).expect("parse ar model");
+        assert!(matches!(
+            command_or_default(cli),
+            Commands::Ar(AgentResumeAllArgs {
+                model: WorktreeAgentModel::Claude,
             })
         ));
     }
