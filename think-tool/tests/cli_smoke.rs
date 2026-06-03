@@ -826,6 +826,13 @@ fn manual_and_idle_triggers_start_prefixed_auto_archived_supervisors() -> Result
         None,
     )?)?;
 
+    let supervisor_config = project.join("roles").join("supervisor").join("config.toml");
+    fs::write(
+        &supervisor_config,
+        fs::read_to_string(&supervisor_config)?
+            .replace("status = \"paused\"", "status = \"active\""),
+    )?;
+
     let fake_bin = temp.path().join("bin");
     install_fake_codex(&fake_bin)?;
     let log = temp.path().join("codex.log");
@@ -864,7 +871,6 @@ fn manual_and_idle_triggers_start_prefixed_auto_archived_supervisors() -> Result
     assert!(manual_trigger.contains("manual smoke review"));
     assert!(fs::read_to_string(manual_agent.join("agent.toml"))?.contains("archived = true"));
 
-    let supervisor_config = project.join("roles").join("supervisor").join("config.toml");
     fs::write(
         &supervisor_config,
         format!(
@@ -939,6 +945,7 @@ fn math_episodes_project_has_compact_episode_defaults() -> Result<(), Box<dyn Er
     assert!(publisher_config.contains("queue = \"publisher\""));
     let supervisor_config =
         fs::read_to_string(project.join("roles").join("supervisor").join("config.toml"))?;
+    assert!(supervisor_config.contains("status = \"paused\""));
     assert!(supervisor_config.contains("agent_prefix = \"o\""));
     assert!(supervisor_config.contains("auto_archive = true"));
     assert!(supervisor_config.contains("kind = \"role-agent-finished\""));

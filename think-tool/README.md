@@ -12,7 +12,7 @@ Installed command: `think`
 
 ## Design
 
-See [DESIGN.md](DESIGN.md).
+See [DESIGN.md](https://github.com/khoek/ferramentum/blob/master/think-tool/DESIGN.md).
 
 ## Quick Start
 
@@ -66,9 +66,9 @@ roles `episode`, `publisher`, `supervisor`, and `auditor`. Episodes write TeX an
 `work/own/` and publish standalone PDFs to `report-single`. The queued serial publisher wakes after
 each finished episode, copies the previous publisher manuscript when exposed, adds the triggering
 episode through a relative `\input`, compile-checks, and publishes the combined PDF to `report`.
-The supervisor also wakes after each finished episode and can launch follow-up episodes without
-waiting on publication. The auditor wakes periodically and publishes Markdown alerts only for
-actionable health issues.
+The supervisor starts paused; after activation, it wakes after each finished episode and can launch
+follow-up episodes without waiting on publication. The auditor wakes periodically and publishes
+Markdown alerts only for actionable health issues.
 
 ## Commands
 

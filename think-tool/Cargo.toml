@@ -1,6 +1,6 @@
 [package]
 name = "think-tool"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 publish.workspace = true
 description = "CLI for coordinating persistent agent sessions on complex projects."

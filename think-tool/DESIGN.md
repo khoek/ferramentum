@@ -217,10 +217,11 @@ notices.
 
 The template creates:
 
-- channels `report` and `report-single`;
+- channels `alerts`, `report`, and `report-single`;
 - role `episode`, active repeatable, sequential `ep` ids;
 - role `publisher`, active oneshot, serial queued, `expose = ["last-agent-finished"]`;
-- role `supervisor`, active oneshot, queued after publisher completion;
+- role `supervisor`, paused oneshot, queued after episode completion when activated;
+- role `auditor`, active oneshot, queued by a periodic idle trigger;
 - static seeds under `templates/math-episodes/`.
 
 Episode agents write `work/own/episodes/<agent>.tex`, build a standalone PDF from their private

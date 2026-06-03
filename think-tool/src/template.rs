@@ -219,7 +219,7 @@ fn create_math_supervisor_role(project: &ProjectPaths) -> Result<()> {
             &role_paths.config(),
             &RoleConfig {
                 version: ROLE_CONFIG_VERSION,
-                status: RoleStatus::Active,
+                status: RoleStatus::Paused,
                 backend: BackendName::Codex,
                 mode: RoleMode::Oneshot,
                 parallel: RoleParallelism::Count(1),
@@ -289,8 +289,9 @@ This project was created from the `math-episodes` template. The intended workflo
 - The `publisher` role is queued and serial. It wakes after each completed episode, copies the prior
   publisher manuscript when one exists, adds the triggering episode by a relative `\input`, checks
   the build, and publishes the finished PDF to the `report` channel.
-- The `supervisor` role reads finished work and channel outputs, maintains a high-level map of
-  active prongs, and launches new `episode` agents when that is the best next move.
+- The `supervisor` role starts paused. When activated, it reads finished work and channel outputs,
+  maintains a high-level map of active prongs, and launches new `episode` agents when that is the
+  best next move.
 - `channels/report-single` is for standalone episode PDFs. `channels/report` is for the publisher's
   complete manuscript PDF. Channel directories are append-only artifact logs managed by think; agents
   publish by writing to their local `channels/<channel>/` outbox.
