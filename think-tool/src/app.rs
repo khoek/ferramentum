@@ -195,8 +195,10 @@ const RETRY_REQUEST_VERSION: u32 = 1;
 const UPDATE_INDEX_STATE_VERSION: u32 = 1;
 const PROJECT_REGISTRY_VERSION: u32 = 1;
 const MAX_OOM_RESTARTS: u32 = 3;
+const MAX_AGENT_REPAIR_RETRIES: u32 = 3;
 const DEFAULT_OOM_RESTART_DELAY_SECONDS: u64 = 5;
 const DEFAULT_PROVIDER_PREP_RETRY_SECONDS: u64 = 5;
+const DEFAULT_AGENT_REPAIR_RETRY_SECONDS: u64 = 1;
 const MIN_RETRY_DELAY_SECONDS: u64 = 1;
 const RETRY_POLL_MIN_SECONDS: u64 = 1;
 const RETRY_POLL_MAX_SECONDS: u64 = 5;
@@ -332,6 +334,8 @@ struct SupervisorState {
     #[serde(default)]
     provider_retries: u32,
     #[serde(default)]
+    repair_retries: u32,
+    #[serde(default)]
     last_run_id: Option<u64>,
     #[serde(default)]
     child_pid: Option<u32>,
@@ -364,6 +368,7 @@ impl Default for SupervisorState {
             oom_restarts: 0,
             quota_retries: 0,
             provider_retries: 0,
+            repair_retries: 0,
             last_run_id: None,
             child_pid: None,
             next_retry_at: None,
@@ -1953,7 +1958,12 @@ fn run_more_codex_command(
     session_id: Option<&str>,
 ) -> Result<MoreCodexRun> {
     let resume_exit = runner::run_command_no_stdin(
-        codex_resume_command(&agent_paths.root(), run_paths.run_id, session_id)?,
+        codex_resume_command(
+            &agent_paths.root(),
+            run_paths.run_id,
+            session_id,
+            &run_paths.reply(),
+        )?,
         run_paths,
     )?;
     if resume_exit.success {
@@ -1977,7 +1987,7 @@ fn run_more_codex_command(
     );
     Ok(MoreCodexRun {
         exit: runner::run_command_no_stdin(
-            codex_more_fresh_command(&agent_paths.root(), run_paths.run_id)?,
+            codex_more_fresh_command(&agent_paths.root(), run_paths.run_id, &run_paths.reply())?,
             run_paths,
         )?,
         message: Some(match session_id {
@@ -2020,19 +2030,26 @@ fn codex_resume_command(
     agent_dir: &Path,
     run_id: u64,
     session_id: Option<&str>,
+    reply_path: &Path,
 ) -> Result<CommandSpec> {
     crate::provider::codex::resume_command(
         agent_dir,
         session_id,
         more_prompt_instruction(run_id),
+        Some(reply_path),
         &codex_config_for_cwd(agent_dir)?,
     )
 }
 
-fn codex_more_fresh_command(agent_dir: &Path, run_id: u64) -> Result<CommandSpec> {
+fn codex_more_fresh_command(
+    agent_dir: &Path,
+    run_id: u64,
+    reply_path: &Path,
+) -> Result<CommandSpec> {
     crate::provider::codex::fresh_more_command(
         agent_dir,
         more_prompt_instruction(run_id),
+        Some(reply_path),
         &codex_config_for_cwd(agent_dir)?,
     )
 }
@@ -3648,6 +3665,50 @@ enum SupervisedCommandOutcome {
     Stopped,
 }
 
+struct SupervisedCommandResult {
+    outcome: SupervisedCommandOutcome,
+    resume_session: Option<String>,
+}
+
+struct FinalizationInput {
+    exit: runner::PtyExit,
+    disposition: Option<Disposition>,
+    state: AgentState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentRepairKind {
+    AgentState,
+    ChannelOutbox,
+    Manifest,
+    Reply,
+}
+
+impl std::fmt::Display for AgentRepairKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AgentState => formatter.write_str("agent state"),
+            Self::ChannelOutbox => formatter.write_str("channel outbox"),
+            Self::Manifest => formatter.write_str("manifest"),
+            Self::Reply => formatter.write_str("reply"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AgentRepairError {
+    kind: AgentRepairKind,
+    message: String,
+}
+
+impl std::fmt::Display for AgentRepairError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AgentRepairError {}
+
 fn run_agent_step(
     project: &ProjectPaths,
     role_paths: &RolePaths,
@@ -3691,16 +3752,118 @@ fn run_agent_step(
         role_paths.role,
         agent_paths.agent
     );
-    let exit = run_supervised_agent_command(agent, &role_paths, agent_paths, &run_paths);
+    let mut repair_attempts = 0;
+    let mut resume_session = None;
+    let mut restart_notice = None;
+    let step_result: Result<Option<FinalizationInput>> = loop {
+        let result = run_supervised_agent_command(
+            &agent,
+            role_paths,
+            agent_paths,
+            &run_paths,
+            resume_session.take(),
+            restart_notice.take(),
+        );
+        let result = match result {
+            Ok(result) => result,
+            Err(err) => break Err(err),
+        };
+        resume_session = result.resume_session;
+        let SupervisedCommandOutcome::Exit(exit) = result.outcome else {
+            break Ok(None);
+        };
+        if !exit.success {
+            match validate_agent_state_after_run(agent_paths, &state) {
+                Ok(state) => {
+                    break Ok(Some(FinalizationInput {
+                        exit,
+                        disposition: None,
+                        state,
+                    }));
+                }
+                Err(err) => break Err(err),
+            }
+        }
+        match validate_agent_finalization(
+            project,
+            agent_paths,
+            config.mode,
+            &state,
+            run_id,
+            &run_paths,
+        ) {
+            Ok((state, disposition)) => {
+                break Ok(Some(FinalizationInput {
+                    exit,
+                    disposition,
+                    state,
+                }));
+            }
+            Err(err)
+                if is_agent_repair_error(&err) && repair_attempts < MAX_AGENT_REPAIR_RETRIES =>
+            {
+                repair_attempts += 1;
+                let retry_at = unix_timestamp() + agent_repair_retry_delay_seconds();
+                let event = agent_repair_event(&err, repair_attempts, retry_at);
+                let kind = agent_repair_kind(&err).expect("repair errors have a kind");
+                if let Err(err) = record_agent_repair_retry(
+                    agent_paths,
+                    run_id,
+                    retry_at,
+                    resume_session.clone(),
+                    &event,
+                    &state,
+                    kind,
+                ) {
+                    break Err(err);
+                }
+                match wait_until_retry(agent_paths, role_paths, retry_at) {
+                    Ok(true) => {}
+                    Ok(false) => break Ok(None),
+                    Err(err) => break Err(err),
+                }
+                restart_notice = Some(agent_repair_notice(
+                    &err,
+                    kind,
+                    config.mode,
+                    repair_attempts,
+                ));
+            }
+            Err(err) => {
+                let event = if is_agent_repair_error(&err) {
+                    agent_repair_exhausted_event(&err)
+                } else {
+                    err.to_string()
+                };
+                if let Err(err) = save_supervisor_needs_attention(
+                    agent_paths,
+                    run_id,
+                    resume_session.clone(),
+                    &event,
+                ) {
+                    break Err(err);
+                }
+                if let Err(err) = update_agent_note(agent_paths, &event) {
+                    break Err(err);
+                }
+                break Err(err);
+            }
+        }
+    };
     elapsed_triggers_done.store(true, Ordering::Relaxed);
     if let Some(handle) = elapsed_trigger_thread {
         handle
             .join()
             .unwrap_or_else(|_| Err(anyhow!("elapsed trigger thread panicked")))?;
     }
-    let SupervisedCommandOutcome::Exit(exit) = exit? else {
+    let Some(finalization) = step_result? else {
         return Ok(ContinueDecision::Stop);
     };
+    let FinalizationInput {
+        exit,
+        disposition,
+        mut state,
+    } = finalization;
     let finished_at = unix_timestamp();
     if !exit.success {
         let exit = run_exit_from_pty(
@@ -3716,20 +3879,6 @@ fn run_agent_step(
         bail!("agent exited unsuccessfully with status code {}", exit.code);
     }
 
-    let disposition = match config.mode {
-        RoleMode::Repeatable => {
-            let disposition = load_agent_manifest(agent_paths)?.disposition;
-            if disposition.is_none() {
-                bail!(
-                    "repeatable role run ended without `disposition = \"continue\"` or `disposition = \"stop\"` in manifest.toml"
-                );
-            }
-            disposition
-        }
-        RoleMode::Oneshot | RoleMode::Infinite => None,
-    };
-
-    let mut state = load_agent(agent_paths)?;
     let pause_requested = state.paused_by_user || state.status == AgentStatus::Paused;
     let pause_note = state.note.clone().unwrap_or_else(|| {
         if state.paused_by_user {
@@ -3804,16 +3953,18 @@ fn run_agent_step(
     Ok(decision)
 }
 
-fn run_supervised_agent_command<A: AgentBackend>(
-    agent: A,
+fn run_supervised_agent_command<A: AgentBackend + ?Sized>(
+    agent: &A,
     role_paths: &RolePaths,
     agent_paths: &crate::state::AgentPaths,
     run_paths: &crate::state::RunPaths,
-) -> Result<SupervisedCommandOutcome> {
+    initial_resume_session: Option<String>,
+    initial_restart_notice: Option<String>,
+) -> Result<SupervisedCommandResult> {
     let mut oom_restarts = 0;
     let mut quota_retries = 0;
-    let mut resume_session = None;
-    let mut restart_notice = None;
+    let mut resume_session = initial_resume_session;
+    let mut restart_notice = initial_restart_notice;
 
     loop {
         let mut supervisor = load_supervisor_state(agent_paths)?;
@@ -3827,6 +3978,7 @@ fn run_supervised_agent_command<A: AgentBackend>(
 
         let command = match agent.command(AgentCommandRequest {
             agent_dir: &agent_paths.root(),
+            reply_path: &run_paths.reply(),
             resume_session: resume_session.as_deref(),
             restart_notice: restart_notice.as_deref(),
         }) {
@@ -3848,7 +4000,10 @@ fn run_supervised_agent_command<A: AgentBackend>(
                 )?;
                 update_agent_note(agent_paths, &event)?;
                 if !wait_until_retry(agent_paths, role_paths, retry_at)? {
-                    return Ok(SupervisedCommandOutcome::Stopped);
+                    return Ok(SupervisedCommandResult {
+                        outcome: SupervisedCommandOutcome::Stopped,
+                        resume_session,
+                    });
                 }
                 restart_notice = Some(
                     concat!(
@@ -3879,10 +4034,13 @@ fn run_supervised_agent_command<A: AgentBackend>(
                 supervisor.last_run_id = Some(run_paths.run_id);
                 supervisor.child_pid = None;
                 supervisor.next_retry_at = None;
-                supervisor.last_session_id = resume_session;
+                supervisor.last_session_id = resume_session.clone();
                 supervisor.last_event = Some("child exited successfully".to_owned());
                 save_supervisor_state(agent_paths, &supervisor)?;
-                return Ok(SupervisedCommandOutcome::Exit(exit));
+                return Ok(SupervisedCommandResult {
+                    outcome: SupervisedCommandOutcome::Exit(exit),
+                    resume_session,
+                });
             }
             Ok(_exit) if agent_execution_was_paused(agent_paths)? => {
                 let mut supervisor = load_supervisor_state(agent_paths)?;
@@ -3890,10 +4048,13 @@ fn run_supervised_agent_command<A: AgentBackend>(
                 supervisor.last_run_id = Some(run_paths.run_id);
                 supervisor.child_pid = None;
                 supervisor.next_retry_at = None;
-                supervisor.last_session_id = resume_session;
+                supervisor.last_session_id = resume_session.clone();
                 supervisor.last_event = Some("child stopped after agent pause".to_owned());
                 save_supervisor_state(agent_paths, &supervisor)?;
-                return Ok(SupervisedCommandOutcome::Stopped);
+                return Ok(SupervisedCommandResult {
+                    outcome: SupervisedCommandOutcome::Stopped,
+                    resume_session,
+                });
             }
             Ok(exit) => {
                 if let Some(decision) = agent.quota_decision(
@@ -3932,7 +4093,10 @@ fn run_supervised_agent_command<A: AgentBackend>(
                             )?;
                             update_agent_note(agent_paths, &event)?;
                             if !wait_until_retry(agent_paths, role_paths, retry_at)? {
-                                return Ok(SupervisedCommandOutcome::Stopped);
+                                return Ok(SupervisedCommandResult {
+                                    outcome: SupervisedCommandOutcome::Stopped,
+                                    resume_session,
+                                });
                             }
                             restart_notice = Some(format!(
                                 concat!(
@@ -3965,7 +4129,10 @@ fn run_supervised_agent_command<A: AgentBackend>(
                     )?;
                     update_agent_note(agent_paths, &event)?;
                     if !wait_until_retry(agent_paths, role_paths, retry_at)? {
-                        return Ok(SupervisedCommandOutcome::Stopped);
+                        return Ok(SupervisedCommandResult {
+                            outcome: SupervisedCommandOutcome::Stopped,
+                            resume_session,
+                        });
                     }
                     restart_notice = Some(format!(
                         "The previous Codex child was killed by SIGKILL/137, likely due to memory pressure. Avoid repeating the memory-heavy operation; use smaller batches, streaming, checkpoints, or external artifacts in data/own/."
@@ -3976,13 +4143,16 @@ fn run_supervised_agent_command<A: AgentBackend>(
                     supervisor.last_run_id = Some(run_paths.run_id);
                     supervisor.child_pid = None;
                     supervisor.next_retry_at = None;
-                    supervisor.last_session_id = resume_session;
+                    supervisor.last_session_id = resume_session.clone();
                     supervisor.last_event = Some(format!(
                         "child exited unsuccessfully with status code {}",
                         exit.code
                     ));
                     save_supervisor_state(agent_paths, &supervisor)?;
-                    return Ok(SupervisedCommandOutcome::Exit(exit));
+                    return Ok(SupervisedCommandResult {
+                        outcome: SupervisedCommandOutcome::Exit(exit),
+                        resume_session,
+                    });
                 }
             }
             Err(err) => {
@@ -3992,16 +4162,19 @@ fn run_supervised_agent_command<A: AgentBackend>(
                     supervisor.last_run_id = Some(run_paths.run_id);
                     supervisor.child_pid = None;
                     supervisor.next_retry_at = None;
-                    supervisor.last_session_id = resume_session;
+                    supervisor.last_session_id = resume_session.clone();
                     supervisor.last_event = Some("child stopped after agent pause".to_owned());
                     save_supervisor_state(agent_paths, &supervisor)?;
-                    return Ok(SupervisedCommandOutcome::Stopped);
+                    return Ok(SupervisedCommandResult {
+                        outcome: SupervisedCommandOutcome::Stopped,
+                        resume_session,
+                    });
                 }
                 let mut supervisor = load_supervisor_state(agent_paths)?;
                 supervisor.status = SupervisorStatus::NeedsAttention;
                 supervisor.last_run_id = Some(run_paths.run_id);
                 supervisor.next_retry_at = None;
-                supervisor.last_session_id = resume_session;
+                supervisor.last_session_id = resume_session.clone();
                 supervisor.last_event = Some(err.to_string());
                 save_supervisor_state(agent_paths, &supervisor)?;
                 return Err(err);
@@ -4072,10 +4245,67 @@ fn save_supervisor_wait(
     save_supervisor_state(agent_paths, &state)
 }
 
+fn save_supervisor_repair_retry(
+    agent_paths: &crate::state::AgentPaths,
+    run_id: u64,
+    retry_at: u64,
+    session_id: Option<String>,
+    event: &str,
+) -> Result<()> {
+    let mut state = load_supervisor_state(agent_paths)?;
+    state.status = SupervisorStatus::Restarting;
+    state.last_run_id = Some(run_id);
+    state.child_pid = None;
+    state.next_retry_at = Some(retry_at);
+    state.last_session_id = session_id;
+    state.last_event = Some(event.to_owned());
+    state.repair_retries += 1;
+    save_supervisor_state(agent_paths, &state)
+}
+
+fn save_supervisor_needs_attention(
+    agent_paths: &crate::state::AgentPaths,
+    run_id: u64,
+    session_id: Option<String>,
+    event: &str,
+) -> Result<()> {
+    let mut state = load_supervisor_state(agent_paths)?;
+    state.status = SupervisorStatus::NeedsAttention;
+    state.last_run_id = Some(run_id);
+    state.child_pid = None;
+    state.next_retry_at = None;
+    state.last_session_id = session_id;
+    state.last_event = Some(event.to_owned());
+    save_supervisor_state(agent_paths, &state)
+}
+
 fn update_agent_note(agent_paths: &crate::state::AgentPaths, note: &str) -> Result<()> {
     let mut state = load_agent(agent_paths)?;
     state.note = Some(note.to_owned());
     save_agent(agent_paths, &mut state)
+}
+
+fn record_agent_repair_retry(
+    agent_paths: &crate::state::AgentPaths,
+    run_id: u64,
+    retry_at: u64,
+    session_id: Option<String>,
+    event: &str,
+    expected_state: &AgentState,
+    kind: AgentRepairKind,
+) -> Result<()> {
+    save_supervisor_repair_retry(agent_paths, run_id, retry_at, session_id, event)?;
+    if update_agent_note(agent_paths, event).is_ok() {
+        return Ok(());
+    }
+    if kind != AgentRepairKind::AgentState {
+        return update_agent_note(agent_paths, event);
+    }
+    let mut restored = expected_state.clone();
+    restored.status = AgentStatus::Running;
+    restored.paused_by_user = false;
+    restored.note = Some(event.to_owned());
+    save_agent(agent_paths, &mut restored)
 }
 
 fn wait_until_retry(
@@ -4153,6 +4383,15 @@ fn provider_prep_retry_delay_seconds() -> u64 {
     DEFAULT_PROVIDER_PREP_RETRY_SECONDS
 }
 
+fn agent_repair_retry_delay_seconds() -> u64 {
+    if let Ok(value) = std::env::var("THINK_ORCHESTRATOR_AGENT_REPAIR_RETRY_SECONDS")
+        && let Ok(value) = value.parse::<u64>()
+    {
+        return value.max(MIN_RETRY_DELAY_SECONDS);
+    }
+    DEFAULT_AGENT_REPAIR_RETRY_SECONDS
+}
+
 fn format_unix_time(timestamp: u64) -> String {
     let Ok(second) = i64::try_from(timestamp) else {
         return timestamp.to_string();
@@ -4193,6 +4432,47 @@ fn finalize_channels(
     Ok(())
 }
 
+fn validate_channel_outboxes(
+    project: &ProjectPaths,
+    agent_paths: &crate::state::AgentPaths,
+    state: &AgentState,
+    run_id: u64,
+) -> Result<()> {
+    for channel in &state.channels {
+        let outbox = agent_paths.channel_dir(channel);
+        if !outbox.exists() || directory_is_empty(&outbox)? {
+            continue;
+        }
+        let channel_dir = project.channel_dir(channel);
+        for entry in fs::read_dir(&outbox)
+            .with_context(|| format!("Failed to read channel outbox `{}`", outbox.display()))?
+        {
+            let entry = entry.with_context(|| format!("Failed to read `{}`", outbox.display()))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                return Err(agent_repair_error(
+                    AgentRepairKind::ChannelOutbox,
+                    format!(
+                        "Channel outbox `{}` contains a non-UTF-8 top-level name.",
+                        outbox.display()
+                    ),
+                ));
+            };
+            if name == "." || name == ".." {
+                continue;
+            }
+            validate_publish_entry(
+                &entry.path(),
+                &channel_dir.join(format!(
+                    "{}-{}-{}-{}",
+                    state.role, state.agent, run_id, name
+                )),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn publish_channel_outbox(
     project: &ProjectPaths,
     agent_paths: &crate::state::AgentPaths,
@@ -4217,10 +4497,13 @@ fn publish_channel_outbox(
         let entry = entry.with_context(|| format!("Failed to read `{}`", outbox.display()))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
-            bail!(
-                "Channel outbox `{}` contains a non-UTF-8 top-level name.",
-                outbox.display()
-            );
+            return Err(agent_repair_error(
+                AgentRepairKind::ChannelOutbox,
+                format!(
+                    "Channel outbox `{}` contains a non-UTF-8 top-level name.",
+                    outbox.display()
+                ),
+            ));
         };
         if name == "." || name == ".." {
             continue;
@@ -4251,11 +4534,51 @@ fn directory_is_empty(path: &Path) -> Result<bool> {
         .is_none())
 }
 
+fn validate_publish_entry(source: &Path, target: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("Failed to inspect `{}`", source.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(agent_repair_error(
+            AgentRepairKind::ChannelOutbox,
+            format!("Refusing to publish symlink `{}`.", source.display()),
+        ));
+    }
+    if metadata.is_dir() {
+        if target.exists() {
+            return ensure_directories_identical(source, target);
+        }
+        return validate_publish_directory(source, target);
+    }
+    if metadata.is_file() {
+        if target.exists() {
+            ensure_files_identical(source, target)?;
+        }
+        return Ok(());
+    }
+    Err(agent_repair_error(
+        AgentRepairKind::ChannelOutbox,
+        format!("Refusing to publish non-file `{}`.", source.display()),
+    ))
+}
+
+fn validate_publish_directory(source: &Path, target: &Path) -> Result<()> {
+    for entry in fs::read_dir(source)
+        .with_context(|| format!("Failed to read directory `{}`", source.display()))?
+    {
+        let entry = entry.with_context(|| format!("Failed to read `{}`", source.display()))?;
+        validate_publish_entry(&entry.path(), &target.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
 fn copy_publish_entry(source: &Path, target: &Path) -> Result<bool> {
     let metadata = fs::symlink_metadata(source)
         .with_context(|| format!("Failed to inspect `{}`", source.display()))?;
     if metadata.file_type().is_symlink() {
-        bail!("Refusing to publish symlink `{}`.", source.display());
+        return Err(agent_repair_error(
+            AgentRepairKind::ChannelOutbox,
+            format!("Refusing to publish symlink `{}`.", source.display()),
+        ));
     }
     if metadata.is_dir() {
         if target.exists() {
@@ -4266,7 +4589,10 @@ fn copy_publish_entry(source: &Path, target: &Path) -> Result<bool> {
         return Ok(true);
     }
     if !metadata.is_file() {
-        bail!("Refusing to publish non-file `{}`.", source.display());
+        return Err(agent_repair_error(
+            AgentRepairKind::ChannelOutbox,
+            format!("Refusing to publish non-file `{}`.", source.display()),
+        ));
     }
     if target.exists() {
         ensure_files_identical(source, target)?;
@@ -4298,11 +4624,14 @@ fn copy_directory(source: &Path, target: &Path) -> Result<()> {
 
 fn ensure_directories_identical(source: &Path, target: &Path) -> Result<()> {
     if !target.is_dir() {
-        bail!(
-            "Publish target `{}` exists but is not a directory matching `{}`.",
-            target.display(),
-            source.display()
-        );
+        return Err(agent_repair_error(
+            AgentRepairKind::ChannelOutbox,
+            format!(
+                "Publish target `{}` exists but is not a directory matching `{}`.",
+                target.display(),
+                source.display()
+            ),
+        ));
     }
     let mut source_entries = BTreeSet::new();
     for entry in fs::read_dir(source)
@@ -4315,14 +4644,20 @@ fn ensure_directories_identical(source: &Path, target: &Path) -> Result<()> {
         let source_type = fs::symlink_metadata(&source_path)
             .with_context(|| format!("Failed to inspect `{}`", source_path.display()))?;
         if source_type.file_type().is_symlink() {
-            bail!("Refusing to publish symlink `{}`.", source_path.display());
+            return Err(agent_repair_error(
+                AgentRepairKind::ChannelOutbox,
+                format!("Refusing to publish symlink `{}`.", source_path.display()),
+            ));
         }
         if source_type.is_dir() {
             ensure_directories_identical(&source_path, &target_entry)?;
         } else if source_type.is_file() {
             ensure_files_identical(&source_path, &target_entry)?;
         } else {
-            bail!("Refusing to publish non-file `{}`.", source_path.display());
+            return Err(agent_repair_error(
+                AgentRepairKind::ChannelOutbox,
+                format!("Refusing to publish non-file `{}`.", source_path.display()),
+            ));
         }
     }
     for entry in fs::read_dir(target)
@@ -4330,11 +4665,14 @@ fn ensure_directories_identical(source: &Path, target: &Path) -> Result<()> {
     {
         let entry = entry.with_context(|| format!("Failed to read `{}`", target.display()))?;
         if !source_entries.contains(&entry.file_name()) {
-            bail!(
-                "Publish target `{}` contains extra entry `{}`.",
-                target.display(),
-                entry.file_name().to_string_lossy()
-            );
+            return Err(agent_repair_error(
+                AgentRepairKind::ChannelOutbox,
+                format!(
+                    "Publish target `{}` contains extra entry `{}`.",
+                    target.display(),
+                    entry.file_name().to_string_lossy()
+                ),
+            ));
         }
     }
     Ok(())
@@ -4342,19 +4680,25 @@ fn ensure_directories_identical(source: &Path, target: &Path) -> Result<()> {
 
 fn ensure_files_identical(source: &Path, target: &Path) -> Result<()> {
     if !target.is_file() {
-        bail!(
-            "Publish target `{}` exists but is not a file matching `{}`.",
-            target.display(),
-            source.display()
-        );
+        return Err(agent_repair_error(
+            AgentRepairKind::ChannelOutbox,
+            format!(
+                "Publish target `{}` exists but is not a file matching `{}`.",
+                target.display(),
+                source.display()
+            ),
+        ));
     }
     if fs::read(source).with_context(|| format!("Failed to read `{}`", source.display()))?
         != fs::read(target).with_context(|| format!("Failed to read `{}`", target.display()))?
     {
-        bail!(
-            "Publish target `{}` already exists with different content.",
-            target.display()
-        );
+        return Err(agent_repair_error(
+            AgentRepairKind::ChannelOutbox,
+            format!(
+                "Publish target `{}` already exists with different content.",
+                target.display()
+            ),
+        ));
     }
     Ok(())
 }
@@ -4432,14 +4776,265 @@ fn load_agent_manifest(paths: &crate::state::AgentPaths) -> Result<AgentManifest
     }
 }
 
+fn load_agent_manifest_for_display(
+    paths: &crate::state::AgentPaths,
+) -> (AgentManifest, Option<String>) {
+    match load_agent_manifest(paths) {
+        Ok(manifest) => (manifest, None),
+        Err(err) => (
+            AgentManifest::default(),
+            Some(compact_single_line(&format!("{err:#}"), 180)),
+        ),
+    }
+}
+
 fn save_agent_manifest(paths: &crate::state::AgentPaths, manifest: &AgentManifest) -> Result<()> {
     io::write_toml(&paths.manifest(), manifest)
 }
 
 fn prepare_agent_manifest(paths: &crate::state::AgentPaths) -> Result<()> {
-    let mut manifest = load_agent_manifest(paths)?;
+    let mut manifest = match load_agent_manifest(paths) {
+        Ok(manifest) => manifest,
+        Err(err) if is_toml_parse_error(&err) => AgentManifest::default(),
+        Err(err) => return Err(err),
+    };
     manifest.disposition = None;
     save_agent_manifest(paths, &manifest)
+}
+
+fn validate_agent_finalization(
+    project: &ProjectPaths,
+    agent_paths: &crate::state::AgentPaths,
+    mode: RoleMode,
+    expected_state: &AgentState,
+    run_id: u64,
+    run_paths: &crate::state::RunPaths,
+) -> Result<(AgentState, Option<Disposition>)> {
+    let state = validate_agent_state_after_run(agent_paths, expected_state)?;
+    let disposition = validate_agent_manifest_for_mode(agent_paths, mode)?;
+    validate_run_reply(run_paths)?;
+    validate_channel_outboxes(project, agent_paths, &state, run_id)?;
+    Ok((state, disposition))
+}
+
+fn validate_agent_state_after_run(
+    paths: &crate::state::AgentPaths,
+    expected: &AgentState,
+) -> Result<AgentState> {
+    let state = match load_agent(paths) {
+        Ok(state) => state,
+        Err(err) if is_toml_parse_error(&err) => {
+            return Err(agent_repair_error(
+                AgentRepairKind::AgentState,
+                format!("agent.toml is invalid: {err:#}"),
+            ));
+        }
+        Err(err) => return Err(err),
+    };
+    if state.role != expected.role {
+        return Err(agent_state_repair_error(format!(
+            "agent.toml changed role from `{}` to `{}`",
+            expected.role, state.role
+        )));
+    }
+    if state.agent != expected.agent {
+        return Err(agent_state_repair_error(format!(
+            "agent.toml changed agent from `{}` to `{}`",
+            expected.agent, state.agent
+        )));
+    }
+    if state.backend != expected.backend {
+        return Err(agent_state_repair_error(format!(
+            "agent.toml changed backend from `{}` to `{}`",
+            expected.backend, state.backend
+        )));
+    }
+    if state.mode != expected.mode {
+        return Err(agent_state_repair_error(format!(
+            "agent.toml changed mode from `{}` to `{}`",
+            expected.mode, state.mode
+        )));
+    }
+    if state.current_step != expected.current_step {
+        return Err(agent_state_repair_error(format!(
+            "agent.toml changed current_step from `{}` to `{}`",
+            expected.current_step, state.current_step
+        )));
+    }
+    if state.run_count != expected.run_count {
+        return Err(agent_state_repair_error(format!(
+            "agent.toml changed run_count from `{}` to `{}`",
+            expected.run_count, state.run_count
+        )));
+    }
+    if state.channels != expected.channels {
+        return Err(agent_state_repair_error(
+            "agent.toml changed the channel list".to_owned(),
+        ));
+    }
+    if !matches!(
+        state.status,
+        AgentStatus::Running
+            | AgentStatus::Paused
+            | AgentStatus::Stopped
+            | AgentStatus::NeedsAttention
+    ) {
+        return Err(agent_state_repair_error(format!(
+            "agent.toml has invalid in-run status `{}`",
+            state.status
+        )));
+    }
+    Ok(state)
+}
+
+fn agent_state_repair_error(message: String) -> anyhow::Error {
+    agent_repair_error(AgentRepairKind::AgentState, message)
+}
+
+fn validate_agent_manifest_for_mode(
+    paths: &crate::state::AgentPaths,
+    mode: RoleMode,
+) -> Result<Option<Disposition>> {
+    let manifest = match load_agent_manifest(paths) {
+        Ok(manifest) => manifest,
+        Err(err) if is_toml_parse_error(&err) => {
+            return Err(agent_repair_error(
+                AgentRepairKind::Manifest,
+                format!("manifest.toml is invalid: {err:#}"),
+            ));
+        }
+        Err(err) => return Err(err),
+    };
+    match mode {
+        RoleMode::Repeatable => manifest.disposition.map(Some).ok_or_else(|| {
+            agent_repair_error(
+                AgentRepairKind::Manifest,
+                concat!(
+                    "repeatable role run ended without `disposition = \"continue\"` or \
+                 `disposition = \"stop\"` in manifest.toml"
+                )
+                .to_owned(),
+            )
+        }),
+        RoleMode::Oneshot | RoleMode::Infinite => Ok(None),
+    }
+}
+
+fn validate_run_reply(run_paths: &crate::state::RunPaths) -> Result<()> {
+    let Some(reply) = io::read_optional_text(&run_paths.reply())? else {
+        return Err(agent_repair_error(
+            AgentRepairKind::Reply,
+            format!(
+                "run reply file `{}` is missing",
+                run_paths.reply().display()
+            ),
+        ));
+    };
+    if reply.trim().is_empty() {
+        return Err(agent_repair_error(
+            AgentRepairKind::Reply,
+            format!("run reply file `{}` is empty", run_paths.reply().display()),
+        ));
+    }
+    Ok(())
+}
+
+fn agent_repair_event(err: &anyhow::Error, attempt: u32, retry_at: u64) -> String {
+    let kind = agent_repair_kind(err)
+        .map(|kind| kind.to_string())
+        .unwrap_or_else(|| "agent output".to_owned());
+    format!(
+        "{kind} is invalid; repair {attempt}/{MAX_AGENT_REPAIR_RETRIES} at {}: {}",
+        format_unix_time(retry_at),
+        compact_single_line(&format!("{err:#}"), 160)
+    )
+}
+
+fn agent_repair_exhausted_event(err: &anyhow::Error) -> String {
+    let kind = agent_repair_kind(err)
+        .map(|kind| kind.to_string())
+        .unwrap_or_else(|| "agent output".to_owned());
+    format!(
+        "{kind} is still invalid after {MAX_AGENT_REPAIR_RETRIES} repair attempts: {}",
+        compact_single_line(&format!("{err:#}"), 160)
+    )
+}
+
+fn agent_repair_notice(
+    err: &anyhow::Error,
+    kind: AgentRepairKind,
+    mode: RoleMode,
+    attempt: u32,
+) -> String {
+    let instruction = match kind {
+        AgentRepairKind::AgentState => {
+            "The runtime restored `agent.toml` to a valid state. Do not edit `agent.toml`, \
+             `orchestrator.toml`, runtime files, or project channel directories."
+        }
+        AgentRepairKind::ChannelOutbox => {
+            "Fix only your local `channels/<channel>/` outbox. Remove symlinks and special files, \
+             rename or remove colliding artifacts, and leave project channel directories alone."
+        }
+        AgentRepairKind::Manifest => manifest_mode_instruction(mode),
+        AgentRepairKind::Reply => {
+            "Provide a compact final reply. It must not be empty; summarize what you did, what \
+             changed, what is known now, and the most important next step if one exists."
+        }
+    };
+    format!(
+        concat!(
+            "The previous run finished, but think could not finalize it because the agent's ",
+            "{kind} output is invalid.\n\n",
+            "# Runtime error\n\n",
+            "{err:#}\n\n",
+            "{instruction}\n\n",
+            "Do not redo unrelated work. Repair the issue and exit again.\n\n",
+            "This is repair attempt {attempt}/{max_attempts}."
+        ),
+        kind = kind,
+        err = err,
+        instruction = instruction,
+        attempt = attempt,
+        max_attempts = MAX_AGENT_REPAIR_RETRIES
+    )
+}
+
+fn manifest_mode_instruction(mode: RoleMode) -> &'static str {
+    match mode {
+        RoleMode::Repeatable => {
+            "Because this is a repeatable role, choose exactly one of \
+             `disposition = \"continue\"` or `disposition = \"stop\"` before exiting."
+        }
+        RoleMode::Oneshot => {
+            "Because this is a one-shot role, remove the `disposition` key. Completion is recorded \
+             by the think runtime; do not write `disposition = \"done\"`."
+        }
+        RoleMode::Infinite => {
+            "Because this is an infinite role, remove the `disposition` key. The think runtime \
+             will start the next run automatically."
+        }
+    }
+}
+
+fn agent_repair_error(kind: AgentRepairKind, message: String) -> anyhow::Error {
+    anyhow!(AgentRepairError { kind, message })
+}
+
+fn is_agent_repair_error(err: &anyhow::Error) -> bool {
+    agent_repair_kind(err).is_some()
+}
+
+fn agent_repair_kind(err: &anyhow::Error) -> Option<AgentRepairKind> {
+    err.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<AgentRepairError>()
+            .map(|error| error.kind)
+    })
+}
+
+fn is_toml_parse_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<toml::de::Error>().is_some())
 }
 
 fn fire_role_step_finished_triggers(
@@ -12951,7 +13546,7 @@ fn load_agent_detail_lines(
     let role_paths = RolePaths::new(project.clone(), agent.role.clone());
     let agent_paths = role_paths.agent(agent.agent.clone());
     let state = load_agent(&agent_paths)?;
-    let manifest = load_agent_manifest(&agent_paths)?;
+    let (manifest, manifest_error) = load_agent_manifest_for_display(&agent_paths);
     let supervisor = load_supervisor_state(&agent_paths)?;
     let mut lines = vec![
         Line::from(vec![
@@ -13002,6 +13597,12 @@ fn load_agent_detail_lines(
     }
     if let Some(summary) = manifest.role_summary.as_deref() {
         lines.push(Line::from(format!("manifest summary: {}", summary.trim())));
+    }
+    if let Some(error) = manifest_error.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!("manifest error: {error}"),
+            Style::default().fg(Color::Red),
+        )));
     }
     if let Some(disposition) = manifest
         .disposition
@@ -14583,7 +15184,7 @@ fn status_agent_summary_and_detail(
     state: &AgentState,
     agent_paths: &crate::state::AgentPaths,
 ) -> Result<(String, String)> {
-    let manifest = load_agent_manifest(agent_paths)?;
+    let (manifest, manifest_error) = load_agent_manifest_for_display(agent_paths);
     let supervisor = load_supervisor_state(agent_paths)?;
     let step = config
         .steps
@@ -14614,15 +15215,26 @@ fn status_agent_summary_and_detail(
         .disposition
         .or_else(|| state.last_exit.as_ref().and_then(|exit| exit.disposition))
         .map(|value| format!("disposition: {value}"));
-    let primary_detail = combine_optional_details(note_detail, disposition_detail);
+    let manifest_error_detail = manifest_error
+        .as_deref()
+        .map(|error| format!("manifest error: {error}"));
+    let primary_detail = combine_optional_details(
+        combine_optional_details(note_detail, disposition_detail),
+        manifest_error_detail,
+    );
     let detail = combine_optional_details(
         combine_optional_details(Some(format!("step: {step}")), primary_detail),
         supervisor_detail,
     );
-    let summary = manifest
-        .role_summary
-        .map(|summary| summary.trim().to_owned())
-        .filter(|summary| !summary.is_empty())
+    let summary = manifest_error
+        .as_ref()
+        .map(|_| "*manifest error*".to_owned())
+        .or_else(|| {
+            manifest
+                .role_summary
+                .map(|summary| summary.trim().to_owned())
+                .filter(|summary| !summary.is_empty())
+        })
         .unwrap_or_else(|| "*name loading*".to_owned());
     Ok((
         summary,

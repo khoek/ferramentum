@@ -35,6 +35,10 @@ preserved across this agent's runs. `work/all/` contains read-only symlinks to o
 workspaces for inspection. Do not use git unless the role prompt explicitly asks you to inspect
 some external repository; there is no think-managed git repo for you to operate on.
 
+Do not edit `agent.toml`, `orchestrator.toml`, runtime files, project configuration, role
+configuration, or project channel directories unless a role prompt explicitly asks for that exact
+change. These files are managed by think.
+
 The sibling `channels/` directory contains publish outboxes, one subdirectory per project channel.
 To publish an artifact, write it into the appropriate channel outbox. When your run finishes
 successfully, think automatically copies outbox files into the project channel using a stable
@@ -45,9 +49,14 @@ Use `manifest.toml` in the agent root exactly as instructed. Early in each run, 
 
 role_summary = "a short human-readable name or summary of this role"
 
+`manifest.toml` must be valid TOML. The only valid `disposition` values are exactly
+`"continue"` and `"stop"`; never write `"done"`, `"complete"`, `"finished"`, booleans, or any
+other value. If your mode does not require a disposition, leave the `disposition` key absent.
+
 Before exiting, write a compact final reply to the run reply file listed in the runtime summary.
-It should read like the final answer you would give an operator: what you did, what changed, what
-is known now, and the most important next step if one exists.
+This is mandatory and must not be empty. It should read like the final answer you would give an
+operator: what you did, what changed, what is known now, and the most important next step if one
+exists.
 
 For repeatable roles, also set the `disposition` key before exiting as instructed by the current
 mode. Leave notes, proof sketches, experiments, failed approaches, review material, and formal
@@ -166,7 +175,8 @@ pub fn mode_directive(mode: RoleMode) -> &'static str {
     match mode {
         RoleMode::Oneshot => {
             "Ensure that absolutely all of your work is complete before terminating, because \
-             another agent will not be restarted at the conclusion of your turn."
+             another agent will not be restarted at the conclusion of your turn. Do not set \
+             `disposition` in manifest.toml for this mode."
         }
         RoleMode::Repeatable => {
             "Make as much progress on your assigned work as you can. If significant work on your \
@@ -177,7 +187,8 @@ pub fn mode_directive(mode: RoleMode) -> &'static str {
         }
         RoleMode::Infinite => {
             "Make as much progress on your role as you can. Another agent will be started to \
-             continue your work after you are finished."
+             continue your work after you are finished. Do not set `disposition` in manifest.toml \
+             for this mode."
         }
     }
 }

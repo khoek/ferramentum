@@ -31,6 +31,7 @@ pub trait AgentBackend {
 #[derive(Debug, Clone, Copy)]
 pub struct AgentCommandRequest<'a> {
     pub agent_dir: &'a Path,
+    pub reply_path: &'a Path,
     pub resume_session: Option<&'a str>,
     pub restart_notice: Option<&'a str>,
 }
@@ -54,6 +55,7 @@ impl AgentBackend for CodexAgent {
     fn command(&self, request: AgentCommandRequest<'_>) -> Result<CommandSpec> {
         crate::provider::codex::agent_command(
             request.agent_dir,
+            request.reply_path,
             request.resume_session,
             request.restart_notice,
             &self.config,

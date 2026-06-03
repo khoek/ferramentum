@@ -112,10 +112,65 @@ for arg in "$@"; do
   fi
 done
 write_reply() {
+  if [ "$THINK_FAKE_CODEX_SKIP_REPLY_ONCE" = "1" ]; then
+    marker="$THINK_FAKE_CODEX_LOG.skip-reply-once"
+    if [ ! -e "$marker" ]; then
+      : > "$marker"
+      return
+    fi
+  fi
   if [ -n "$reply_path" ]; then
     mkdir -p "$(dirname "$reply_path")"
     printf 'fake final reply\n' > "$reply_path"
   fi
+}
+write_agent_state_corruption() {
+  if [ "$THINK_FAKE_CODEX_BAD_AGENT_TOML_ONCE" = "1" ]; then
+    marker="$THINK_FAKE_CODEX_LOG.bad-agent-toml-once"
+    if [ ! -e "$marker" ]; then
+      : > "$marker"
+      printf 'this is not toml\n' > agent.toml
+    fi
+  fi
+}
+write_channel_outbox() {
+  if [ "$THINK_FAKE_CODEX_BAD_CHANNEL_ONCE" = "1" ]; then
+    mkdir -p channels/report
+    marker="$THINK_FAKE_CODEX_LOG.bad-channel-once"
+    if [ ! -e "$marker" ]; then
+      : > "$marker"
+      ln -s ../work channels/report/bad-link
+      return
+    fi
+    rm -f channels/report/bad-link
+    printf 'fake report artifact\n' > channels/report/good.txt
+  fi
+}
+write_manifest() {
+  case "$PWD" in
+    */roles/*/agents/*)
+      ;;
+    *)
+      return
+      ;;
+  esac
+  if [ "$THINK_FAKE_CODEX_BAD_MANIFEST_ONCE" = "1" ]; then
+    marker="$THINK_FAKE_CODEX_LOG.bad-manifest-once"
+    if [ ! -e "$marker" ]; then
+      : > "$marker"
+      printf 'role_summary = "fake supervisor"\ndisposition = "done"\n' > manifest.toml
+      return
+    fi
+  fi
+  if [ "$THINK_FAKE_CODEX_WRITE_MANIFEST" = "1" ]; then
+    printf 'role_summary = "fake supervisor"\ndisposition = "stop"\n' > manifest.toml
+  fi
+}
+finish_agent_run() {
+  write_manifest
+  write_channel_outbox
+  write_agent_state_corruption
+  write_reply
 }
 if [ "$1" = "update" ]; then
   exit 0
@@ -142,35 +197,6 @@ if [ "$1" = "exec" ] && [ "$2" = "resume" ]; then
     printf 'No sessions found for this workspace\n' >&2
     exit 1
   fi
-  if [ "$THINK_FAKE_CODEX_WRITE_MANIFEST" = "1" ]; then
-    case "$PWD" in
-      */roles/*/agents/*)
-        printf 'role_summary = "fake supervisor"\ndisposition = "stop"\n' > manifest.toml
-        ;;
-    esac
-  fi
-  if [ "$THINK_FAKE_CODEX_TOUCH_EPISODE_WORK" = "1" ]; then
-    case "$PWD" in
-      */roles/episode/agents/*)
-        agent_id="${PWD##*/}"
-        mkdir -p work/own/episodes channels/report-single
-        printf '\\episodeprojecttitle{Smoke}\\section{Smoke %s}\\n' "$agent_id" > "work/own/episodes/$agent_id.tex"
-        printf 'fake pdf\n' > "channels/report-single/$agent_id.pdf"
-        ;;
-    esac
-  fi
-  write_reply
-  printf 'session id: 019e7b82-2aad-7540-a6da-f8fc17d5977c\n'
-  exit 0
-fi
-if [ "$1" = "exec" ]; then
-  if [ "$THINK_FAKE_CODEX_WRITE_MANIFEST" = "1" ]; then
-    case "$PWD" in
-      */roles/*/agents/*)
-        printf 'role_summary = "fake supervisor"\ndisposition = "stop"\n' > manifest.toml
-        ;;
-    esac
-  fi
   if [ "$THINK_FAKE_CODEX_TOUCH_EPISODE_WORK" = "1" ]; then
     case "$PWD" in
       */roles/episode/agents/*)
@@ -181,7 +207,22 @@ if [ "$1" = "exec" ]; then
         ;;
       esac
   fi
-  write_reply
+  finish_agent_run
+  printf 'session id: 019e7b82-2aad-7540-a6da-f8fc17d5977c\n'
+  exit 0
+fi
+if [ "$1" = "exec" ]; then
+  if [ "$THINK_FAKE_CODEX_TOUCH_EPISODE_WORK" = "1" ]; then
+    case "$PWD" in
+      */roles/episode/agents/*)
+        agent_id="${PWD##*/}"
+        mkdir -p work/own/episodes channels/report-single
+        printf '\\episodeprojecttitle{Smoke}\\section{Smoke %s}\\n' "$agent_id" > "work/own/episodes/$agent_id.tex"
+        printf 'fake pdf\n' > "channels/report-single/$agent_id.pdf"
+        ;;
+      esac
+  fi
+  finish_agent_run
   printf 'session id: 019e7b82-2aad-7540-a6da-f8fc17d5977d\n'
   exit 0
 fi
@@ -395,6 +436,39 @@ fn status_reads_existing_raw_pty_exit_files() -> Result<(), Box<dyn Error>> {
 
     let output = assert_success(run(&["status"], Some(&project))?)?;
     assert!(!String::from_utf8(output.stderr)?.contains("missing field `run_id`"));
+    Ok(())
+}
+
+#[test]
+fn status_surfaces_invalid_manifest_without_failing() -> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let project = temp.path().join("project");
+    assert_success(run(
+        &[
+            "project",
+            "new",
+            "--template",
+            "math-episodes",
+            project.to_str().expect("temporary path is valid UTF-8"),
+        ],
+        None,
+    )?)?;
+    write_agent_state(&project, "episode", "ep1", "done", false)?;
+    fs::write(
+        project
+            .join("roles")
+            .join("episode")
+            .join("agents")
+            .join("ep1")
+            .join("manifest.toml"),
+        "role_summary = \"bad manifest\"\ndisposition = \"done\"\n",
+    )?;
+
+    let output = assert_success(run(&["status"], Some(&project))?)?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("*manifest error*"));
+    assert!(stdout.contains("manifest error:"));
+    assert!(stdout.contains("unknown variant `done`"));
     Ok(())
 }
 
@@ -806,6 +880,253 @@ fn queued_triggers_start_agents_with_trigger_context() -> Result<(), Box<dyn Err
             .join("episode-1-1-1.pdf")
             .exists()
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn invalid_manifest_is_reported_to_agent_and_retried() -> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let project = temp.path().join("project");
+    assert_success(run(
+        &[
+            "project",
+            "new",
+            "--template",
+            "math-episodes",
+            project.to_str().expect("temporary path is valid UTF-8"),
+        ],
+        None,
+    )?)?;
+
+    let fake_bin = temp.path().join("bin");
+    install_fake_codex(&fake_bin)?;
+    let log = temp.path().join("codex.log");
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let think_home = temp.path().join("think-home").display().to_string();
+    let log_path = log.display().to_string();
+    assert_success(run_with_env(
+        &[
+            "advanced",
+            "trigger",
+            "publisher",
+            "--reason",
+            "manifest retry smoke",
+        ],
+        Some(&project),
+        &[
+            ("PATH", path.as_str()),
+            ("THINK_HOME", think_home.as_str()),
+            ("THINK_FAKE_CODEX_LOG", log_path.as_str()),
+            ("THINK_FAKE_CODEX_WRITE_MANIFEST", "1"),
+            ("THINK_FAKE_CODEX_BAD_MANIFEST_ONCE", "1"),
+            ("THINK_ORCHESTRATOR_AGENT_REPAIR_RETRY_SECONDS", "1"),
+        ],
+    )?)?;
+
+    let publisher_agent = only_agent_dir(&project, "publisher")?;
+    let agent = fs::read_to_string(publisher_agent.join("agent.toml"))?;
+    assert!(agent.contains("status = \"done\""));
+    assert!(agent.contains("archived = true"));
+    assert!(agent.contains("run_count = 1"));
+    let manifest = fs::read_to_string(publisher_agent.join("manifest.toml"))?;
+    assert!(manifest.contains("disposition = \"stop\""));
+    let supervisor = fs::read_to_string(publisher_agent.join("orchestrator.toml"))?;
+    assert!(supervisor.contains("status = \"idle\""));
+    assert!(supervisor.contains("repair_retries = 1"));
+
+    let log = fs::read_to_string(log)?;
+    assert!(log.lines().filter(|line| line.starts_with("exec")).count() >= 2);
+    assert!(log.contains("manifest.toml"));
+    assert!(log.contains("Runtime error"));
+    assert!(log.contains("done"));
+    assert_success(run(&["status"], Some(&project))?)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn invalid_channel_outbox_is_reported_to_agent_and_retried() -> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let project = temp.path().join("project");
+    assert_success(run(
+        &[
+            "project",
+            "new",
+            "--template",
+            "math-episodes",
+            project.to_str().expect("temporary path is valid UTF-8"),
+        ],
+        None,
+    )?)?;
+
+    let fake_bin = temp.path().join("bin");
+    install_fake_codex(&fake_bin)?;
+    let log = temp.path().join("codex.log");
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let think_home = temp.path().join("think-home").display().to_string();
+    let log_path = log.display().to_string();
+    assert_success(run_with_env(
+        &[
+            "advanced",
+            "trigger",
+            "publisher",
+            "--reason",
+            "channel retry smoke",
+        ],
+        Some(&project),
+        &[
+            ("PATH", path.as_str()),
+            ("THINK_HOME", think_home.as_str()),
+            ("THINK_FAKE_CODEX_LOG", log_path.as_str()),
+            ("THINK_FAKE_CODEX_WRITE_MANIFEST", "1"),
+            ("THINK_FAKE_CODEX_BAD_CHANNEL_ONCE", "1"),
+            ("THINK_ORCHESTRATOR_AGENT_REPAIR_RETRY_SECONDS", "1"),
+        ],
+    )?)?;
+
+    let publisher_agent = only_agent_dir(&project, "publisher")?;
+    let supervisor = fs::read_to_string(publisher_agent.join("orchestrator.toml"))?;
+    assert!(supervisor.contains("status = \"idle\""));
+    assert!(supervisor.contains("repair_retries = 1"));
+    assert!(
+        project
+            .join("channels")
+            .join("report")
+            .join("publisher-pub1-1-good.txt")
+            .exists()
+    );
+    let log = fs::read_to_string(log)?;
+    assert!(log.contains("channel outbox"));
+    assert!(log.contains("Refusing to publish symlink"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn corrupted_agent_state_is_restored_reported_and_retried() -> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let project = temp.path().join("project");
+    assert_success(run(
+        &[
+            "project",
+            "new",
+            "--template",
+            "math-episodes",
+            project.to_str().expect("temporary path is valid UTF-8"),
+        ],
+        None,
+    )?)?;
+
+    let fake_bin = temp.path().join("bin");
+    install_fake_codex(&fake_bin)?;
+    let log = temp.path().join("codex.log");
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let think_home = temp.path().join("think-home").display().to_string();
+    let log_path = log.display().to_string();
+    assert_success(run_with_env(
+        &[
+            "advanced",
+            "trigger",
+            "publisher",
+            "--reason",
+            "agent state retry smoke",
+        ],
+        Some(&project),
+        &[
+            ("PATH", path.as_str()),
+            ("THINK_HOME", think_home.as_str()),
+            ("THINK_FAKE_CODEX_LOG", log_path.as_str()),
+            ("THINK_FAKE_CODEX_WRITE_MANIFEST", "1"),
+            ("THINK_FAKE_CODEX_BAD_AGENT_TOML_ONCE", "1"),
+            ("THINK_ORCHESTRATOR_AGENT_REPAIR_RETRY_SECONDS", "1"),
+        ],
+    )?)?;
+
+    let publisher_agent = only_agent_dir(&project, "publisher")?;
+    let agent = fs::read_to_string(publisher_agent.join("agent.toml"))?;
+    assert!(agent.contains("status = \"done\""));
+    assert!(agent.contains("run_count = 1"));
+    let supervisor = fs::read_to_string(publisher_agent.join("orchestrator.toml"))?;
+    assert!(supervisor.contains("status = \"idle\""));
+    assert!(supervisor.contains("repair_retries = 1"));
+    let log = fs::read_to_string(log)?;
+    assert!(log.contains("agent state"));
+    assert!(log.contains("agent.toml is invalid"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_reply_is_reported_to_agent_and_retried() -> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let project = temp.path().join("project");
+    assert_success(run(
+        &[
+            "project",
+            "new",
+            "--template",
+            "math-episodes",
+            project.to_str().expect("temporary path is valid UTF-8"),
+        ],
+        None,
+    )?)?;
+
+    let fake_bin = temp.path().join("bin");
+    install_fake_codex(&fake_bin)?;
+    let log = temp.path().join("codex.log");
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let think_home = temp.path().join("think-home").display().to_string();
+    let log_path = log.display().to_string();
+    assert_success(run_with_env(
+        &[
+            "advanced",
+            "trigger",
+            "publisher",
+            "--reason",
+            "reply retry smoke",
+        ],
+        Some(&project),
+        &[
+            ("PATH", path.as_str()),
+            ("THINK_HOME", think_home.as_str()),
+            ("THINK_FAKE_CODEX_LOG", log_path.as_str()),
+            ("THINK_FAKE_CODEX_WRITE_MANIFEST", "1"),
+            ("THINK_FAKE_CODEX_SKIP_REPLY_ONCE", "1"),
+            ("THINK_ORCHESTRATOR_AGENT_REPAIR_RETRY_SECONDS", "1"),
+        ],
+    )?)?;
+
+    let publisher_agent = only_agent_dir(&project, "publisher")?;
+    assert!(
+        publisher_agent
+            .join("runs")
+            .join("1")
+            .join("REPLY.md")
+            .exists()
+    );
+    let supervisor = fs::read_to_string(publisher_agent.join("orchestrator.toml"))?;
+    assert!(supervisor.contains("status = \"idle\""));
+    assert!(supervisor.contains("repair_retries = 1"));
+    let log = fs::read_to_string(log)?;
+    assert!(log.contains("reply"));
+    assert!(log.contains("run reply file"));
     Ok(())
 }
 

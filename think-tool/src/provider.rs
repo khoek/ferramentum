@@ -188,6 +188,7 @@ pub mod codex {
 
     pub fn agent_command(
         agent_dir: &Path,
+        reply_path: &Path,
         resume_session: Option<&str>,
         restart_notice: Option<&str>,
         config: &CodexProviderConfig,
@@ -200,19 +201,22 @@ pub mod codex {
             }
             None => "Read PROMPT.md in the current directory and follow it exactly.".to_owned(),
         };
-        exec_prompt_command(
+        let mut spec = exec_prompt_command(
             agent_dir,
             prompt,
             resume_session,
             ConversationPolicy::WorkspaceWrite,
             config,
-        )
+        )?;
+        append_output_last_message(&mut spec, reply_path)?;
+        Ok(spec)
     }
 
     pub fn resume_command(
         agent_dir: &Path,
         session_id: Option<&str>,
         prompt: String,
+        reply_path: Option<&Path>,
         config: &CodexProviderConfig,
     ) -> Result<CommandSpec> {
         let invocation = prepare_invocation(config)?;
@@ -228,21 +232,43 @@ pub mod codex {
             args.push("--last".to_owned());
         }
         args.push(prompt);
-        command_spec(agent_dir, args, invocation)
+        let mut spec = command_spec(agent_dir, args, invocation)?;
+        if let Some(reply_path) = reply_path {
+            append_output_last_message(&mut spec, reply_path)?;
+        }
+        Ok(spec)
     }
 
     pub fn fresh_more_command(
         agent_dir: &Path,
         prompt: String,
+        reply_path: Option<&Path>,
         config: &CodexProviderConfig,
     ) -> Result<CommandSpec> {
-        exec_prompt_command(
+        let mut spec = exec_prompt_command(
             agent_dir,
             prompt,
             None,
             ConversationPolicy::WorkspaceWrite,
             config,
-        )
+        )?;
+        if let Some(reply_path) = reply_path {
+            append_output_last_message(&mut spec, reply_path)?;
+        }
+        Ok(spec)
+    }
+
+    fn append_output_last_message(spec: &mut CommandSpec, reply_path: &Path) -> Result<()> {
+        let prompt = spec
+            .args
+            .pop()
+            .context("Codex command was missing its prompt argument")?;
+        spec.args.extend([
+            "--output-last-message".to_owned(),
+            reply_path.display().to_string(),
+        ]);
+        spec.args.push(prompt);
+        Ok(())
     }
 
     pub fn record_quota_failure_and_select_next(
