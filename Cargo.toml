@@ -5,6 +5,7 @@ members = [
     "ice-tool",
     "kai-tool",
     "ocular-tool",
+    "think-tool",
 ]
 
 [workspace.package]
