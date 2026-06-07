@@ -213,7 +213,7 @@ The dashboard surfaces:
 The queue tab is for trigger queues only. The timeline has lanes for agents, runs, triggers, and
 notices.
 
-## Math Episodes Template
+## Episodes Math Template
 
 The template creates:
 
@@ -222,21 +222,49 @@ The template creates:
 - role `publisher`, active oneshot, serial queued, `expose = ["last-agent-finished"]`;
 - role `supervisor`, paused oneshot, queued after episode completion when activated;
 - role `auditor`, active oneshot, queued by a periodic idle trigger;
-- static seeds under `templates/math-episodes/`.
+- static seeds under `templates/episodes-math/`.
 
 Episode agents write `work/own/episodes/<agent>.tex`, build a standalone PDF from their private
-workspace, and publish it to `channels/report-single/<agent>.pdf`.
+workspace, and publish the PDF to `channels/report-single/<agent>.pdf`.
 
-Publisher agents read `TRIGGER.md` to identify the finished episode. They read `EXPOSED.md` to find
-the previous publisher. If one exists, they copy its `work/own/manuscript/`; otherwise they seed a
-new manuscript from `templates/math-episodes/`. They add the triggering episode through a relative
-input such as:
+Publisher agents read `TRIGGER.md` as a stale-publication hint. They read `EXPOSED.md` to find the
+previous publisher. If one exists, they copy its `work/own/manuscript/`; otherwise they seed a new
+manuscript from `templates/episodes-math/`. They include every terminal episode agent with a usable
+TeX source exactly once, sorted by natural sequential episode name, with finish-time fallback for
+non-sequential names. Running/incomplete episode drafts are ignored. Publisher agents use relative
+inputs such as:
 
 ```tex
 \input{../../all/episode/agents/ep7/episodes/ep7}
 ```
 
 Then they run a TeX build and publish `work/own/manuscript/report.pdf` to `channels/report/report.pdf`.
+
+## Episodes Code Template
+
+The template creates:
+
+- channels `alerts`, `branches`, and `merges`;
+- role `episode`, active repeatable, sequential `ep` ids;
+- role `merger`, active oneshot, serial queued, `expose = ["last-agent-finished"]`;
+- role `supervisor`, paused oneshot, queued after episode and merger completion;
+- role `auditor`, active oneshot, queued by a periodic idle trigger;
+- handoff templates under `templates/episodes-code/`.
+
+The target repository is expected at project-root `repo/`. The setup pass should clone a repo URL or
+copy a local directory there. If an activated supervisor finds that `repo/.git` is missing, it
+writes an alert and runs `think role pause supervisor` before exiting, so the missing setup does not
+repeatedly spawn supervisors.
+
+Implementation episodes create private worktrees under `work/own/repo`, commit local branches named
+`episodes/<agent>`, and publish structured branch handoffs to `channels/branches`. They never push
+and never merge into `master`. The serial merger integrates handed-off branches into local `master`
+or into new committed consolidation branches and publishes structured merge handoffs to
+`channels/merges`; a merger run can handle one branch or a compatible tranche named by the
+supervisor. Merger runs are resume-safe for their own worktree and publish `already-integrated`
+handoffs when all requested source heads are already reachable instead of creating empty merge
+commits. Consolidation branches are immutable outputs. Later merger runs may consume them as source
+branches, but they should not extend or amend an existing consolidation branch in place.
 
 ## Recovery
 

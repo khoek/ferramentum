@@ -15,6 +15,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
+use crate::input::buffer::TextBuffer;
+
 const FOOTER_HEIGHT: u16 = 1;
 const MIN_VISIBLE_ROWS: u16 = 1;
 const CHOICE_FRAME_EXTRA_ROWS: u16 = 5;
@@ -365,13 +367,8 @@ struct EditorState {
     context_title: Option<String>,
     context_lines: Vec<String>,
     context_scroll: usize,
-    lines: Vec<String>,
-    cursor_row: usize,
-    cursor_col: usize,
+    buffer: TextBuffer,
     scroll: usize,
-    history: Vec<String>,
-    history_index: Option<usize>,
-    draft_before_history: Option<Vec<String>>,
 }
 
 impl EditorState {
@@ -388,13 +385,8 @@ impl EditorState {
             context_title,
             context_lines,
             context_scroll: usize::MAX,
-            lines: vec![String::new()],
-            cursor_row: 0,
-            cursor_col: 0,
+            buffer: TextBuffer::new(history),
             scroll: 0,
-            history,
-            history_index: None,
-            draft_before_history: None,
         }
     }
 
@@ -407,7 +399,7 @@ impl EditorState {
             match self.handle_key(key)? {
                 EditorAction::Continue => {}
                 EditorAction::Submit => {
-                    let text = self.text();
+                    let text = self.buffer.text();
                     return Ok((!text.trim().is_empty()).then_some(text.trim().to_owned()));
                 }
                 EditorAction::Cancel => return Ok(None),
@@ -421,11 +413,11 @@ impl EditorState {
                 KeyCode::Char('c') => return Ok(EditorAction::Cancel),
                 KeyCode::Char('d') => return Ok(EditorAction::Submit),
                 KeyCode::Char('a') => {
-                    self.cursor_col = 0;
+                    self.buffer.move_to_line_start();
                     return Ok(EditorAction::Continue);
                 }
                 KeyCode::Char('e') => {
-                    self.cursor_col = self.current_line().chars().count();
+                    self.buffer.move_to_line_end();
                     return Ok(EditorAction::Continue);
                 }
                 _ => {}
@@ -434,45 +426,38 @@ impl EditorState {
         match key.code {
             KeyCode::Esc => Ok(EditorAction::Cancel),
             KeyCode::Enter => {
-                self.begin_edit();
-                let byte_col = self.byte_col();
-                let suffix = self.current_line_mut().split_off(byte_col);
-                self.cursor_row += 1;
-                self.cursor_col = 0;
-                self.lines.insert(self.cursor_row, suffix);
+                self.buffer.insert_newline();
                 Ok(EditorAction::Continue)
             }
             KeyCode::Backspace => {
-                self.begin_edit();
-                self.backspace();
+                self.buffer.backspace();
                 Ok(EditorAction::Continue)
             }
             KeyCode::Delete => {
-                self.begin_edit();
-                self.delete();
+                self.buffer.delete();
                 Ok(EditorAction::Continue)
             }
             KeyCode::Left => {
-                self.move_left();
+                self.buffer.move_left();
                 Ok(EditorAction::Continue)
             }
             KeyCode::Right => {
-                self.move_right();
+                self.buffer.move_right();
                 Ok(EditorAction::Continue)
             }
             KeyCode::Up => {
-                if self.cursor_row == 0 {
-                    self.history_previous();
+                if self.buffer.cursor_line() == 0 {
+                    self.buffer.history_previous();
                 } else {
-                    self.move_up();
+                    self.buffer.move_vertical(-1);
                 }
                 Ok(EditorAction::Continue)
             }
             KeyCode::Down => {
-                if self.history_index.is_some() {
-                    self.history_next();
+                if self.buffer.history_active() {
+                    self.buffer.history_next();
                 } else {
-                    self.move_down();
+                    self.buffer.move_vertical(1);
                 }
                 Ok(EditorAction::Continue)
             }
@@ -480,8 +465,11 @@ impl EditorState {
                 if self.has_context() {
                     self.context_scroll = self.context_scroll.saturating_sub(self.context_rows());
                 } else {
-                    self.cursor_row = self.cursor_row.saturating_sub(self.visible_body_rows());
-                    self.clamp_cursor_col();
+                    self.buffer.move_to_line(
+                        self.buffer
+                            .cursor_line()
+                            .saturating_sub(self.visible_body_rows()),
+                    );
                 }
                 Ok(EditorAction::Continue)
             }
@@ -490,25 +478,23 @@ impl EditorState {
                     self.context_scroll =
                         (self.context_scroll + self.context_rows()).min(self.max_context_scroll());
                 } else {
-                    self.cursor_row =
-                        (self.cursor_row + self.visible_body_rows()).min(self.lines.len() - 1);
-                    self.clamp_cursor_col();
+                    self.buffer.move_to_line(
+                        (self.buffer.cursor_line() + self.visible_body_rows())
+                            .min(self.buffer.lines().len() - 1),
+                    );
                 }
                 Ok(EditorAction::Continue)
             }
             KeyCode::Home => {
-                self.cursor_col = 0;
+                self.buffer.move_to_line_start();
                 Ok(EditorAction::Continue)
             }
             KeyCode::End => {
-                self.cursor_col = self.current_line().chars().count();
+                self.buffer.move_to_line_end();
                 Ok(EditorAction::Continue)
             }
             KeyCode::Char(ch) => {
-                self.begin_edit();
-                let byte_col = self.byte_col();
-                self.current_line_mut().insert(byte_col, ch);
-                self.cursor_col += 1;
+                self.buffer.insert(ch);
                 Ok(EditorAction::Continue)
             }
             _ => Ok(EditorAction::Continue),
@@ -602,14 +588,15 @@ impl EditorState {
         let block = panel("Prompt").border_style(Style::default().fg(Color::Blue));
         let inner = block.inner(area);
         let body_rows = inner.height.max(MIN_VISIBLE_ROWS) as usize;
-        if self.cursor_row < self.scroll {
-            self.scroll = self.cursor_row;
-        } else if self.cursor_row >= self.scroll + body_rows {
-            self.scroll = self.cursor_row + 1 - body_rows;
+        if self.buffer.cursor_line() < self.scroll {
+            self.scroll = self.buffer.cursor_line();
+        } else if self.buffer.cursor_line() >= self.scroll + body_rows {
+            self.scroll = self.buffer.cursor_line() + 1 - body_rows;
         }
         let lines = (0..body_rows)
             .map(|row| {
-                self.lines
+                self.buffer
+                    .lines()
                     .get(self.scroll + row)
                     .map(|line| Line::from(line.as_str()))
                     .unwrap_or_else(|| {
@@ -619,8 +606,12 @@ impl EditorState {
             .collect::<Vec<_>>();
         frame.render_widget(block, area);
         frame.render_widget(Paragraph::new(Text::from(lines)), inner);
-        let cursor_y = inner.y + self.cursor_row.saturating_sub(self.scroll) as u16;
-        let cursor_x = inner.x + self.cursor_col.min(inner.width.saturating_sub(1) as usize) as u16;
+        let cursor_y = inner.y + self.buffer.cursor_line().saturating_sub(self.scroll) as u16;
+        let cursor_x = inner.x
+            + self
+                .buffer
+                .cursor_col()
+                .min(inner.width.saturating_sub(1) as usize) as u16;
         if cursor_y < inner.y + inner.height {
             frame.set_cursor_position(Position::new(cursor_x, cursor_y));
         }
@@ -669,133 +660,6 @@ impl EditorState {
                 .saturating_sub(EDITOR_RESERVED_ROWS_BELOW_HELP)
                 .max(MIN_VISIBLE_ROWS),
         )
-    }
-
-    fn text(&self) -> String {
-        self.lines.join("\n")
-    }
-
-    fn current_line(&self) -> &str {
-        &self.lines[self.cursor_row]
-    }
-
-    fn current_line_mut(&mut self) -> &mut String {
-        &mut self.lines[self.cursor_row]
-    }
-
-    fn byte_col(&self) -> usize {
-        char_to_byte(self.current_line(), self.cursor_col)
-    }
-
-    fn clamp_cursor_col(&mut self) {
-        self.cursor_col = self.cursor_col.min(self.current_line().chars().count());
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor_col > 0 {
-            let byte_col = self.byte_col();
-            let previous = char_to_byte(self.current_line(), self.cursor_col - 1);
-            self.current_line_mut().drain(previous..byte_col);
-            self.cursor_col -= 1;
-        } else if self.cursor_row > 0 {
-            let removed = self.lines.remove(self.cursor_row);
-            self.cursor_row -= 1;
-            self.cursor_col = self.current_line().chars().count();
-            self.current_line_mut().push_str(&removed);
-        }
-    }
-
-    fn delete(&mut self) {
-        if self.cursor_col < self.current_line().chars().count() {
-            let start = self.byte_col();
-            let end = char_to_byte(self.current_line(), self.cursor_col + 1);
-            self.current_line_mut().drain(start..end);
-        } else if self.cursor_row + 1 < self.lines.len() {
-            let next = self.lines.remove(self.cursor_row + 1);
-            self.current_line_mut().push_str(&next);
-        }
-    }
-
-    fn move_left(&mut self) {
-        if self.cursor_col > 0 {
-            self.cursor_col -= 1;
-        } else if self.cursor_row > 0 {
-            self.cursor_row -= 1;
-            self.cursor_col = self.current_line().chars().count();
-        }
-    }
-
-    fn move_right(&mut self) {
-        if self.cursor_col < self.current_line().chars().count() {
-            self.cursor_col += 1;
-        } else if self.cursor_row + 1 < self.lines.len() {
-            self.cursor_row += 1;
-            self.cursor_col = 0;
-        }
-    }
-
-    fn move_up(&mut self) {
-        if self.cursor_row > 0 {
-            self.cursor_row -= 1;
-            self.clamp_cursor_col();
-        }
-    }
-
-    fn move_down(&mut self) {
-        if self.cursor_row + 1 < self.lines.len() {
-            self.cursor_row += 1;
-            self.clamp_cursor_col();
-        }
-    }
-
-    fn history_previous(&mut self) {
-        if self.history.is_empty() {
-            return;
-        }
-        let index = match self.history_index {
-            Some(0) => 0,
-            Some(index) => index - 1,
-            None => {
-                self.draft_before_history = Some(self.lines.clone());
-                self.history.len() - 1
-            }
-        };
-        self.history_index = Some(index);
-        self.replace_text(self.history[index].clone());
-    }
-
-    fn history_next(&mut self) {
-        let Some(index) = self.history_index else {
-            return;
-        };
-        if index + 1 < self.history.len() {
-            self.history_index = Some(index + 1);
-            self.replace_text(self.history[index + 1].clone());
-        } else {
-            self.lines = self
-                .draft_before_history
-                .take()
-                .unwrap_or_else(|| vec![String::new()]);
-            self.history_index = None;
-            self.cursor_row = self.lines.len().saturating_sub(1);
-            self.cursor_col = self.current_line().chars().count();
-            self.scroll = 0;
-        }
-    }
-
-    fn replace_text(&mut self, text: String) {
-        self.lines = text.lines().map(ToOwned::to_owned).collect();
-        if self.lines.is_empty() {
-            self.lines.push(String::new());
-        }
-        self.cursor_row = self.lines.len() - 1;
-        self.cursor_col = self.current_line().chars().count();
-        self.scroll = 0;
-    }
-
-    fn begin_edit(&mut self) {
-        self.history_index = None;
-        self.draft_before_history = None;
     }
 }
 
@@ -1026,13 +890,6 @@ fn choice_lines(item: &str, selected: bool) -> Vec<Line<'_>> {
         .collect()
 }
 
-fn char_to_byte(text: &str, char_index: usize) -> usize {
-    text.char_indices()
-        .nth(char_index)
-        .map(|(index, _)| index)
-        .unwrap_or(text.len())
-}
-
 fn strip_ansi(text: &str) -> String {
     let mut stripped = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -1065,17 +922,16 @@ mod tests {
             Vec::new(),
             vec!["first".to_owned(), "second".to_owned()],
         );
-        state.lines = vec!["draft".to_owned()];
-        state.cursor_col = 5;
+        state.buffer.set_text("draft");
 
-        state.history_previous();
-        assert_eq!(state.text(), "second");
-        state.history_previous();
-        assert_eq!(state.text(), "first");
-        state.history_next();
-        assert_eq!(state.text(), "second");
-        state.history_next();
-        assert_eq!(state.text(), "draft");
+        state.buffer.history_previous();
+        assert_eq!(state.buffer.text(), "second");
+        state.buffer.history_previous();
+        assert_eq!(state.buffer.text(), "first");
+        state.buffer.history_next();
+        assert_eq!(state.buffer.text(), "second");
+        state.buffer.history_next();
+        assert_eq!(state.buffer.text(), "draft");
     }
 
     #[test]

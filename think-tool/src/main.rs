@@ -1,23 +1,24 @@
-mod agent;
 mod app;
+mod attach;
+mod backend;
 mod cli;
 mod config;
+mod dashboard;
 mod git;
 mod ids;
-mod input_history;
+mod input;
 mod io;
 mod lock;
 mod maintenance;
 mod prompt;
 mod provider;
-mod runner;
 mod selection;
 mod session;
 mod state;
 mod template;
-mod terminal_editor;
+mod time;
 mod transcript;
-mod tui_text;
+mod tui;
 mod ui;
 
 use std::any::Any;
@@ -32,8 +33,8 @@ fn main() -> ExitCode {
     install_broken_pipe_hook();
     match panic::catch_unwind(|| app::run(Cli::parse())) {
         Ok(Ok(())) => ExitCode::SUCCESS,
-        Ok(Err(err)) if terminal_editor::is_cancelled(&err) => {
-            if let Some(message) = terminal_editor::cancellation_message(&err) {
+        Ok(Err(err)) if input::editor::is_cancelled(&err) => {
+            if let Some(message) = input::editor::cancellation_message(&err) {
                 eprintln!("{message}");
             }
             ExitCode::SUCCESS

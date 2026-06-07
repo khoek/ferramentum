@@ -46,15 +46,22 @@ impl ProjectConfig {
     pub fn with_template(template: Option<ProjectTemplate>) -> Self {
         Self {
             default_role: match template {
-                Some(ProjectTemplate::MathEpisodes) => RoleSlug::parse("episode").ok(),
+                Some(ProjectTemplate::EpisodesMath | ProjectTemplate::EpisodesCode) => {
+                    RoleSlug::parse("episode").ok()
+                }
                 None => None,
             },
             channels: match template {
-                Some(ProjectTemplate::MathEpisodes) => [ALERTS_CHANNEL, "report", "report-single"]
+                Some(ProjectTemplate::EpisodesMath) => [ALERTS_CHANNEL, "report", "report-single"]
                     .into_iter()
                     .map(ChannelSlug::parse)
                     .collect::<Result<Vec<_>, _>>()
-                    .expect("built-in math-episodes channels must be valid slugs"),
+                    .expect("built-in episodes-math channels must be valid slugs"),
+                Some(ProjectTemplate::EpisodesCode) => [ALERTS_CHANNEL, "branches", "merges"]
+                    .into_iter()
+                    .map(ChannelSlug::parse)
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("built-in episodes-code channels must be valid slugs"),
                 None => builtin_channels(),
             },
             template,
@@ -153,13 +160,15 @@ pub enum UiTheme {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProjectTemplate {
-    MathEpisodes,
+    EpisodesMath,
+    EpisodesCode,
 }
 
 impl fmt::Display for ProjectTemplate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MathEpisodes => formatter.write_str("math-episodes"),
+            Self::EpisodesMath => formatter.write_str("episodes-math"),
+            Self::EpisodesCode => formatter.write_str("episodes-code"),
         }
     }
 }

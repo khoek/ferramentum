@@ -23,23 +23,14 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    #[command(
-        about = "Create and start one new agent for the default role.",
-        hide = true
-    )]
-    New(NewAgentArgs),
     #[command(about = "Send a query a new or existing agent.")]
     More(MoreArgs),
     #[command(about = "Show roles, agents, queues, and runtime state.")]
     Status(StatusArgs),
     #[command(about = "Open the current project directory.")]
     Open,
-    #[command(about = "Ask Codex to fix something in this workspace.")]
-    Fix(FixArgs),
-    #[command(about = "Ask Codex to operate this think project.")]
+    #[command(about = "Ask the configured backend to operate this think project.")]
     Assist(AssistArgs),
-    #[command(about = "List roles, agents, queues, and runtime state.", hide = true)]
-    List(StatusArgs),
     #[command(about = "Advanced maintenance commands.", subcommand, hide = true)]
     Advanced(AdvancedCommand),
     #[command(about = "Manage projects.", subcommand, hide = true)]
@@ -75,12 +66,6 @@ pub struct NewAgentArgs {
     pub no_prompt: bool,
     #[arg(long, help = "Attach to the new agent after starting it.")]
     pub attach: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct FixArgs {
-    #[arg(help = "Fix request; opens an editor when omitted.")]
-    pub query: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -234,6 +219,11 @@ pub struct StatusArgs {
     pub role: Option<RoleSlug>,
     #[arg(long, help = "Include archived agents.")]
     pub all: bool,
+    #[arg(
+        long,
+        help = "Print plain status output instead of opening the dashboard."
+    )]
+    pub plain: bool,
 }
 
 #[derive(Debug, Args)]
@@ -269,7 +259,9 @@ pub struct RunNoticesArgs {
 pub enum RoleCommand {
     #[command(about = "Create a role from local arguments and default prompts.")]
     New(RoleNewArgs),
-    #[command(about = "Create a draft role, optionally asking Codex to refine it.")]
+    #[command(
+        about = "Create a draft role, optionally asking the configured backend to refine it."
+    )]
     Draft(RoleDraftArgs),
     #[command(about = "Open ROLE.md in $EDITOR.")]
     Edit(RoleSelectorArgs),

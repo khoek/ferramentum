@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -8,22 +9,27 @@ use serde::{Deserialize, Serialize};
 
 use crate::io;
 
-const CODEX_UPDATE_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
-const CODEX_UPDATE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+pub trait UpdateTask {
+    fn key(&self) -> &'static str;
+    fn label(&self) -> &'static str;
+    fn interval(&self) -> Duration;
+    fn timeout(&self) -> Duration;
+    fn command(&self) -> Command;
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ThinkState {
     #[serde(default)]
-    codex: CodexState,
+    update_checks: BTreeMap<String, UpdateCheckState>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct CodexState {
-    last_update_check: Option<u64>,
-    last_update_result: Option<String>,
+struct UpdateCheckState {
+    last_check: Option<u64>,
+    last_result: Option<String>,
 }
 
-pub fn ensure_codex_update_checked() -> Result<()> {
+pub fn ensure_update_checked(task: &impl UpdateTask) -> Result<()> {
     let home = think_home()?;
     io::ensure_dir(&home)?;
     let state_path = home.join("state.toml");
@@ -34,15 +40,18 @@ pub fn ensure_codex_update_checked() -> Result<()> {
     };
     let now = unix_timestamp()?;
     if state
-        .codex
-        .last_update_check
-        .is_some_and(|last| now.saturating_sub(last) < CODEX_UPDATE_INTERVAL_SECONDS)
+        .update_checks
+        .get(task.key())
+        .and_then(|state| state.last_check)
+        .is_some_and(|last| Duration::from_secs(now.saturating_sub(last)) < task.interval())
     {
         return Ok(());
     }
 
-    let Some(_lock) =
-        crate::lock::FileLock::try_acquire(home.join("codex-update.lock"), "codex update lock")?
+    let Some(_lock) = crate::lock::FileLock::try_acquire(
+        home.join(format!("{}-update.lock", task.key())),
+        task.label(),
+    )?
     else {
         return Ok(());
     };
@@ -52,16 +61,21 @@ pub fn ensure_codex_update_checked() -> Result<()> {
         ThinkState::default()
     };
     if state
-        .codex
-        .last_update_check
-        .is_some_and(|last| now.saturating_sub(last) < CODEX_UPDATE_INTERVAL_SECONDS)
+        .update_checks
+        .get(task.key())
+        .and_then(|state| state.last_check)
+        .is_some_and(|last| Duration::from_secs(now.saturating_sub(last)) < task.interval())
     {
         return Ok(());
     }
 
-    let result = run_codex_update();
-    state.codex.last_update_check = Some(unix_timestamp()?);
-    state.codex.last_update_result = Some(match &result {
+    let result = run_update(task);
+    let check = state
+        .update_checks
+        .entry(task.key().to_owned())
+        .or_default();
+    check.last_check = Some(unix_timestamp()?);
+    check.last_result = Some(match &result {
         Ok(()) => "ok".to_owned(),
         Err(err) => format!("error: {err:#}"),
     });
@@ -69,31 +83,32 @@ pub fn ensure_codex_update_checked() -> Result<()> {
     result
 }
 
-fn run_codex_update() -> Result<()> {
-    let mut child = Command::new("codex")
-        .arg("update")
+fn run_update(task: &impl UpdateTask) -> Result<()> {
+    let mut command = task.command();
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context("Failed to start `codex update`")?;
+        .with_context(|| format!("Failed to start `{}`", task.label()))?;
     let started = Instant::now();
     loop {
         if let Some(status) = child
             .try_wait()
-            .context("Failed to wait for `codex update`")?
+            .with_context(|| format!("Failed to wait for `{}`", task.label()))?
         {
             if status.success() {
                 return Ok(());
             }
-            bail!("`codex update` exited with status {status}");
+            bail!("`{}` exited with status {status}", task.label());
         }
-        if started.elapsed() >= CODEX_UPDATE_TIMEOUT {
+        if started.elapsed() >= task.timeout() {
             let _ = child.kill();
             let _ = child.wait();
             bail!(
-                "`codex update` did not finish within {} seconds",
-                CODEX_UPDATE_TIMEOUT.as_secs()
+                "`{}` did not finish within {} seconds",
+                task.label(),
+                task.timeout().as_secs()
             );
         }
         thread::sleep(Duration::from_millis(250));

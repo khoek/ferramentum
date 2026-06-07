@@ -4,10 +4,10 @@ use std::str::FromStr;
 use anyhow::{Context, Result, bail};
 
 use crate::ids::{AgentId, RoleSlug};
+use crate::input::editor::{ChoicePrompt, PromptEditor, UserCancelled};
 use crate::state::{
     AgentState, AgentStatus, ProjectPaths, RolePaths, list_agents, list_roles, load_agent,
 };
-use crate::terminal_editor::{ChoicePrompt, PromptEditor, UserCancelled};
 
 #[derive(Debug, Clone)]
 pub struct AgentSpec {

@@ -98,134 +98,220 @@ fn install_fake_codex(bin_dir: &Path) -> Result<(), Box<dyn Error>> {
     fs::write(
         &codex,
         r#"#!/bin/sh
-printf '%s\n' "$*" >> "$THINK_FAKE_CODEX_LOG"
-reply_path=""
-expect_reply_path=0
-for arg in "$@"; do
-  if [ "$expect_reply_path" = "1" ]; then
-    reply_path="$arg"
-    expect_reply_path=0
-    continue
-  fi
-  if [ "$arg" = "-o" ] || [ "$arg" = "--output-last-message" ]; then
-    expect_reply_path=1
-  fi
-done
-write_reply() {
-  if [ "$THINK_FAKE_CODEX_SKIP_REPLY_ONCE" = "1" ]; then
-    marker="$THINK_FAKE_CODEX_LOG.skip-reply-once"
-    if [ ! -e "$marker" ]; then
-      : > "$marker"
-      return
-    fi
-  fi
-  if [ -n "$reply_path" ]; then
-    mkdir -p "$(dirname "$reply_path")"
-    printf 'fake final reply\n' > "$reply_path"
-  fi
-}
-write_agent_state_corruption() {
-  if [ "$THINK_FAKE_CODEX_BAD_AGENT_TOML_ONCE" = "1" ]; then
-    marker="$THINK_FAKE_CODEX_LOG.bad-agent-toml-once"
-    if [ ! -e "$marker" ]; then
-      : > "$marker"
-      printf 'this is not toml\n' > agent.toml
-    fi
-  fi
-}
-write_channel_outbox() {
-  if [ "$THINK_FAKE_CODEX_BAD_CHANNEL_ONCE" = "1" ]; then
-    mkdir -p channels/report
-    marker="$THINK_FAKE_CODEX_LOG.bad-channel-once"
-    if [ ! -e "$marker" ]; then
-      : > "$marker"
-      ln -s ../work channels/report/bad-link
-      return
-    fi
-    rm -f channels/report/bad-link
-    printf 'fake report artifact\n' > channels/report/good.txt
-  fi
-}
-write_manifest() {
-  case "$PWD" in
-    */roles/*/agents/*)
-      ;;
-    *)
-      return
-      ;;
-  esac
-  if [ "$THINK_FAKE_CODEX_BAD_MANIFEST_ONCE" = "1" ]; then
-    marker="$THINK_FAKE_CODEX_LOG.bad-manifest-once"
-    if [ ! -e "$marker" ]; then
-      : > "$marker"
-      printf 'role_summary = "fake supervisor"\ndisposition = "done"\n' > manifest.toml
-      return
-    fi
-  fi
-  if [ "$THINK_FAKE_CODEX_WRITE_MANIFEST" = "1" ]; then
-    printf 'role_summary = "fake supervisor"\ndisposition = "stop"\n' > manifest.toml
-  fi
-}
-finish_agent_run() {
-  write_manifest
-  write_channel_outbox
-  write_agent_state_corruption
-  write_reply
-}
+if [ -n "$THINK_FAKE_CODEX_LOG" ]; then
+  printf '%s\n' "$*" >> "$THINK_FAKE_CODEX_LOG"
+fi
+if [ "$1" = "--version" ]; then
+  printf 'codex-fake 0.0.0\n'
+  exit 0
+fi
 if [ "$1" = "update" ]; then
   exit 0
 fi
-if [ "$THINK_FAKE_CODEX_QUOTA_ONCE" = "1" ]; then
-  marker="$THINK_FAKE_CODEX_LOG.quota-once"
-  if [ ! -e "$marker" ]; then
-    : > "$marker"
-    printf 'session id: 019e7b82-2aad-7540-a6da-f8fc17d5977e\n'
-    printf 'quota exceeded: rate limit reached\n' >&2
-    exit 1
-  fi
-fi
-if [ "$THINK_FAKE_CODEX_SIGKILL_ONCE" = "1" ]; then
-  marker="$THINK_FAKE_CODEX_LOG.sigkill-once"
-  if [ ! -e "$marker" ]; then
-    : > "$marker"
-    printf 'session id: 019e7b82-2aad-7540-a6da-f8fc17d5977f\n'
-    exit 137
-  fi
-fi
-if [ "$1" = "exec" ] && [ "$2" = "resume" ]; then
-  if [ "$THINK_FAKE_CODEX_RESUME" = "missing" ]; then
-    printf 'No sessions found for this workspace\n' >&2
-    exit 1
-  fi
-  if [ "$THINK_FAKE_CODEX_TOUCH_EPISODE_WORK" = "1" ]; then
-    case "$PWD" in
-      */roles/episode/agents/*)
-        agent_id="${PWD##*/}"
-        mkdir -p work/own/episodes channels/report-single
-        printf '\\episodeprojecttitle{Smoke}\\section{Smoke %s}\\n' "$agent_id" > "work/own/episodes/$agent_id.tex"
-        printf 'fake pdf\n' > "channels/report-single/$agent_id.pdf"
-        ;;
-      esac
-  fi
-  finish_agent_run
-  printf 'session id: 019e7b82-2aad-7540-a6da-f8fc17d5977c\n'
+if [ "$1" = "login" ]; then
   exit 0
 fi
-if [ "$1" = "exec" ]; then
-  if [ "$THINK_FAKE_CODEX_TOUCH_EPISODE_WORK" = "1" ]; then
-    case "$PWD" in
-      */roles/episode/agents/*)
-        agent_id="${PWD##*/}"
-        mkdir -p work/own/episodes channels/report-single
-        printf '\\episodeprojecttitle{Smoke}\\section{Smoke %s}\\n' "$agent_id" > "work/own/episodes/$agent_id.tex"
-        printf 'fake pdf\n' > "channels/report-single/$agent_id.pdf"
-        ;;
-      esac
+case " $* " in
+  *" debug models "*)
+    cat <<'JSON'
+{
+  "models": [
+    {
+      "slug": "gpt-5-codex",
+      "display_name": "GPT-5 Codex",
+      "visibility": "list",
+      "supported_reasoning_levels": [
+        {"effort": "low"},
+        {"effort": "medium"},
+        {"effort": "high"}
+      ]
+    }
+  ]
+}
+JSON
+    exit 0
+    ;;
+esac
+for arg in "$@"; do
+  if [ "$arg" = "app-server" ]; then
+    fake_codex_app_server="${TMPDIR:-/tmp}/think-fake-codex-app-server-$$.py"
+    cat > "$fake_codex_app_server" <<'PY'
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+LOG = os.environ.get("THINK_FAKE_CODEX_LOG", "")
+
+def log(text):
+    if LOG:
+        with open(LOG, "a", encoding="utf-8") as handle:
+            handle.write(text.rstrip() + "\n")
+
+def marker(name):
+    if not LOG:
+        return None
+    return Path(f"{LOG}.{name}")
+
+def first_time(name):
+    path = marker(name)
+    if path is None:
+        return True
+    if path.exists():
+        return False
+    path.write_text("", encoding="utf-8")
+    return True
+
+def send(value):
+    print(json.dumps(value, separators=(",", ":")), flush=True)
+
+def is_agent_dir(path):
+    parts = Path(path).parts
+    return len(parts) >= 4 and parts[-4] == "roles" and parts[-2] == "agents"
+
+def role_and_agent(path):
+    parts = Path(path).parts
+    return parts[-3], parts[-1]
+
+def write_episode_work(cwd):
+    if os.environ.get("THINK_FAKE_CODEX_TOUCH_EPISODE_WORK") != "1" or not is_agent_dir(cwd):
+        return
+    role, agent = role_and_agent(cwd)
+    if role != "episode":
+        return
+    Path("work/own/episodes").mkdir(parents=True, exist_ok=True)
+    Path("channels/report-single").mkdir(parents=True, exist_ok=True)
+    Path(f"work/own/episodes/{agent}.tex").write_text(
+        f"\\episodeprojecttitle{{Smoke}}\\section{{Smoke {agent}}}\\n",
+        encoding="utf-8",
+    )
+    Path(f"channels/report-single/{agent}.pdf").write_text("fake pdf\n", encoding="utf-8")
+
+def write_manifest(cwd):
+    if not is_agent_dir(cwd):
+        return
+    if os.environ.get("THINK_FAKE_CODEX_BAD_MANIFEST_ONCE") == "1" and first_time("bad-manifest-once"):
+        Path("manifest.toml").write_text(
+            'role_summary = "fake supervisor"\ndisposition = "done"\n',
+            encoding="utf-8",
+        )
+        return
+    if os.environ.get("THINK_FAKE_CODEX_WRITE_MANIFEST") == "1":
+        Path("manifest.toml").write_text(
+            'role_summary = "fake supervisor"\ndisposition = "stop"\n',
+            encoding="utf-8",
+        )
+
+def write_channel_outbox():
+    if os.environ.get("THINK_FAKE_CODEX_BAD_CHANNEL_ONCE") != "1":
+        return
+    Path("channels/report").mkdir(parents=True, exist_ok=True)
+    if first_time("bad-channel-once"):
+        link = Path("channels/report/bad-link")
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        link.symlink_to("../work")
+        return
+    link = Path("channels/report/bad-link")
+    if link.exists() or link.is_symlink():
+        link.unlink()
+    Path("channels/report/good.txt").write_text("fake report artifact\n", encoding="utf-8")
+
+def write_agent_state_corruption():
+    if os.environ.get("THINK_FAKE_CODEX_BAD_AGENT_TOML_ONCE") == "1" and first_time("bad-agent-toml-once"):
+        Path("agent.toml").write_text("this is not toml\n", encoding="utf-8")
+
+def should_emit_reply():
+    return not (
+        os.environ.get("THINK_FAKE_CODEX_SKIP_REPLY_ONCE") == "1"
+        and first_time("skip-reply-once")
+    )
+
+def finish_agent_run(cwd):
+    write_episode_work(cwd)
+    write_manifest(cwd)
+    write_channel_outbox()
+    write_agent_state_corruption()
+
+def prompt_text(params):
+    texts = []
+    for item in params.get("input", []):
+        if item.get("type") == "text":
+            texts.append(item.get("text", ""))
+    return "\n".join(texts)
+
+def log_prompt(prompt, cwd):
+    log(prompt)
+    for match in re.finditer(r"Read `([^`]+)`", prompt):
+        path = Path(match.group(1))
+        if not path.is_absolute():
+            path = Path(cwd) / path
+        if path.exists():
+            log(path.read_text(encoding="utf-8"))
+
+cwd = os.getcwd()
+thread_id = "thread-fake"
+turn_id = "turn-fake"
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    request = json.loads(line)
+    method = request.get("method")
+    log(method or "")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "initialize":
+        send({"id": request_id, "result": {"serverInfo": {"name": "fake-codex-app-server"}}})
+    elif method == "initialized":
+        continue
+    elif method in ("thread/start", "thread/resume"):
+        thread_id = params.get("threadId") or thread_id
+        log(thread_id)
+        send({"id": request_id, "result": {"thread": {"id": thread_id}}})
+    elif method == "turn/start":
+        prompt = prompt_text(params)
+        log_prompt(prompt, cwd)
+        send({"id": request_id, "result": {"turn": {"id": turn_id}}})
+        if os.environ.get("THINK_FAKE_CODEX_SIGKILL_ONCE") == "1" and first_time("sigkill-once"):
+            sys.exit(137)
+        if os.environ.get("THINK_FAKE_CODEX_QUOTA_ONCE") == "1" and first_time("quota-once"):
+            send({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turn": {"id": turn_id, "status": "failed", "error": "quota exceeded: rate limit reached"},
+                },
+            })
+            continue
+        finish_agent_run(cwd)
+        if should_emit_reply():
+            send({
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "itemId": "item-fake",
+                    "delta": "fake final reply\n",
+                },
+            })
+        send({
+            "method": "turn/completed",
+            "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed"}},
+        })
+    elif method == "turn/steer":
+        log_prompt(prompt_text(params), cwd)
+        send({"id": request_id, "result": {}})
+    else:
+        if request_id is not None:
+            send({"id": request_id, "result": {}})
+PY
+    python3 "$fake_codex_app_server" "$@"
+    status=$?
+    rm -f "$fake_codex_app_server"
+    exit $status
   fi
-  finish_agent_run
-  printf 'session id: 019e7b82-2aad-7540-a6da-f8fc17d5977d\n'
-  exit 0
-fi
+done
 printf 'unexpected fake codex invocation: %s\n' "$*" >&2
 exit 2
 "#,
@@ -302,7 +388,6 @@ fn top_level_help_hides_advanced_namespaces_until_all() -> Result<(), Box<dyn Er
     assert!(stdout.contains("more"));
     assert!(stdout.contains("status"));
     assert!(stdout.contains("open"));
-    assert!(stdout.contains("fix"));
     assert!(stdout.contains("assist"));
     assert!(!stdout.contains("check"));
     assert!(stdout.contains("help"));
@@ -321,7 +406,6 @@ fn top_level_help_hides_advanced_namespaces_until_all() -> Result<(), Box<dyn Er
     assert!(stdout.contains("  agent"));
     assert!(stdout.contains("  role"));
     assert!(stdout.contains("  channel"));
-    assert!(stdout.contains("  list"));
     assert!(stdout.contains("  advanced"));
     assert!(!stdout.contains("run-child"));
     assert!(!stdout.contains("run-orchestrator"));
@@ -334,6 +418,12 @@ fn top_level_help_hides_advanced_namespaces_until_all() -> Result<(), Box<dyn Er
     assert!(stdout.contains("trigger"));
 
     let output = run(&["list"], None)?;
+    assert!(!output.status.success());
+
+    let output = run(&["new", "--help"], None)?;
+    assert!(!output.status.success());
+
+    let output = run(&["fix", "--help"], None)?;
     assert!(!output.status.success());
 
     let output = assert_success(run(&["more", "--help"], None)?)?;
@@ -415,7 +505,7 @@ fn status_reads_existing_raw_pty_exit_files() -> Result<(), Box<dyn Error>> {
             "project",
             "new",
             "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,
@@ -448,7 +538,7 @@ fn status_surfaces_invalid_manifest_without_failing() -> Result<(), Box<dyn Erro
             "project",
             "new",
             "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,
@@ -482,7 +572,7 @@ fn assist_prompt_exposes_project_and_cli_context() -> Result<(), Box<dyn Error>>
             "project",
             "new",
             "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,
@@ -524,9 +614,8 @@ fn assist_prompt_exposes_project_and_cli_context() -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
-#[cfg(unix)]
 #[test]
-fn fix_prompt_explains_best_effort_and_uses_tight_think_context() -> Result<(), Box<dyn Error>> {
+fn supervisor_records_failed_app_server_turn() -> Result<(), Box<dyn Error>> {
     let temp = tempdir()?;
     let project = temp.path().join("project");
     assert_success(run(
@@ -534,54 +623,7 @@ fn fix_prompt_explains_best_effort_and_uses_tight_think_context() -> Result<(), 
             "project",
             "new",
             "--template",
-            "math-episodes",
-            project.to_str().expect("temporary path is valid UTF-8"),
-        ],
-        None,
-    )?)?;
-
-    let fake_bin = temp.path().join("bin");
-    install_fake_codex(&fake_bin)?;
-    let log = temp.path().join("codex.log");
-    let path = format!(
-        "{}:{}",
-        fake_bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let think_home = temp.path().join("think-home").display().to_string();
-    let log_path = log.display().to_string();
-    assert_success(run_with_env(
-        &["fix", "repair the report"],
-        Some(&project),
-        &[
-            ("PATH", path.as_str()),
-            ("THINK_HOME", think_home.as_str()),
-            ("THINK_FAKE_CODEX_LOG", log_path.as_str()),
-        ],
-    )?)?;
-
-    let prompt = newest_command_prompt(&project, "fix")?;
-    assert!(prompt.contains("# think fix"));
-    assert!(prompt.contains("Make a best-effort attempt"));
-    assert!(prompt.contains("ask a concise clarification question"));
-    assert!(prompt.contains("think-tool source"));
-    assert!(prompt.contains("# Current think project"));
-    assert!(!prompt.contains("# ferramentum"));
-    assert!(!prompt.contains("A repository housing various useful Rust CLI utilities."));
-    Ok(())
-}
-
-#[cfg(unix)]
-#[test]
-fn supervisor_waits_and_resumes_after_quota_backoff() -> Result<(), Box<dyn Error>> {
-    let temp = tempdir()?;
-    let project = temp.path().join("project");
-    assert_success(run(
-        &[
-            "project",
-            "new",
-            "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,
@@ -598,7 +640,7 @@ fn supervisor_waits_and_resumes_after_quota_backoff() -> Result<(), Box<dyn Erro
     );
     let think_home = temp.path().join("think-home").display().to_string();
     let log_path = log.display().to_string();
-    assert_success(run_with_env(
+    let output = run_with_env(
         &[
             "run-child",
             "orchestrator",
@@ -616,9 +658,10 @@ fn supervisor_waits_and_resumes_after_quota_backoff() -> Result<(), Box<dyn Erro
             ("THINK_FAKE_CODEX_LOG", log_path.as_str()),
             ("THINK_FAKE_CODEX_QUOTA_ONCE", "1"),
             ("THINK_FAKE_CODEX_WRITE_MANIFEST", "1"),
-            ("THINK_ORCHESTRATOR_QUOTA_RETRY_SECONDS", "1"),
         ],
-    )?)?;
+    )?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr)?.contains("status code 1"));
 
     let supervisor = fs::read_to_string(
         project
@@ -628,15 +671,16 @@ fn supervisor_waits_and_resumes_after_quota_backoff() -> Result<(), Box<dyn Erro
             .join("1")
             .join("orchestrator.toml"),
     )?;
-    assert!(supervisor.contains("status = \"idle\""));
-    assert!(supervisor.contains("quota_retries = 1"));
+    assert!(supervisor.contains("status = \"needs-attention\""));
+    assert!(supervisor.contains("app-server turn failed with status code 1"));
     let log = fs::read_to_string(log)?;
-    assert!(log.contains("exec --cd"));
-    assert!(log.contains("exec resume"));
+    assert!(log.contains("app-server --stdio"));
+    assert!(log.contains("thread/start"));
+    assert!(log.contains("turn/start"));
 
     let output = assert_success(run(&["status"], Some(&project))?)?;
     let stdout = String::from_utf8(output.stdout)?;
-    assert!(stdout.contains("fake supervisor"));
+    assert!(stdout.contains("needs-attention"));
     assert!(stdout.contains("usage unavailable"));
     assert!(!stdout.contains("quota · ok"));
     Ok(())
@@ -652,7 +696,7 @@ fn retry_updates_active_waiting_supervisors() -> Result<(), Box<dyn Error>> {
             "project",
             "new",
             "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,
@@ -733,7 +777,7 @@ fn supervisor_restarts_after_sigkill_oom_like_exit() -> Result<(), Box<dyn Error
             "project",
             "new",
             "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,
@@ -783,7 +827,12 @@ fn supervisor_restarts_after_sigkill_oom_like_exit() -> Result<(), Box<dyn Error
     assert!(supervisor.contains("status = \"idle\""));
     assert!(supervisor.contains("oom_restarts = 1"));
     let log = fs::read_to_string(log)?;
-    assert!(log.lines().filter(|line| line.starts_with("exec")).count() >= 2);
+    assert!(
+        log.lines()
+            .filter(|line| line.starts_with("app-server"))
+            .count()
+            >= 2
+    );
     Ok(())
 }
 
@@ -797,7 +846,7 @@ fn queued_triggers_start_agents_with_trigger_context() -> Result<(), Box<dyn Err
             "project",
             "new",
             "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,
@@ -820,7 +869,14 @@ fn queued_triggers_start_agents_with_trigger_context() -> Result<(), Box<dyn Err
     fs::write(
         &orchestrator_config,
         format!(
-            "{}\n[[triggers]]\nkind = \"role-agent-finished\"\nrole = \"episode\"\nlaunch = \"queued\"\nqueue = \"orchestrators\"\n",
+            concat!(
+                "{}\n",
+                "[[triggers]]\n",
+                "kind = \"role-agent-finished\"\n",
+                "role = \"episode\"\n",
+                "launch = \"queued\"\n",
+                "queue = \"orchestrators\"\n",
+            ),
             fs::read_to_string(&orchestrator_config)?
         ),
     )?;
@@ -893,7 +949,7 @@ fn invalid_manifest_is_reported_to_agent_and_retried() -> Result<(), Box<dyn Err
             "project",
             "new",
             "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,
@@ -940,7 +996,12 @@ fn invalid_manifest_is_reported_to_agent_and_retried() -> Result<(), Box<dyn Err
     assert!(supervisor.contains("repair_retries = 1"));
 
     let log = fs::read_to_string(log)?;
-    assert!(log.lines().filter(|line| line.starts_with("exec")).count() >= 2);
+    assert!(
+        log.lines()
+            .filter(|line| line.starts_with("app-server"))
+            .count()
+            >= 2
+    );
     assert!(log.contains("manifest.toml"));
     assert!(log.contains("Runtime error"));
     assert!(log.contains("done"));
@@ -958,7 +1019,7 @@ fn invalid_channel_outbox_is_reported_to_agent_and_retried() -> Result<(), Box<d
             "project",
             "new",
             "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,
@@ -1020,7 +1081,7 @@ fn corrupted_agent_state_is_restored_reported_and_retried() -> Result<(), Box<dy
             "project",
             "new",
             "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,
@@ -1078,7 +1139,7 @@ fn missing_reply_is_reported_to_agent_and_retried() -> Result<(), Box<dyn Error>
             "project",
             "new",
             "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,
@@ -1141,7 +1202,7 @@ fn manual_and_idle_triggers_start_prefixed_auto_archived_supervisors() -> Result
             "project",
             "new",
             "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,
@@ -1195,7 +1256,15 @@ fn manual_and_idle_triggers_start_prefixed_auto_archived_supervisors() -> Result
     fs::write(
         &supervisor_config,
         format!(
-            "{}\n[[triggers]]\nkind = \"queue-idle\"\nidle_queue = \"publisher\"\nidle_seconds = 1\nlaunch = \"queued\"\nqueue = \"supervisor\"\n",
+            concat!(
+                "{}\n",
+                "[[triggers]]\n",
+                "kind = \"queue-idle\"\n",
+                "idle_queue = \"publisher\"\n",
+                "idle_seconds = 1\n",
+                "launch = \"queued\"\n",
+                "queue = \"supervisor\"\n",
+            ),
             fs::read_to_string(&supervisor_config)?
         ),
     )?;
@@ -1208,7 +1277,7 @@ fn manual_and_idle_triggers_start_prefixed_auto_archived_supervisors() -> Result
         "empty_since = 1\n",
     )?;
     assert_success(run_with_env(
-        &["list"],
+        &["status", "--plain"],
         Some(&project),
         &[
             ("PATH", path.as_str()),
@@ -1232,7 +1301,7 @@ fn manual_and_idle_triggers_start_prefixed_auto_archived_supervisors() -> Result
 }
 
 #[test]
-fn math_episodes_project_has_compact_episode_defaults() -> Result<(), Box<dyn Error>> {
+fn episodes_math_project_has_compact_episode_defaults() -> Result<(), Box<dyn Error>> {
     let temp = tempdir()?;
     let project = temp.path().join("project");
     assert_success(run(
@@ -1240,13 +1309,14 @@ fn math_episodes_project_has_compact_episode_defaults() -> Result<(), Box<dyn Er
             "project",
             "new",
             "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,
     )?)?;
 
     let config = fs::read_to_string(project.join("roles").join("episode").join("config.toml"))?;
+    assert!(!project.join("runtime").join("reports").exists());
     assert!(fs::read_to_string(project.join("think.toml"))?.contains("default_role = \"episode\""));
     assert!(config.contains("status = \"active\""));
     assert!(config.contains("parallel = \"infinite\""));
@@ -1286,7 +1356,7 @@ fn math_episodes_project_has_compact_episode_defaults() -> Result<(), Box<dyn Er
     assert!(stdout.contains("● supervisor"));
     assert!(!stdout.contains("project:"));
 
-    let seed = project.join("templates").join("math-episodes");
+    let seed = project.join("templates").join("episodes-math");
     assert!(seed.join(".gitignore").exists());
     assert!(
         project
@@ -1318,15 +1388,201 @@ fn math_episodes_project_has_compact_episode_defaults() -> Result<(), Box<dyn Er
     assert!(preamble_tex.contains("\\fancyhead[L]"));
     assert!(preamble_tex.contains("\\ThinkVersion"));
     assert!(seed.join("episode-standalone.tex").exists());
+    assert!(!seed.join("episode-summary.md").exists());
     assert!(makefile.contains("episode-standalone.tex preamble.tex"));
     assert!(seed.join("episodes").is_dir());
     assert!(seed.join("papers").is_dir());
+    assert!(
+        !seed
+            .join("scripts")
+            .join("validate-episode-summaries.py")
+            .exists()
+    );
+    let project_md = fs::read_to_string(project.join("PROJECT.md"))?;
+    assert!(project_md.contains("every terminal episode agent with a usable TeX"));
+    let publisher_step = fs::read_to_string(
+        project
+            .join("roles")
+            .join("publisher")
+            .join("steps")
+            .join("publish.md"),
+    )?;
+    assert!(publisher_step.contains("status is done or stopped"));
+    assert!(publisher_step.contains("Do not include sources from agents"));
+    assert!(publisher_step.contains("ep5` goes between `ep4` and `ep6"));
     assert!(seed.join("experiments").join("Cargo.toml").exists());
     assert!(
         seed.join("experiments")
             .join("src")
             .join("commands")
             .join("mod.rs")
+            .exists()
+    );
+    Ok(())
+}
+
+#[test]
+fn episodes_code_project_has_branch_merge_defaults() -> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let project = temp.path().join("project");
+    assert_success(run(
+        &[
+            "project",
+            "new",
+            "--template",
+            "episodes-code",
+            project.to_str().expect("temporary path is valid UTF-8"),
+        ],
+        None,
+    )?)?;
+
+    let project_config = fs::read_to_string(project.join("think.toml"))?;
+    assert!(!project.join("runtime").join("reports").exists());
+    assert!(project_config.contains("template = \"episodes-code\""));
+    assert!(project_config.contains("default_role = \"episode\""));
+    assert!(project_config.contains("\"alerts\""));
+    assert!(project_config.contains("\"branches\""));
+    assert!(project_config.contains("\"merges\""));
+
+    let project_md = fs::read_to_string(project.join("PROJECT.md"))?;
+    assert!(project_md.contains("worktree"));
+    assert!(project_md.contains("repo/"));
+    assert!(project_md.contains("master"));
+    assert!(project_md.contains("Rust 2024"));
+    assert!(project_md.contains("There is no pushing"));
+    assert!(project_md.contains("reasonable care"));
+
+    let episode_config =
+        fs::read_to_string(project.join("roles").join("episode").join("config.toml"))?;
+    assert!(episode_config.contains("status = \"active\""));
+    assert!(episode_config.contains("parallel = \"infinite\""));
+    assert!(episode_config.contains("agent_prefix = \"ep\""));
+    let episode_step = fs::read_to_string(
+        project
+            .join("roles")
+            .join("episode")
+            .join("steps")
+            .join("work.md"),
+    )?;
+    assert!(episode_step.contains("repo/.git"));
+    assert!(episode_step.contains("git -C repo worktree add"));
+    assert!(episode_step.contains("episodes/<agent-id>"));
+    assert!(episode_step.contains("channels/branches/<agent-id>.md"));
+    assert!(!episode_step.contains("<source-repo>"));
+    assert!(!episode_step.contains("<task-label>"));
+
+    let merger_config =
+        fs::read_to_string(project.join("roles").join("merger").join("config.toml"))?;
+    assert!(merger_config.contains("parallel = 1"));
+    assert!(merger_config.contains("agent_prefix = \"merge\""));
+    assert!(merger_config.contains("expose = [\"last-agent-finished\"]"));
+    assert!(merger_config.contains("kind = \"role-agent-finished\""));
+    assert!(merger_config.contains("role = \"episode\""));
+    assert!(merger_config.contains("queue = \"merger\""));
+    assert!(!merger_config.contains("role = \"merge-tranche\""));
+    let merger_step = fs::read_to_string(
+        project
+            .join("roles")
+            .join("merger")
+            .join("steps")
+            .join("merge.md"),
+    )?;
+    assert!(merger_step.contains("git merge --no-ff --no-commit"));
+    assert!(merger_step.contains("git commit"));
+    assert!(merger_step.contains("octopus"));
+    assert!(merger_step.contains("consolidation branch"));
+    assert!(merger_step.contains("Consolidation branches are immutable outputs"));
+    assert!(merger_step.contains("If this is a resumed run and `work/own/repo` already exists"));
+    assert!(merger_step.contains("result = \"already-integrated\""));
+    assert!(merger_step.contains("skipped source branches"));
+    assert!(merger_step.contains("request source, requester agent if any"));
+    assert!(merger_step.contains("merges/<agent-id>"));
+    assert!(merger_step.contains("tranche prompt"));
+    assert!(merger_step.contains("reasonable care"));
+    assert!(merger_step.contains("channels/merges/<agent-id>.md"));
+    assert!(merger_step.contains("number of entries in"));
+
+    let supervisor_config =
+        fs::read_to_string(project.join("roles").join("supervisor").join("config.toml"))?;
+    assert!(supervisor_config.contains("status = \"paused\""));
+    assert!(supervisor_config.contains("agent_prefix = \"sup\""));
+    assert!(
+        supervisor_config
+            .matches("kind = \"role-agent-finished\"")
+            .count()
+            >= 2
+    );
+    assert!(supervisor_config.contains("role = \"episode\""));
+    assert!(supervisor_config.contains("role = \"merger\""));
+    assert!(!supervisor_config.contains("role = \"merge-tranche\""));
+    assert!(supervisor_config.contains("queue = \"supervisor\""));
+    let supervisor_role =
+        fs::read_to_string(project.join("roles").join("supervisor").join("ROLE.md"))?;
+    assert!(supervisor_role.contains("maximum safe parallelism"));
+    let supervisor_step = fs::read_to_string(
+        project
+            .join("roles")
+            .join("supervisor")
+            .join("steps")
+            .join("work.md"),
+    )?;
+    assert!(supervisor_step.contains("think agent new merger --prompt"));
+    assert!(supervisor_step.contains("tranche prompt"));
+    assert!(supervisor_step.contains("update `master` or leave a new"));
+    assert!(supervisor_step.contains("consolidation branches being consumed as inputs"));
+    assert!(supervisor_step.contains("reasonable care"));
+    assert!(supervisor_step.contains("think role pause supervisor"));
+    assert!(supervisor_step.contains("repo/.git"));
+
+    let auditor_config =
+        fs::read_to_string(project.join("roles").join("auditor").join("config.toml"))?;
+    assert!(auditor_config.contains("kind = \"queue-idle\""));
+    assert!(auditor_config.contains("idle_queue = \"auditor\""));
+
+    let output = assert_success(run(&["status"], Some(&project))?)?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("● episode"));
+    assert!(stdout.contains("● auditor"));
+    assert!(stdout.contains("● merger"));
+    assert!(stdout.contains("● supervisor"));
+    assert!(!stdout.contains("merge-tranche"));
+
+    let seed = project.join("templates").join("episodes-code");
+    assert!(seed.join("README.md").exists());
+    assert!(seed.join("branch-handoff.md").exists());
+    assert!(seed.join("merge-handoff.md").exists());
+    assert!(!seed.join("branch-report.md").exists());
+    assert!(!seed.join("merge-report.md").exists());
+    assert!(!seed.join("tranche-report.md").exists());
+    assert!(!seed.join("scripts").join("validate-reports.py").exists());
+    let branch_handoff = fs::read_to_string(seed.join("branch-handoff.md"))?;
+    assert!(branch_handoff.contains("kind = \"branch\""));
+    assert!(branch_handoff.contains("branch = \"episodes/<agent-id>\""));
+    assert!(branch_handoff.contains("ready_for_merge = true"));
+    let merge_handoff = fs::read_to_string(seed.join("merge-handoff.md"))?;
+    assert!(merge_handoff.contains("request_source = \"episode-finished-trigger\""));
+    assert!(merge_handoff.contains("requester_agent = \"episode/<requester-agent-id>\""));
+    assert!(merge_handoff.contains("source_branches = [\"<branch-name>\"]"));
+    assert!(merge_handoff.contains("skipped_branches = []"));
+    assert!(merge_handoff.contains("output_branch = \"merges/<agent-id>\""));
+    assert!(merge_handoff.contains("target_mode = \"master\""));
+    assert!(merge_handoff.contains("master_updated = true"));
+    assert!(merge_handoff.contains("master_after = \"<commit>\""));
+    assert!(!merge_handoff.contains("trigger_role"));
+    assert!(!merge_handoff.contains("trigger_agent"));
+    assert!(!merge_handoff.lines().any(|line| line == "mode ="));
+    assert!(
+        project
+            .join("channels")
+            .join("branches")
+            .join(".git")
+            .exists()
+    );
+    assert!(
+        project
+            .join("channels")
+            .join("merges")
+            .join(".git")
             .exists()
     );
     Ok(())
@@ -1374,7 +1630,7 @@ fn status_all_includes_archived_agents_with_summary_before_status() -> Result<()
             "project",
             "new",
             "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,
@@ -1472,7 +1728,7 @@ fn status_uses_manifest_disposition_for_resumed_agents() -> Result<(), Box<dyn E
             "project",
             "new",
             "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,
@@ -1506,7 +1762,7 @@ fn agent_selectors_accept_role_qualified_form_and_reject_ambiguous_bare_ids()
             "project",
             "new",
             "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,
@@ -1540,7 +1796,7 @@ fn agent_selectors_accept_role_qualified_form_and_reject_ambiguous_bare_ids()
 
 #[cfg(unix)]
 #[test]
-fn more_resumes_the_recorded_codex_session_id() -> Result<(), Box<dyn Error>> {
+fn more_resumes_the_recorded_backend_thread_id() -> Result<(), Box<dyn Error>> {
     let temp = tempdir()?;
     let project = temp.path().join("project");
     assert_success(run(
@@ -1548,7 +1804,7 @@ fn more_resumes_the_recorded_codex_session_id() -> Result<(), Box<dyn Error>> {
             "project",
             "new",
             "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,
@@ -1563,8 +1819,13 @@ fn more_resumes_the_recorded_codex_session_id() -> Result<(), Box<dyn Error>> {
         .join("1");
     fs::create_dir_all(&run)?;
     fs::write(
-        run.join("TRANSCRIPT.txt"),
-        "session id: 019e7b82-2aad-7540-a6da-f8fc17d5977c\n",
+        project
+            .join("roles")
+            .join("episode")
+            .join("agents")
+            .join("1")
+            .join("backend-thread.toml"),
+        "version = 1\nthread_id = \"thread-recorded\"\nupdated_at = 1\n",
     )?;
 
     let fake_bin = temp.path().join("bin");
@@ -1587,16 +1848,15 @@ fn more_resumes_the_recorded_codex_session_id() -> Result<(), Box<dyn Error>> {
         ],
     )?)?;
     let log = fs::read_to_string(log)?;
-    assert!(log.contains("exec resume"));
-    assert!(log.contains("019e7b82-2aad-7540-a6da-f8fc17d5977c"));
-    assert!(!log.contains("--last"));
+    assert!(log.contains("thread/resume"));
+    assert!(log.contains("thread-recorded"));
     assert!(log.contains("Read runs/2/PROMPT.md"));
     Ok(())
 }
 
 #[cfg(unix)]
 #[test]
-fn more_falls_back_to_fresh_exec_when_resume_metadata_is_unavailable() -> Result<(), Box<dyn Error>>
+fn more_starts_thread_when_app_server_thread_metadata_is_unavailable() -> Result<(), Box<dyn Error>>
 {
     let temp = tempdir()?;
     let project = temp.path().join("project");
@@ -1605,7 +1865,7 @@ fn more_falls_back_to_fresh_exec_when_resume_metadata_is_unavailable() -> Result
             "project",
             "new",
             "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,
@@ -1629,14 +1889,14 @@ fn more_falls_back_to_fresh_exec_when_resume_metadata_is_unavailable() -> Result
             ("PATH", path.as_str()),
             ("THINK_HOME", think_home.as_str()),
             ("THINK_FAKE_CODEX_LOG", log_path.as_str()),
-            ("THINK_FAKE_CODEX_RESUME", "missing"),
         ],
     )?)?;
-    assert!(String::from_utf8(output.stdout)?.contains("starting a fresh Codex exec"));
+    assert!(
+        String::from_utf8(output.stdout)?.contains("continuing agent `episode/1` with app-server")
+    );
     let log = fs::read_to_string(log)?;
-    assert!(log.contains("exec resume"));
-    assert!(log.contains("--last"));
-    assert!(log.contains("exec --cd"));
+    assert!(log.contains("thread/start"));
+    assert!(!log.contains("thread/resume"));
 
     let state = fs::read_to_string(
         project
@@ -1660,7 +1920,7 @@ fn blank_agent_prompt_cancels_create() -> Result<(), Box<dyn Error>> {
             "project",
             "new",
             "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,
@@ -1686,7 +1946,7 @@ fn bare_think_shows_status_and_more_new_creates_default_role_agent() -> Result<(
             "project",
             "new",
             "--template",
-            "math-episodes",
+            "episodes-math",
             project.to_str().expect("temporary path is valid UTF-8"),
         ],
         None,

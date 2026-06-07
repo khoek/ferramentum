@@ -35,12 +35,6 @@ impl Display for LockBusy {
 
 impl Error for LockBusy {}
 
-pub fn is_lock_busy_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.downcast_ref::<LockBusy>().is_some())
-}
-
 impl FileLock {
     pub fn acquire(path: PathBuf, label: &str) -> Result<Self> {
         let Some(lock) = Self::try_acquire(path.clone(), label)? else {

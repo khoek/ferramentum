@@ -1,5 +1,4 @@
 use std::cmp::Ordering;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -174,6 +173,19 @@ impl AgentPaths {
 
     pub fn manifest(&self) -> PathBuf {
         self.root().join("manifest.toml")
+    }
+
+    pub fn backend_thread_state(&self) -> PathBuf {
+        self.root().join("backend-thread.toml")
+    }
+
+    pub fn steer_dir(&self) -> PathBuf {
+        self.role
+            .project
+            .runtime_dir()
+            .join("steer")
+            .join(self.role.role.as_str())
+            .join(self.agent.as_str())
     }
 
     pub fn data_dir(&self) -> PathBuf {
@@ -394,23 +406,20 @@ fn list_slug_dirs<S>(dir: &Path) -> Result<Vec<S>>
 where
     S: std::str::FromStr<Err = anyhow::Error> + Ord + ToString,
 {
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut values = Vec::new();
-    for entry in fs::read_dir(dir).with_context(|| format!("Failed to read `{}`", dir.display()))? {
-        let entry = entry.with_context(|| format!("Failed to read `{}`", dir.display()))?;
+    let mut values = io::collect_existing_dir(dir, |entry| {
         if !entry
             .file_type()
             .with_context(|| format!("Failed to inspect `{}`", entry.path().display()))?
             .is_dir()
         {
-            continue;
+            return Ok(None);
         }
-        if let Some(name) = entry.file_name().to_str() {
-            values.push(name.parse()?);
-        }
-    }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Ok(None);
+        };
+        Ok(Some(name.parse()?))
+    })?;
     values.sort_by(|left: &S, right: &S| {
         natural_cmp(&left.to_string(), &right.to_string()).then_with(|| left.cmp(right))
     });
@@ -474,6 +483,13 @@ fn natural_cmp(left: &str, right: &str) -> Ordering {
     left.len().cmp(&right.len())
 }
 
+pub fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::natural_cmp;
@@ -484,11 +500,4 @@ mod tests {
         values.sort_by(|left, right| natural_cmp(left, right));
         assert_eq!(values, ["e1", "e2", "e02", "e10", "e11"]);
     }
-}
-
-pub fn unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }

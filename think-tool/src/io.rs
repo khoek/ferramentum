@@ -51,6 +51,26 @@ pub fn read_optional_text(path: &Path) -> Result<Option<String>> {
     }
 }
 
+pub fn collect_existing_dir<T>(
+    path: &Path,
+    mut map_entry: impl FnMut(fs::DirEntry) -> Result<Option<T>>,
+) -> Result<Vec<T>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut values = Vec::new();
+    for entry in
+        fs::read_dir(path).with_context(|| format!("Failed to read `{}`", path.display()))?
+    {
+        if let Some(value) =
+            map_entry(entry.with_context(|| format!("Failed to read `{}`", path.display()))?)?
+        {
+            values.push(value);
+        }
+    }
+    Ok(values)
+}
+
 pub fn write_toml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_text(
         path,
