@@ -648,9 +648,10 @@ pub(super) fn create_agent(
     role_paths: &RolePaths,
     config: &RoleConfig,
 ) -> Result<(AgentId, crate::state::AgentPaths)> {
-    let _lock = lock::FileLock::acquire(
+    let _lock = lock::FileLock::acquire_wait(
         role_paths.project.agent_lock_path(),
         "agent allocation lock",
+        Duration::from_secs(30),
     )?;
     let agent = allocate_agent_id(
         role_paths,

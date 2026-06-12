@@ -35,7 +35,8 @@ use crate::cli::{
     AdvancedCommand, AgentCommand, AgentSelectorArgs, AssistArgs, AttachArgs, ChannelCommand, Cli,
     CodexConfigArgs, CodexLoginArgs, CodexProviderCommand, CodexUseArgs, Commands, HelpArgs,
     MoreArgs, NewAgentArgs, ProjectCommand, ProjectNewArgs, ProviderCommand, RoleCommand,
-    RoleDraftArgs, RoleNewArgs, RunChildCommand, RunNoticesArgs, RunOrchestratorArgs, TriggerArgs,
+    RoleDraftArgs, RoleNewArgs, RunChildCommand, RunNoticesArgs, RunOrchestratorArgs, RunQueueArgs,
+    TriggerArgs,
 };
 use crate::config::{
     ALERTS_CHANNEL, AgentNameScheme, CodexThinkingLevel, ExposedContext, ProjectConfig,
@@ -122,7 +123,7 @@ struct TriggerQueueState {
     items: Vec<TriggerQueueItem>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct TriggerQueueItem {
     role: RoleSlug,
     enqueued_at: u64,
@@ -139,7 +140,7 @@ struct QueueRuntimeState {
     empty_since: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum TriggerCause {
     Manual {

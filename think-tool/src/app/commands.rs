@@ -3,6 +3,7 @@ use super::*;
 pub(super) fn run_child_command(command: RunChildCommand) -> Result<()> {
     match command {
         RunChildCommand::Orchestrator(args) => run_orchestrator(args),
+        RunChildCommand::Queue(args) => run_trigger_queue_worker(args),
         RunChildCommand::Notices(args) => run_notices(args),
     }
 }

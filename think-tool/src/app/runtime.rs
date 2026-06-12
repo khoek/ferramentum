@@ -1,5 +1,7 @@
 use super::*;
 
+const TRIGGER_QUEUE_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(super) fn run_orchestrator(args: RunOrchestratorArgs) -> Result<()> {
     let project = ProjectPaths::new(
         args.project
@@ -1619,9 +1621,18 @@ pub(super) fn launch_triggered_role(
         }
         TriggerLaunch::Queued { queue } => {
             enqueue_triggered_role(project, queue, role, cause)?;
-            drain_trigger_queue(project, queue)
+            ensure_trigger_queue_worker_started(project, queue)
         }
     }
+}
+
+pub(super) fn run_trigger_queue_worker(args: RunQueueArgs) -> Result<()> {
+    let project = ProjectPaths::new(
+        args.project
+            .canonicalize()
+            .context("Invalid project path")?,
+    );
+    drain_trigger_queue(&project, &args.queue)
 }
 
 pub(super) fn enqueue_triggered_role(
@@ -1631,29 +1642,69 @@ pub(super) fn enqueue_triggered_role(
     cause: TriggerCause,
 ) -> Result<()> {
     validate_trigger_queue(queue)?;
-    let path = trigger_queue_path(project, queue);
+    let _state_lock = acquire_trigger_queue_state_lock(project, queue)?;
     let mut state = load_trigger_queue(project, queue)?;
     state.items.push(TriggerQueueItem {
         role: role.clone(),
         enqueued_at: unix_timestamp(),
         cause,
     });
-    io::write_toml(&path, &state)
+    io::write_toml(&trigger_queue_path(project, queue), &state)
+}
+
+pub(super) fn ensure_trigger_queue_worker_started(
+    project: &ProjectPaths,
+    queue: &str,
+) -> Result<()> {
+    validate_trigger_queue(queue)?;
+    if lock::is_active(&trigger_queue_lock_path(project, queue))? {
+        return Ok(());
+    }
+    let log_path = trigger_queue_worker_log_path(project, queue);
+    let log = append_trigger_queue_worker_log(&log_path)?;
+    let stderr = log.try_clone().with_context(|| {
+        format!(
+            "Failed to clone trigger queue worker log `{}`",
+            log_path.display()
+        )
+    })?;
+    Command::new(think_child_executable()?)
+        .arg("run-child")
+        .arg("queue")
+        .arg("--project")
+        .arg(&project.root)
+        .arg("--queue")
+        .arg(queue)
+        .current_dir(&project.root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .with_context(|| format!("Failed to start trigger queue worker `{queue}`"))?;
+    Ok(())
 }
 
 pub(super) fn drain_trigger_queue(project: &ProjectPaths, queue: &str) -> Result<()> {
     validate_trigger_queue(queue)?;
-    let Some(_lock) = lock::FileLock::try_acquire(
+    let Some(drain_lock) = lock::FileLock::try_acquire(
         trigger_queue_lock_path(project, queue),
         "trigger queue lock",
     )?
     else {
         return Ok(());
     };
+    let mut drain_lock = Some(drain_lock);
     loop {
-        let mut queue_state = load_trigger_queue(project, queue)?;
-        let Some(item) = queue_state.items.first().cloned() else {
-            return Ok(());
+        let item = {
+            let _state_lock = acquire_trigger_queue_state_lock(project, queue)?;
+            let queue_state = load_trigger_queue(project, queue)?;
+            let Some(item) = queue_state.items.first().cloned() else {
+                // Let a concurrent enqueue observe the inactive drain lock after it
+                // obtains the state lock, so it knows to start the next worker.
+                drop(drain_lock.take());
+                return Ok(());
+            };
+            item
         };
         let role_paths = RolePaths::new(project.clone(), item.role.clone());
         let mut config = load_role_config(&role_paths)?;
@@ -1661,6 +1712,18 @@ pub(super) fn drain_trigger_queue(project: &ProjectPaths, queue: &str) -> Result
             config.status = RoleStatus::Active;
             save_role_config(&role_paths, &config)?;
             start_one_agent_sync_with_trigger(&role_paths, &config, Some(&item.cause))?;
+        }
+        let _state_lock = acquire_trigger_queue_state_lock(project, queue)?;
+        let mut queue_state = load_trigger_queue(project, queue)?;
+        let Some(position) = queue_state
+            .items
+            .iter()
+            .position(|candidate| candidate == &item)
+        else {
+            bail!("trigger queue `{queue}` changed while processing its head item");
+        };
+        if position != 0 {
+            bail!("trigger queue `{queue}` head changed while processing");
         }
         queue_state.items.remove(0);
         io::write_toml(&trigger_queue_path(project, queue), &queue_state)?;
@@ -1689,6 +1752,49 @@ pub(super) fn trigger_queue_lock_path(project: &ProjectPaths, queue: &str) -> Pa
         .join("locks")
         .join("trigger-queues")
         .join(format!("{queue}.lock"))
+}
+
+pub(super) fn trigger_queue_state_lock_path(project: &ProjectPaths, queue: &str) -> PathBuf {
+    project
+        .runtime_dir()
+        .join("locks")
+        .join("trigger-queue-state")
+        .join(format!("{queue}.lock"))
+}
+
+pub(super) fn trigger_queue_worker_log_path(project: &ProjectPaths, queue: &str) -> PathBuf {
+    project
+        .runtime_dir()
+        .join("sessions")
+        .join("trigger-queues")
+        .join(format!("{queue}.log"))
+}
+
+pub(super) fn append_trigger_queue_worker_log(path: &Path) -> Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        io::ensure_dir(parent)?;
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "Failed to open trigger queue worker log `{}`",
+                path.display()
+            )
+        })
+}
+
+pub(super) fn acquire_trigger_queue_state_lock(
+    project: &ProjectPaths,
+    queue: &str,
+) -> Result<lock::FileLock> {
+    lock::FileLock::acquire_wait(
+        trigger_queue_state_lock_path(project, queue),
+        "trigger queue state lock",
+        TRIGGER_QUEUE_STATE_LOCK_TIMEOUT,
+    )
 }
 
 pub(super) fn queue_runtime_path(project: &ProjectPaths, queue: &str) -> PathBuf {
@@ -1728,7 +1834,8 @@ pub(super) fn queue_is_empty(project: &ProjectPaths, queue: &str) -> Result<bool
     if !load_trigger_queue(project, queue)?.items.is_empty() {
         return Ok(false);
     }
-    Ok(!lock::is_active(&trigger_queue_lock_path(project, queue))?)
+    Ok(!lock::is_active(&trigger_queue_lock_path(project, queue))?
+        && !lock::is_active(&trigger_queue_state_lock_path(project, queue))?)
 }
 
 pub(super) fn validate_trigger_queue(queue: &str) -> Result<()> {

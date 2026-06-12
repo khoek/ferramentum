@@ -112,6 +112,8 @@ pub struct HelpArgs {
 pub enum RunChildCommand {
     #[command(about = "Run one agent runtime orchestrator.")]
     Orchestrator(RunOrchestratorArgs),
+    #[command(about = "Run one trigger queue worker.")]
+    Queue(RunQueueArgs),
     #[command(about = "Run the dashboard notice generator.")]
     Notices(RunNoticesArgs),
 }
@@ -246,6 +248,14 @@ pub struct RunOrchestratorArgs {
     pub role: RoleSlug,
     #[arg(long)]
     pub agent: crate::ids::AgentId,
+}
+
+#[derive(Debug, Args)]
+pub struct RunQueueArgs {
+    #[arg(long)]
+    pub project: PathBuf,
+    #[arg(long)]
+    pub queue: String,
 }
 
 #[derive(Debug, Args)]

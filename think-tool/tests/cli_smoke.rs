@@ -2,6 +2,8 @@ use std::error::Error;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
 
@@ -379,6 +381,52 @@ fn only_agent_dir(project: &Path, role: &str) -> Result<std::path::PathBuf, Box<
         return Err(format!("expected exactly one agent under {}", agents.display()).into());
     }
     Ok(entries.remove(0))
+}
+
+fn wait_for_only_agent_dir(
+    project: &Path,
+    role: &str,
+) -> Result<std::path::PathBuf, Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match only_agent_dir(project, role) {
+            Ok(path) => return Ok(path),
+            Err(err) if Instant::now() >= deadline => {
+                return Err(err);
+            }
+            Err(_) => {}
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_path(path: &Path) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if path.exists() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!("timed out waiting for {}", path.display()).into())
+}
+
+fn wait_for_file_contains(path: &Path, needle: &str) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if path.exists() {
+            let text = fs::read_to_string(path)?;
+            if text.contains(needle) {
+                return Ok(());
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!(
+        "timed out waiting for {} to contain {needle:?}",
+        path.display()
+    )
+    .into())
 }
 
 #[test]
@@ -913,7 +961,8 @@ fn queued_triggers_start_agents_with_trigger_context() -> Result<(), Box<dyn Err
         ],
     )?)?;
 
-    let orchestrator_agent = only_agent_dir(&project, "orchestrator")?;
+    let orchestrator_agent = wait_for_only_agent_dir(&project, "orchestrator")?;
+    wait_for_path(&orchestrator_agent.join("TRIGGER.md"))?;
     let orchestrator_trigger = fs::read_to_string(orchestrator_agent.join("TRIGGER.md"))?;
     assert!(orchestrator_trigger.contains("trigger kind: role-agent-finished"));
     assert!(orchestrator_trigger.contains("source role: `episode`"));
@@ -923,19 +972,19 @@ fn queued_triggers_start_agents_with_trigger_context() -> Result<(), Box<dyn Err
     assert!(orchestrator_prompt.contains("# Trigger Context"));
     assert!(orchestrator_prompt.contains("role-agent-finished"));
 
-    let publisher_agent = only_agent_dir(&project, "publisher")?;
+    let publisher_agent = wait_for_only_agent_dir(&project, "publisher")?;
+    wait_for_path(&publisher_agent.join("TRIGGER.md"))?;
     let publisher_trigger = fs::read_to_string(publisher_agent.join("TRIGGER.md"))?;
     assert!(publisher_trigger.contains("trigger kind: role-agent-finished"));
     assert!(publisher_trigger.contains("source role: `episode`"));
     assert!(publisher_trigger.contains("source agent: `1`"));
     assert!(publisher_agent.join("EXPOSED.md").exists());
-    assert!(
-        project
+    wait_for_path(
+        &project
             .join("channels")
             .join("report-single")
-            .join("episode-1-1-1.pdf")
-            .exists()
-    );
+            .join("episode-1-1-1.pdf"),
+    )?;
     Ok(())
 }
 
@@ -984,7 +1033,8 @@ fn invalid_manifest_is_reported_to_agent_and_retried() -> Result<(), Box<dyn Err
         ],
     )?)?;
 
-    let publisher_agent = only_agent_dir(&project, "publisher")?;
+    let publisher_agent = wait_for_only_agent_dir(&project, "publisher")?;
+    wait_for_file_contains(&publisher_agent.join("agent.toml"), "run_count = 1")?;
     let agent = fs::read_to_string(publisher_agent.join("agent.toml"))?;
     assert!(agent.contains("status = \"done\""));
     assert!(agent.contains("archived = true"));
@@ -1054,17 +1104,24 @@ fn invalid_channel_outbox_is_reported_to_agent_and_retried() -> Result<(), Box<d
         ],
     )?)?;
 
-    let publisher_agent = only_agent_dir(&project, "publisher")?;
+    let publisher_agent = wait_for_only_agent_dir(&project, "publisher")?;
+    wait_for_file_contains(
+        &publisher_agent.join("orchestrator.toml"),
+        "repair_retries = 1",
+    )?;
+    wait_for_file_contains(
+        &publisher_agent.join("orchestrator.toml"),
+        "status = \"idle\"",
+    )?;
     let supervisor = fs::read_to_string(publisher_agent.join("orchestrator.toml"))?;
     assert!(supervisor.contains("status = \"idle\""));
     assert!(supervisor.contains("repair_retries = 1"));
-    assert!(
-        project
+    wait_for_path(
+        &project
             .join("channels")
             .join("report")
-            .join("publisher-pub1-1-good.txt")
-            .exists()
-    );
+            .join("publisher-pub1-1-good.txt"),
+    )?;
     let log = fs::read_to_string(log)?;
     assert!(log.contains("channel outbox"));
     assert!(log.contains("Refusing to publish symlink"));
@@ -1116,7 +1173,8 @@ fn corrupted_agent_state_is_restored_reported_and_retried() -> Result<(), Box<dy
         ],
     )?)?;
 
-    let publisher_agent = only_agent_dir(&project, "publisher")?;
+    let publisher_agent = wait_for_only_agent_dir(&project, "publisher")?;
+    wait_for_file_contains(&publisher_agent.join("agent.toml"), "run_count = 1")?;
     let agent = fs::read_to_string(publisher_agent.join("agent.toml"))?;
     assert!(agent.contains("status = \"done\""));
     assert!(agent.contains("run_count = 1"));
@@ -1174,14 +1232,16 @@ fn missing_reply_is_reported_to_agent_and_retried() -> Result<(), Box<dyn Error>
         ],
     )?)?;
 
-    let publisher_agent = only_agent_dir(&project, "publisher")?;
-    assert!(
-        publisher_agent
-            .join("runs")
-            .join("1")
-            .join("REPLY.md")
-            .exists()
-    );
+    let publisher_agent = wait_for_only_agent_dir(&project, "publisher")?;
+    wait_for_path(&publisher_agent.join("runs").join("1").join("REPLY.md"))?;
+    wait_for_file_contains(
+        &publisher_agent.join("orchestrator.toml"),
+        "status = \"idle\"",
+    )?;
+    wait_for_file_contains(
+        &publisher_agent.join("orchestrator.toml"),
+        "repair_retries = 1",
+    )?;
     let supervisor = fs::read_to_string(publisher_agent.join("orchestrator.toml"))?;
     assert!(supervisor.contains("status = \"idle\""));
     assert!(supervisor.contains("repair_retries = 1"));
@@ -1247,11 +1307,11 @@ fn manual_and_idle_triggers_start_prefixed_auto_archived_supervisors() -> Result
         .join("supervisor")
         .join("agents")
         .join("o1");
-    assert!(manual_agent.exists());
+    wait_for_path(&manual_agent.join("TRIGGER.md"))?;
     let manual_trigger = fs::read_to_string(manual_agent.join("TRIGGER.md"))?;
     assert!(manual_trigger.contains("trigger kind: manual"));
     assert!(manual_trigger.contains("manual smoke review"));
-    assert!(fs::read_to_string(manual_agent.join("agent.toml"))?.contains("archived = true"));
+    wait_for_file_contains(&manual_agent.join("agent.toml"), "archived = true")?;
 
     fs::write(
         &supervisor_config,
@@ -1276,7 +1336,7 @@ fn manual_and_idle_triggers_start_prefixed_auto_archived_supervisors() -> Result
             .join("publisher.toml"),
         "empty_since = 1\n",
     )?;
-    assert_success(run_with_env(
+    let status_output = assert_success(run_with_env(
         &["status", "--plain"],
         Some(&project),
         &[
@@ -1286,17 +1346,18 @@ fn manual_and_idle_triggers_start_prefixed_auto_archived_supervisors() -> Result
             ("THINK_FAKE_CODEX_WRITE_MANIFEST", "1"),
         ],
     )?)?;
+    assert!(!String::from_utf8_lossy(&status_output.stdout).contains("starting app-server run"));
 
     let idle_agent = project
         .join("roles")
         .join("supervisor")
         .join("agents")
         .join("o2");
-    assert!(idle_agent.exists());
+    wait_for_path(&idle_agent.join("TRIGGER.md"))?;
     let idle_trigger = fs::read_to_string(idle_agent.join("TRIGGER.md"))?;
     assert!(idle_trigger.contains("trigger kind: queue-idle"));
     assert!(idle_trigger.contains("queue: `publisher`"));
-    assert!(fs::read_to_string(idle_agent.join("agent.toml"))?.contains("archived = true"));
+    wait_for_file_contains(&idle_agent.join("agent.toml"), "archived = true")?;
     Ok(())
 }
 
