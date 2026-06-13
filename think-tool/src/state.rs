@@ -394,6 +394,20 @@ pub fn list_roles(project: &ProjectPaths) -> Result<Vec<RoleSlug>> {
     list_slug_dirs(&project.roles_dir())
 }
 
+pub fn list_roles_by_display_order(project: &ProjectPaths) -> Result<Vec<RoleSlug>> {
+    let mut roles = list_roles(project)?
+        .into_iter()
+        .map(|role| Ok((role_display_priority(project, &role)?, role)))
+        .collect::<Result<Vec<_>>>()?;
+    roles.sort_by(|(left_priority, left), (right_priority, right)| {
+        left_priority
+            .cmp(right_priority)
+            .then_with(|| natural_cmp(&left.to_string(), &right.to_string()))
+            .then_with(|| left.cmp(right))
+    });
+    Ok(roles.into_iter().map(|(_, role)| role).collect())
+}
+
 pub fn list_channels(project: &ProjectPaths) -> Result<Vec<ChannelSlug>> {
     list_slug_dirs(&project.channels_dir())
 }
@@ -424,6 +438,21 @@ where
         natural_cmp(&left.to_string(), &right.to_string()).then_with(|| left.cmp(right))
     });
     Ok(values)
+}
+
+fn role_display_priority(project: &ProjectPaths, role: &RoleSlug) -> Result<u32> {
+    #[derive(Deserialize)]
+    struct RoleDisplayConfig {
+        #[serde(default = "crate::config::default_role_display_priority")]
+        display_priority: u32,
+    }
+
+    Ok(
+        io::read_toml::<RoleDisplayConfig>(
+            &RolePaths::new(project.clone(), role.clone()).config(),
+        )?
+        .display_priority,
+    )
 }
 
 fn natural_cmp(left: &str, right: &str) -> Ordering {
@@ -492,12 +521,39 @@ pub fn unix_timestamp() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::natural_cmp;
+    use super::{ProjectPaths, list_roles_by_display_order, natural_cmp};
 
     #[test]
     fn natural_sort_orders_embedded_numbers_by_value() {
         let mut values = vec!["e11", "e2", "e1", "e02", "e10"];
         values.sort_by(|left, right| natural_cmp(left, right));
         assert_eq!(values, ["e1", "e2", "e02", "e10", "e11"]);
+    }
+
+    #[test]
+    fn roles_sort_by_display_priority_then_slug() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = ProjectPaths::new(temp.path().to_owned());
+        for (role, priority) in [
+            ("auditor", Some(30)),
+            ("episode", Some(1)),
+            ("zeta", None),
+            ("supervisor", Some(10)),
+        ] {
+            let role_dir = project.roles_dir().join(role);
+            std::fs::create_dir_all(&role_dir).unwrap();
+            let body = priority
+                .map(|priority| format!("display_priority = {priority}\n"))
+                .unwrap_or_default();
+            std::fs::write(role_dir.join("config.toml"), body).unwrap();
+        }
+
+        let roles = list_roles_by_display_order(&project)
+            .unwrap()
+            .into_iter()
+            .map(|role| role.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(roles, ["episode", "supervisor", "auditor", "zeta"]);
     }
 }

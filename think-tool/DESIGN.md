@@ -99,6 +99,7 @@ Role config:
 ```toml
 version = 1
 status = "active"
+display_priority = 1
 backend = "codex"
 mode = "oneshot"
 parallel = 1

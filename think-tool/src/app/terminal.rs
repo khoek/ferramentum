@@ -1578,7 +1578,9 @@ fn draw_attach_composer(
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(
-        Paragraph::new(Text::from(composer.display_lines())).wrap(Wrap { trim: false }),
+        Paragraph::new(Text::from(
+            composer.display_lines(usize::from(inner.width), usize::from(inner.height)),
+        )),
         inner,
     );
 }
@@ -1628,19 +1630,15 @@ impl AttachComposer {
         self.buffer.text()
     }
 
-    pub(super) fn display_lines(&self) -> Vec<Line<'static>> {
-        self.buffer
-            .lines()
-            .iter()
-            .enumerate()
-            .map(|(line_index, line)| {
-                let mut text = line.clone();
-                if line_index == self.buffer.cursor_line() {
-                    insert_cursor_marker(&mut text, self.buffer.cursor_col());
-                }
-                Line::from(Span::styled(text, Style::default().fg(Color::White)))
+    pub(super) fn display_lines(&self, width: usize, height: usize) -> Vec<Line<'static>> {
+        let layout = crate::input::view::WrappedInput::new(&self.buffer, width)
+            .style(Style::default().fg(Color::White))
+            .cursor(crate::input::view::CursorRender::InlineMarker {
+                marker: '▏',
+                style: Style::default().fg(Color::Magenta),
             })
-            .collect()
+            .layout();
+        layout.visible_lines(layout.scroll_for_cursor(0, height), height, Line::from(""))
     }
 
     pub(super) fn apply_edit_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
@@ -1665,15 +1663,6 @@ impl AttachComposer {
         }
         true
     }
-}
-
-pub(super) fn char_to_byte_index(text: &str, char_index: usize) -> usize {
-    crate::input::buffer::char_to_byte_index(text, char_index)
-}
-
-pub(super) fn insert_cursor_marker(text: &mut String, cursor_col: usize) {
-    let byte = char_to_byte_index(text, cursor_col);
-    text.insert(byte, '▏');
 }
 
 pub(super) fn draw_attach_status_rail(frame: &mut Frame<'_>, area: Rect, rail: AttachStatusRail) {
@@ -1852,7 +1841,7 @@ pub(super) fn load_attach_viewer_agents(
     scope: &AttachScope,
 ) -> Result<Vec<AttachViewerAgent>> {
     let roles = match scope {
-        AttachScope::Project => list_roles(project)?,
+        AttachScope::Project => list_roles_by_display_order(project)?,
         AttachScope::Role(role) => vec![role.clone()],
         AttachScope::Agent(agent) => vec![agent.role.clone()],
     };

@@ -392,7 +392,7 @@ pub(super) fn choose_role_for_agent(project: &ProjectPaths) -> Result<RoleSlug> 
             return Ok(default_role);
         }
     }
-    let mut roles = list_roles(project)?;
+    let mut roles = list_roles_by_display_order(project)?;
     roles.retain(|role| {
         let paths = RolePaths::new(project.clone(), role.clone());
         load_role_config(&paths)

@@ -9,7 +9,12 @@ use crate::ids::{ChannelSlug, RoleSlug, StepSlug};
 
 pub const PROJECT_CONFIG_VERSION: u32 = 1;
 pub const ROLE_CONFIG_VERSION: u32 = 1;
+pub const DEFAULT_ROLE_DISPLAY_PRIORITY: u32 = 100;
 pub const ALERTS_CHANNEL: &str = "alerts";
+
+pub fn default_role_display_priority() -> u32 {
+    DEFAULT_ROLE_DISPLAY_PRIORITY
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
@@ -191,6 +196,8 @@ impl fmt::Display for BackendName {
 pub struct RoleConfig {
     pub version: u32,
     pub status: RoleStatus,
+    #[serde(default = "default_role_display_priority")]
+    pub display_priority: u32,
     pub backend: BackendName,
     pub mode: RoleMode,
     pub parallel: RoleParallelism,
@@ -463,6 +470,7 @@ queue = "supervisor"
         .expect("role config should parse");
 
         assert_eq!(config.triggers.len(), 4);
+        assert_eq!(config.display_priority, DEFAULT_ROLE_DISPLAY_PRIORITY);
         assert_eq!(config.parallel, RoleParallelism::Count(1));
         assert!(matches!(
             &config.triggers[0],

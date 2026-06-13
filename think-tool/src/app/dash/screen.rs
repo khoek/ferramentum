@@ -4600,7 +4600,9 @@ impl DashboardApp {
         frame.render_widget(Clear, popup);
         frame.render_widget(block, popup);
         frame.render_widget(
-            Paragraph::new(Text::from(composer.display_lines())).wrap(Wrap { trim: false }),
+            Paragraph::new(Text::from(
+                composer.display_lines(usize::from(inner.width), usize::from(inner.height)),
+            )),
             inner,
         );
     }
@@ -4950,6 +4952,11 @@ impl DashboardApp {
             section_line("contract"),
             schema_kv_line("role", role.slug.to_string(), Color::Cyan),
             schema_kv_line("status", role.config.status.to_string(), Color::White),
+            schema_kv_line(
+                "display priority",
+                role.config.display_priority.to_string(),
+                Color::White,
+            ),
             schema_kv_line("backend", role.config.backend.to_string(), Color::White),
             schema_kv_line("mode", role.config.mode.to_string(), Color::Cyan),
             schema_kv_line("parallel", role.config.parallel.to_string(), Color::Cyan),

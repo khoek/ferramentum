@@ -87,9 +87,10 @@ impl DashboardSnapshot {
         for role in &self.roles {
             let _ = write!(
                 signature,
-                "role\0{}\0{}\0{}\0{}\0{}\0{};",
+                "role\0{}\0{}\0{}\0{}\0{}\0{}\0{};",
                 role.slug,
                 role.status,
+                role.display_priority,
                 role.mode,
                 role.parallel,
                 role.auto_archive,
@@ -224,6 +225,7 @@ impl DashboardSnapshot {
 pub(in crate::app) struct DashboardRole {
     pub(in crate::app) slug: RoleSlug,
     pub(in crate::app) status: RoleStatus,
+    pub(in crate::app) display_priority: u32,
     pub(in crate::app) mode: RoleMode,
     pub(in crate::app) parallel: String,
     pub(in crate::app) expose: String,
@@ -238,6 +240,7 @@ impl QueryMatch for DashboardRole {
             [
                 self.slug.to_string(),
                 self.status.to_string(),
+                self.display_priority.to_string(),
                 self.mode.to_string(),
                 self.parallel.clone(),
                 self.expose.clone(),
@@ -263,6 +266,12 @@ impl DashboardRole {
                 Span::styled(ui::FIELD_SEPARATOR, Style::default().fg(Color::DarkGray)),
                 Span::styled("parallel ", Style::default().fg(Color::DarkGray)),
                 Span::styled(self.parallel.clone(), Style::default().fg(Color::Cyan)),
+                Span::styled(ui::FIELD_SEPARATOR, Style::default().fg(Color::DarkGray)),
+                Span::styled("priority ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    self.display_priority.to_string(),
+                    Style::default().fg(Color::White),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("expose ", Style::default().fg(Color::DarkGray)),
@@ -319,6 +328,7 @@ impl DashboardRole {
                 Span::styled(self.slug.to_string(), Style::default().fg(Color::Cyan)),
             ]),
             Line::from(format!("status: {}", self.status)),
+            Line::from(format!("display priority: {}", self.display_priority)),
             Line::from(format!("mode: {}", self.mode)),
             Line::from(format!("parallel: {}", self.parallel)),
             Line::from(format!("expose: {}", empty_dash(&self.expose))),
@@ -585,7 +595,7 @@ pub(in crate::app) enum QueueSelection {
 
 pub(in crate::app) fn load_dashboard_schema(project: &ProjectPaths) -> Result<DashboardSchema> {
     let mut roles = Vec::new();
-    for role in list_roles(project)? {
+    for role in list_roles_by_display_order(project)? {
         let role_paths = RolePaths::new(project.clone(), role.clone());
         let config = load_role_config(&role_paths)?;
         let step_files = role_step_prompt_files(&role_paths)?;
@@ -645,7 +655,7 @@ pub(in crate::app) fn load_dashboard_snapshot(
     let roles = if let Some(role) = role_filter {
         vec![role.clone()]
     } else {
-        list_roles(project)?
+        list_roles_by_display_order(project)?
     };
     let (notices, notices_loading, notices_updated_at) = load_notice_lines(project)?;
     let mut snapshot = DashboardSnapshot {
@@ -713,6 +723,7 @@ pub(in crate::app) fn load_dashboard_snapshot(
         snapshot.roles.push(DashboardRole {
             slug: role,
             status: config.status,
+            display_priority: config.display_priority,
             mode: config.mode,
             parallel: format!("{active}/{}", config.parallel),
             expose: config

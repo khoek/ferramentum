@@ -60,7 +60,8 @@ use crate::selection::{self, AgentSpec, AttachTarget, ResolvedAgent};
 use crate::session::{NativeSessionHost, PaneSpawnRequest, SessionHost};
 use crate::state::{
     AgentManifest, AgentState, AgentStatus, Disposition, ProjectPaths, RolePaths, RunExitState,
-    list_agents, list_channels, list_roles, load_agent, save_agent, unix_timestamp,
+    list_agents, list_channels, list_roles, list_roles_by_display_order, load_agent, save_agent,
+    unix_timestamp,
 };
 use crate::time::{
     event_age, file_modified_unix, format_unix_time, format_unix_time_compact, human_duration,
@@ -899,6 +900,7 @@ mod tests {
         let config = RoleConfig {
             version: ROLE_CONFIG_VERSION,
             status: RoleStatus::Active,
+            display_priority: crate::config::DEFAULT_ROLE_DISPLAY_PRIORITY,
             backend: crate::config::BackendName::Codex,
             mode: RoleMode::Repeatable,
             parallel: crate::config::RoleParallelism::Infinite,

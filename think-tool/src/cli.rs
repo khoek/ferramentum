@@ -304,6 +304,12 @@ pub struct RoleNewArgs {
     pub agent_names: Option<AgentNameScheme>,
     #[arg(long = "prefix", help = "Prefix prepended to generated agent ids.")]
     pub agent_prefix: Option<String>,
+    #[arg(
+        long,
+        default_value_t = crate::config::DEFAULT_ROLE_DISPLAY_PRIORITY,
+        help = "Sort key for role display; lower values appear first."
+    )]
+    pub display_priority: u32,
     #[arg(long, help = "Archive successful done agents automatically.")]
     pub auto_archive: bool,
     #[arg(long)]

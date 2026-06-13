@@ -93,6 +93,7 @@ pub(super) fn create_role(project: &ProjectPaths, args: RoleNewArgs) -> Result<(
         } else {
             RoleStatus::Draft
         },
+        display_priority: args.display_priority,
         backend: project_config.default_backend,
         mode: args.mode,
         parallel,
@@ -161,6 +162,7 @@ pub(super) fn ensure_draft_role(project: &ProjectPaths, role: &RoleSlug) -> Resu
                 &RoleConfig {
                     version: ROLE_CONFIG_VERSION,
                     status: RoleStatus::Draft,
+                    display_priority: crate::config::DEFAULT_ROLE_DISPLAY_PRIORITY,
                     backend: project_config.default_backend,
                     mode: RoleMode::Repeatable,
                     parallel: template::default_parallel(project_config.template),
@@ -187,6 +189,7 @@ pub(super) fn ensure_draft_role(project: &ProjectPaths, role: &RoleSlug) -> Resu
             steps: Vec::new(),
             agent_names: None,
             agent_prefix: None,
+            display_priority: crate::config::DEFAULT_ROLE_DISPLAY_PRIORITY,
             auto_archive: false,
             active: false,
         },
@@ -329,6 +332,7 @@ pub(super) fn run_backend_role_draft(
          The role config schema is:\n\
          version = {ROLE_CONFIG_VERSION}\n\
          status = \"draft\" | \"active\" | \"paused\"\n\
+         display_priority = nonnegative integer; lower values display first\n\
          backend = \"{backend}\"\n\
          mode = \"oneshot\" | \"repeatable\" | \"infinite\"\n\
          parallel = positive integer, or parallel = \"infinite\"\n\

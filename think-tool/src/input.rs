@@ -1,5 +1,6 @@
 pub mod buffer;
 pub mod editor;
+pub mod view;
 
 pub mod history {
     use std::path::PathBuf;

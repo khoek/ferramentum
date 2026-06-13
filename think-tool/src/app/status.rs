@@ -301,7 +301,7 @@ pub(super) fn load_status_roles(
     let roles = if let Some(role) = role_filter {
         vec![role.clone()]
     } else {
-        list_roles(project)?
+        list_roles_by_display_order(project)?
     };
     roles
         .into_iter()

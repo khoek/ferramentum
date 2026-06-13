@@ -16,6 +16,7 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::input::buffer::TextBuffer;
+use crate::input::view::WrappedInput;
 
 const FOOTER_HEIGHT: u16 = 1;
 const MIN_VISIBLE_ROWS: u16 = 1;
@@ -588,31 +589,21 @@ impl EditorState {
         let block = panel("Prompt").border_style(Style::default().fg(Color::Blue));
         let inner = block.inner(area);
         let body_rows = inner.height.max(MIN_VISIBLE_ROWS) as usize;
-        if self.buffer.cursor_line() < self.scroll {
-            self.scroll = self.buffer.cursor_line();
-        } else if self.buffer.cursor_line() >= self.scroll + body_rows {
-            self.scroll = self.buffer.cursor_line() + 1 - body_rows;
-        }
-        let lines = (0..body_rows)
-            .map(|row| {
-                self.buffer
-                    .lines()
-                    .get(self.scroll + row)
-                    .map(|line| Line::from(line.as_str()))
-                    .unwrap_or_else(|| {
-                        Line::from(Span::styled("~", Style::default().fg(Color::DarkGray)))
-                    })
-            })
-            .collect::<Vec<_>>();
+        let layout = WrappedInput::new(&self.buffer, inner.width as usize)
+            .style(Style::default().fg(Color::White))
+            .layout();
+        self.scroll = layout.scroll_for_cursor(self.scroll, body_rows);
+        let lines = layout.visible_lines(
+            self.scroll,
+            body_rows,
+            Line::from(Span::styled("~", Style::default().fg(Color::DarkGray))),
+        );
         frame.render_widget(block, area);
         frame.render_widget(Paragraph::new(Text::from(lines)), inner);
-        let cursor_y = inner.y + self.buffer.cursor_line().saturating_sub(self.scroll) as u16;
-        let cursor_x = inner.x
-            + self
-                .buffer
-                .cursor_col()
-                .min(inner.width.saturating_sub(1) as usize) as u16;
-        if cursor_y < inner.y + inner.height {
+        let cursor = layout.cursor();
+        let cursor_y = inner.y + cursor.row.saturating_sub(self.scroll) as u16;
+        let cursor_x = inner.x + cursor.col.min(inner.width.saturating_sub(1) as usize) as u16;
+        if cursor.row >= self.scroll && cursor_y < inner.y + inner.height {
             frame.set_cursor_position(Position::new(cursor_x, cursor_y));
         }
     }

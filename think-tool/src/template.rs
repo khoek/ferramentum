@@ -186,6 +186,7 @@ fn create_math_episode_role(project: &ProjectPaths) -> Result<()> {
             &RoleConfig {
                 version: ROLE_CONFIG_VERSION,
                 status: RoleStatus::Active,
+                display_priority: 1,
                 backend: BackendName::Codex,
                 mode: RoleMode::Repeatable,
                 parallel: RoleParallelism::Infinite,
@@ -215,6 +216,7 @@ fn create_code_episode_role(project: &ProjectPaths) -> Result<()> {
             &RoleConfig {
                 version: ROLE_CONFIG_VERSION,
                 status: RoleStatus::Active,
+                display_priority: 1,
                 backend: BackendName::Codex,
                 mode: RoleMode::Repeatable,
                 parallel: RoleParallelism::Infinite,
@@ -244,6 +246,7 @@ fn create_code_merger_role(project: &ProjectPaths) -> Result<()> {
             &RoleConfig {
                 version: ROLE_CONFIG_VERSION,
                 status: RoleStatus::Active,
+                display_priority: 20,
                 backend: BackendName::Codex,
                 mode: RoleMode::Oneshot,
                 parallel: RoleParallelism::Count(1),
@@ -281,6 +284,7 @@ fn create_code_supervisor_role(project: &ProjectPaths) -> Result<()> {
             &RoleConfig {
                 version: ROLE_CONFIG_VERSION,
                 status: RoleStatus::Paused,
+                display_priority: 10,
                 backend: BackendName::Codex,
                 mode: RoleMode::Oneshot,
                 parallel: RoleParallelism::Count(1),
@@ -323,6 +327,7 @@ fn create_code_auditor_role(project: &ProjectPaths) -> Result<()> {
             &RoleConfig {
                 version: ROLE_CONFIG_VERSION,
                 status: RoleStatus::Active,
+                display_priority: 30,
                 backend: BackendName::Codex,
                 mode: RoleMode::Oneshot,
                 parallel: RoleParallelism::Count(1),
@@ -361,6 +366,7 @@ fn create_math_publisher_role(project: &ProjectPaths) -> Result<()> {
             &RoleConfig {
                 version: ROLE_CONFIG_VERSION,
                 status: RoleStatus::Active,
+                display_priority: 20,
                 backend: BackendName::Codex,
                 mode: RoleMode::Oneshot,
                 parallel: RoleParallelism::Count(1),
@@ -398,6 +404,7 @@ fn create_math_supervisor_role(project: &ProjectPaths) -> Result<()> {
             &RoleConfig {
                 version: ROLE_CONFIG_VERSION,
                 status: RoleStatus::Paused,
+                display_priority: 10,
                 backend: BackendName::Codex,
                 mode: RoleMode::Oneshot,
                 parallel: RoleParallelism::Count(1),
@@ -432,6 +439,7 @@ fn create_math_auditor_role(project: &ProjectPaths) -> Result<()> {
             &RoleConfig {
                 version: ROLE_CONFIG_VERSION,
                 status: RoleStatus::Active,
+                display_priority: 30,
                 backend: BackendName::Codex,
                 mode: RoleMode::Oneshot,
                 parallel: RoleParallelism::Count(1),

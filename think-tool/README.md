@@ -104,7 +104,7 @@ merge-queue problems.
 Advanced commands:
 
 - `think agent new [role] [--prompt TEXT] [--no-prompt] [--attach]`
-- `think role new [slug] [--active] [--parallel N|infinite] [--expose NAME]`
+- `think role new [slug] [--active] [--parallel N|infinite] [--display-priority N] [--expose NAME]`
 - `think role draft [slug] [--request TEXT] [--feedback TEXT] [--no-review] [--active]`
 - `think role activate <role>`
 - `think agent attach [role|agent|role/agent]`

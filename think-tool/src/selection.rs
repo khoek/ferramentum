@@ -6,7 +6,8 @@ use anyhow::{Context, Result, bail};
 use crate::ids::{AgentId, RoleSlug};
 use crate::input::editor::{ChoicePrompt, PromptEditor, UserCancelled};
 use crate::state::{
-    AgentState, AgentStatus, ProjectPaths, RolePaths, list_agents, list_roles, load_agent,
+    AgentState, AgentStatus, ProjectPaths, RolePaths, list_agents, list_roles,
+    list_roles_by_display_order, load_agent,
 };
 
 #[derive(Debug, Clone)]
@@ -187,7 +188,7 @@ pub fn resolve_or_choose_agent_or_new(
 }
 
 pub fn choose_role(project: &ProjectPaths, prompt: &str) -> Result<RoleSlug> {
-    let roles = list_roles(project)?;
+    let roles = list_roles_by_display_order(project)?;
     choose_slug(roles, prompt, "role")
 }
 
@@ -288,7 +289,7 @@ fn list_agents_for_choice(
     include_archived: bool,
 ) -> Result<Vec<ResolvedAgent>> {
     let mut agents = Vec::new();
-    for role in list_roles(project)? {
+    for role in list_roles_by_display_order(project)? {
         let role_paths = RolePaths::new(project.clone(), role.clone());
         for agent in list_agents(&role_paths)? {
             if !include_archived && load_agent(&role_paths.agent(agent.clone()))?.archived {
