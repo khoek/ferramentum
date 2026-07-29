@@ -1,3 +1,5 @@
+mod credentials;
+
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -52,8 +54,8 @@ const COMMON_WORDS: &[&str] = &[
 #[derive(Debug, Parser)]
 #[command(
     name = "kai",
-    about = "Utilities for AI and coding workflows.",
-    after_help = "Shorthands:\n  lg  llm-get\n  a   agent\n  ar  agent --resume-all\n  wc  worktree create\n  wa  worktree agent\n  wo  worktree open\n  wd  worktree delete\n\nWorkspace setup:\n  init        Create .kai/config.toml in the current repo root\n"
+    about = "Utilities for AI-assisted coding workflows.",
+    after_help = "Shorthands:\n  a     agent\n  ar    agent --resume-all\n  wc    worktree create\n  wa    worktree agent\n  wo    worktree open\n  wd    worktree delete\n  next  cred next\n  lg    llm-get\n\nWorkspace setup:\n  init  Create .kai/config.toml in the current repo root\n"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -62,6 +64,30 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    #[command(
+        name = "agent",
+        alias = "a",
+        about = "Run codex or claude in the current directory.",
+        after_help = "Shorthand: a"
+    )]
+    Agent(AgentArgs),
+
+    #[command(
+        name = "worktree",
+        about = "Work with git worktrees under configured `worktree_root` (`.kai/config.toml`)."
+    )]
+    Worktree(WorktreeArgs),
+
+    #[command(name = "cred", about = "Manage enrolled Codex CLI accounts.")]
+    Cred(credentials::CredArgs),
+
+    #[command(
+        name = "next",
+        about = "Activate the next enrolled Codex account.",
+        after_help = "Shorthand for `kai cred next`."
+    )]
+    Next,
+
     #[command(
         name = "llm-get",
         alias = "lg",
@@ -84,25 +110,11 @@ enum Commands {
     Bump(BumpArgs),
 
     #[command(
-        name = "agent",
-        alias = "a",
-        about = "Run codex or claude in the current directory.",
-        after_help = "Shorthand: a"
-    )]
-    Agent(AgentArgs),
-
-    #[command(
         name = "ar",
         hide = true,
         about = "Shorthand for `agent --resume-all`."
     )]
     Ar(AgentResumeAllArgs),
-
-    #[command(
-        name = "worktree",
-        about = "Work with git worktrees under configured `worktree_root` (`.kai/config.toml`)."
-    )]
-    Worktree(WorktreeArgs),
 
     #[command(name = "wc", hide = true, about = "Shorthand for `worktree create`.")]
     Wc(WorktreeCreateArgs),
@@ -493,24 +505,7 @@ fn main() -> ExitCode {
 fn run() -> Result<ExitCode> {
     let command = command_or_default(Cli::parse());
     match command {
-        Commands::LlmGet(args) => {
-            llm_get(args)?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Commands::Init(args) => {
-            kai_init(args)?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Commands::Bump(args) => {
-            kai_bump(args)?;
-            Ok(ExitCode::SUCCESS)
-        }
         Commands::Agent(args) => agent(args),
-        Commands::Ar(args) => agent(AgentArgs {
-            model: args.model,
-            resume: false,
-            resume_all: true,
-        }),
         Commands::Worktree(args) => match args.command {
             WorktreeCommands::Create(args) => {
                 worktree_create(args)?;
@@ -523,6 +518,31 @@ fn run() -> Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
         },
+        Commands::Cred(args) => {
+            credentials::run(args.command)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Next => {
+            credentials::run(credentials::CredCommand::Next)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::LlmGet(args) => {
+            llm_get(args)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Init(args) => {
+            kai_init(args)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Bump(args) => {
+            kai_bump(args)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Ar(args) => agent(AgentArgs {
+            model: args.model,
+            resume: false,
+            resume_all: true,
+        }),
         Commands::Wc(args) => {
             worktree_create(args)?;
             Ok(ExitCode::SUCCESS)
