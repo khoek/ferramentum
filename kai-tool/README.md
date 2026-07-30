@@ -76,7 +76,8 @@ Already-running Codex processes may retain their previous credential in memory. 
 
 ## Other commands
 
-- `kai agent` (`a`, or `ar` for `--resume-all`) launches Codex or Claude.
+- `kai agent` (`a`; `ar` opens the all-sessions picker, and `ar SESSION_ID` resumes directly)
+  launches Codex or Claude.
 - `kai worktree` (`wc`, `wa`, `wo`, `wd`) manages git worktrees.
 - `kai llm-get` (`lg`) produces LLM-friendly file listings.
 - `kai init` writes `.kai/config.toml`.

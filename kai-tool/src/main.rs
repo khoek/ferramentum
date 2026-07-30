@@ -55,7 +55,7 @@ const COMMON_WORDS: &[&str] = &[
 #[command(
     name = "kai",
     about = "Utilities for AI-assisted coding workflows.",
-    after_help = "Shorthands:\n  a     agent\n  ar    agent --resume-all\n  wc    worktree create\n  wa    worktree agent\n  wo    worktree open\n  wd    worktree delete\n  next  cred next\n  lg    llm-get\n\nWorkspace setup:\n  init  Create .kai/config.toml in the current repo root\n"
+    after_help = "Shorthands:\n  a     agent\n  ar    agent --resume-all, or resume SESSION_ID\n  wc    worktree create\n  wa    worktree agent\n  wo    worktree open\n  wd    worktree delete\n  next  cred next\n  lg    llm-get\n\nWorkspace setup:\n  init  Create .kai/config.toml in the current repo root\n"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -112,9 +112,9 @@ enum Commands {
     #[command(
         name = "ar",
         hide = true,
-        about = "Shorthand for `agent --resume-all`."
+        about = "Resume across all sessions, or resume SESSION_ID directly."
     )]
-    Ar(AgentResumeAllArgs),
+    Ar(AgentResumeArgs),
 
     #[command(name = "wc", hide = true, about = "Shorthand for `worktree create`.")]
     Wc(WorktreeCreateArgs),
@@ -251,7 +251,11 @@ struct AgentArgs {
 }
 
 #[derive(Debug, Args)]
-struct AgentResumeAllArgs {
+struct AgentResumeArgs {
+    /// Session ID or name to resume directly (default: open the all-sessions picker).
+    #[arg(value_name = "SESSION_ID")]
+    session_id: Option<String>,
+
     /// Which tool to run (default: codex).
     #[arg(long = "model", value_enum, default_value_t = WorktreeAgentModel::Codex)]
     model: WorktreeAgentModel,
@@ -362,11 +366,12 @@ struct WorktreeInvocationContext {
     invoked_from_submodule: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AgentResumeMode {
     Off,
     Picker,
     PickerAll,
+    Session(String),
 }
 
 fn worktree_branch_mode(existing: bool, delete: bool) -> WorktreeBranchMode {
@@ -538,11 +543,12 @@ fn run() -> Result<ExitCode> {
             kai_bump(args)?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Ar(args) => agent(AgentArgs {
-            model: args.model,
-            resume: false,
-            resume_all: true,
-        }),
+        Commands::Ar(args) => {
+            let resume_mode = args
+                .session_id
+                .map_or(AgentResumeMode::PickerAll, AgentResumeMode::Session);
+            agent_with_resume_mode(args.model, resume_mode)
+        }
         Commands::Wc(args) => {
             worktree_create(args)?;
             Ok(ExitCode::SUCCESS)
@@ -976,13 +982,16 @@ fn build_agent_command(
     let (tool, mut command) = match model {
         WorktreeAgentModel::Codex => {
             let mut command = Command::new("codex");
-            if matches!(
-                resume_mode,
-                AgentResumeMode::Picker | AgentResumeMode::PickerAll
-            ) {
-                command.arg("resume");
-                if matches!(resume_mode, AgentResumeMode::PickerAll) {
-                    command.arg("--all");
+            match resume_mode {
+                AgentResumeMode::Off => {}
+                AgentResumeMode::Picker => {
+                    command.arg("resume");
+                }
+                AgentResumeMode::PickerAll => {
+                    command.arg("resume").arg("--all");
+                }
+                AgentResumeMode::Session(session_id) => {
+                    command.arg("resume").arg(session_id);
                 }
             }
             command.arg("--dangerously-bypass-approvals-and-sandbox");
@@ -990,11 +999,14 @@ fn build_agent_command(
         }
         WorktreeAgentModel::Claude => {
             let mut command = Command::new("claude");
-            if matches!(
-                resume_mode,
-                AgentResumeMode::Picker | AgentResumeMode::PickerAll
-            ) {
-                command.arg("--resume");
+            match resume_mode {
+                AgentResumeMode::Off => {}
+                AgentResumeMode::Picker | AgentResumeMode::PickerAll => {
+                    command.arg("--resume");
+                }
+                AgentResumeMode::Session(session_id) => {
+                    command.arg("--resume").arg(session_id);
+                }
             }
             command.arg("--dangerously-skip-permissions");
             ("claude", command)
@@ -1006,15 +1018,22 @@ fn build_agent_command(
 
 fn agent(args: AgentArgs) -> Result<ExitCode> {
     let resume_mode = resolve_agent_resume_mode(args.resume, args.resume_all);
-    if matches!(args.model, WorktreeAgentModel::Claude)
-        && matches!(resume_mode, AgentResumeMode::PickerAll)
+    agent_with_resume_mode(args.model, resume_mode)
+}
+
+fn agent_with_resume_mode(
+    model: WorktreeAgentModel,
+    resume_mode: AgentResumeMode,
+) -> Result<ExitCode> {
+    if matches!(model, WorktreeAgentModel::Claude)
+        && matches!(&resume_mode, AgentResumeMode::PickerAll)
     {
         eprintln_warning(
             "`claude` does not support a separate `--all` resume scope; using `--resume`.",
         );
     }
 
-    let (tool, mut command) = build_agent_command(args.model, resume_mode);
+    let (tool, mut command) = build_agent_command(model, resume_mode);
     let status = command
         .status()
         .with_context(|| format!("Failed to run `{tool}`"))?;
@@ -3519,6 +3538,27 @@ mod tests {
     }
 
     #[test]
+    fn build_agent_command_codex_resume_session_uses_id() {
+        let (tool, command) = build_agent_command(
+            WorktreeAgentModel::Codex,
+            AgentResumeMode::Session("019c1234-session".to_owned()),
+        );
+        assert_eq!(tool, "codex");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                "resume",
+                "019c1234-session",
+                "--dangerously-bypass-approvals-and-sandbox"
+            ]
+        );
+    }
+
+    #[test]
     fn build_agent_command_claude_resume_uses_picker() {
         let (tool, command) =
             build_agent_command(WorktreeAgentModel::Claude, AgentResumeMode::Picker);
@@ -3540,6 +3580,23 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(args, vec!["--resume", "--dangerously-skip-permissions"]);
+    }
+
+    #[test]
+    fn build_agent_command_claude_resume_session_uses_id() {
+        let (tool, command) = build_agent_command(
+            WorktreeAgentModel::Claude,
+            AgentResumeMode::Session("session-id".to_owned()),
+        );
+        assert_eq!(tool, "claude");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec!["--resume", "session-id", "--dangerously-skip-permissions"]
+        );
     }
 
     #[test]
@@ -3912,9 +3969,23 @@ mod tests {
         let cli = Cli::try_parse_from(["kai", "ar"]).expect("parse ar shorthand");
         assert!(matches!(
             command_or_default(cli),
-            Commands::Ar(AgentResumeAllArgs {
+            Commands::Ar(AgentResumeArgs {
+                session_id: None,
                 model: WorktreeAgentModel::Codex,
             })
+        ));
+    }
+
+    #[test]
+    fn top_level_agent_resume_all_alias_session_id_parses() {
+        let cli =
+            Cli::try_parse_from(["kai", "ar", "019c1234-session"]).expect("parse ar session ID");
+        assert!(matches!(
+            command_or_default(cli),
+            Commands::Ar(AgentResumeArgs {
+                session_id: Some(session_id),
+                model: WorktreeAgentModel::Codex,
+            }) if session_id == "019c1234-session"
         ));
     }
 
@@ -3923,7 +3994,8 @@ mod tests {
         let cli = Cli::try_parse_from(["kai", "ar", "--model", "claude"]).expect("parse ar model");
         assert!(matches!(
             command_or_default(cli),
-            Commands::Ar(AgentResumeAllArgs {
+            Commands::Ar(AgentResumeArgs {
+                session_id: None,
                 model: WorktreeAgentModel::Claude,
             })
         ));
