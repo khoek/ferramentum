@@ -278,16 +278,9 @@ impl Store {
 
 pub fn ensure_codex_uses_file_credentials(paths: &RuntimePaths) -> Result<()> {
     let config_path = paths.codex_config();
-    let contents = match fs::read_to_string(&config_path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("could not read Codex config {}", config_path.display()));
-        }
+    let Some(config) = paths.read_codex_config()? else {
+        return Ok(());
     };
-    let config: toml::Table = toml::from_str(&contents)
-        .with_context(|| format!("could not parse Codex config {}", config_path.display()))?;
     match config
         .get("cli_auth_credentials_store")
         .and_then(toml::Value::as_str)

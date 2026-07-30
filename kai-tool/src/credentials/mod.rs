@@ -6,13 +6,14 @@ use clap::{Args, Subcommand};
 mod auth;
 mod enroll;
 mod paths;
+mod quota;
 mod store;
 mod ui;
 
-use self::auth::{Credential, validate_email};
+use self::auth::{Credential, CredentialFacts, validate_email};
 use self::paths::RuntimePaths;
 use self::store::{Profile, Store, ensure_codex_uses_file_credentials};
-use self::ui::{AccountStatus, AccountView, ListView};
+use self::ui::{AccountStatus, AccountView, ListView, QuotaStatus};
 
 #[derive(Debug, Args)]
 #[command(after_help = concat!(
@@ -33,11 +34,11 @@ pub struct CredArgs {
 pub enum CredCommand {
     #[command(
         visible_alias = "ls",
-        about = "List enrolled accounts and show which one Codex is using."
+        about = "List enrolled accounts with their live quota and active state."
     )]
     List(ListArgs),
 
-    #[command(about = "Activate the next enrolled account, wrapping at the end.")]
+    #[command(about = "Activate the next enrolled account and show its live quota.")]
     Next,
 
     #[command(about = "Activate an enrolled account.")]
@@ -103,49 +104,71 @@ enum LiveAuth {
 }
 
 pub fn run(command: CredCommand) -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("could not initialize the credential runtime")?
+        .block_on(run_async(command))
+}
+
+async fn run_async(command: CredCommand) -> Result<()> {
     let _invocation_lock = capulus::acquire("kai-cred", false)?;
     let paths = RuntimePaths::from_env()?;
     ensure_codex_uses_file_credentials(&paths)?;
     let mut store = Store::open(paths)?;
     match command {
-        CredCommand::List(args) => cmd_list(&store, args),
-        CredCommand::Next => cmd_next(&mut store),
+        CredCommand::List(args) => cmd_list(&store, args).await,
+        CredCommand::Next => cmd_next(&mut store).await,
         CredCommand::Activate(args) => cmd_activate(&mut store, &args.email),
         CredCommand::Add(args) => cmd_add(&mut store, args),
         CredCommand::Remove(args) => cmd_remove(&mut store, args),
     }
 }
 
-fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
+async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
     let live = load_live(store);
     let active_profile = match &live {
         LiveAuth::Present(credential) => managed_profile(store, credential),
         _ => None,
     };
     let active_id = active_profile.map(|profile| profile.id.as_str());
-    let accounts = store
-        .profiles()
-        .iter()
-        .map(|profile| {
-            let active = active_id == Some(profile.id.as_str());
-            let facts = if active {
-                match &live {
-                    LiveAuth::Present(credential) => Ok(credential.facts.clone()),
-                    _ => unreachable!(),
-                }
-            } else {
-                store.credential(profile).map(|credential| credential.facts)
-            };
-            match facts {
-                Ok(facts) => AccountView {
-                    email: profile.email.clone(),
+    let quota_client = quota::Client::new(store.paths()).map_err(|err| format!("{err:#}"));
+    let mut quota_tasks = tokio::task::JoinSet::new();
+    let mut accounts = Vec::with_capacity(store.profiles().len());
+    for profile in store.profiles() {
+        let active = active_id == Some(profile.id.as_str());
+        let loaded = if active {
+            match &live {
+                LiveAuth::Present(credential) => Ok((
+                    credential.facts.clone(),
+                    quota::Request::from_credential(credential),
+                )),
+                _ => unreachable!(),
+            }
+        } else {
+            store.credential(profile).map(|credential| {
+                let request = quota::Request::from_credential(&credential);
+                (credential.facts, request)
+            })
+        };
+        let (mut account, request) = match loaded {
+            Ok((facts, Ok(request))) => (
+                ready_account_view(profile, active, facts, QuotaStatus::Loading),
+                Some(request),
+            ),
+            Ok((facts, Err(err))) => (
+                ready_account_view(
+                    profile,
                     active,
-                    plan: facts.plan,
-                    access_expires_at: facts.access_expires_at,
-                    last_refresh: facts.last_refresh,
-                    status: AccountStatus::Ready,
-                },
-                Err(err) => AccountView {
+                    facts,
+                    QuotaStatus::Unavailable {
+                        error: format!("{err:#}"),
+                    },
+                ),
+                None,
+            ),
+            Err(err) => (
+                AccountView {
                     email: profile.email.clone(),
                     active,
                     plan: None,
@@ -154,10 +177,29 @@ fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
                     status: AccountStatus::Invalid {
                         error: format!("{err:#}"),
                     },
+                    quota: QuotaStatus::Unavailable {
+                        error: "credential is invalid".to_owned(),
+                    },
                 },
+                None,
+            ),
+        };
+        let index = accounts.len();
+        if let Some(request) = request {
+            match &quota_client {
+                Ok(client) => {
+                    let client = client.clone();
+                    quota_tasks.spawn(async move { (index, client.fetch(request).await) });
+                }
+                Err(error) => {
+                    account.quota = QuotaStatus::Unavailable {
+                        error: error.clone(),
+                    };
+                }
             }
-        })
-        .collect::<Vec<_>>();
+        }
+        accounts.push(account);
+    }
     let next = match (&live, active_profile) {
         (LiveAuth::Absent, _) => store.profiles().first(),
         (LiveAuth::Present(_), Some(active)) => next_profile(store, Some(active)),
@@ -165,15 +207,28 @@ fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
     }
     .map(|profile| profile.email.clone());
     let active = active_profile.map(|profile| profile.email.clone());
-
-    ui::print_list(
-        &ListView {
-            active,
-            next,
-            accounts,
-        },
-        args.json,
-    )?;
+    let mut view = ListView {
+        active,
+        next,
+        accounts,
+    };
+    let live_list = if args.json {
+        None
+    } else {
+        ui::LiveList::start(&view)
+    };
+    while let Some(result) = quota_tasks.join_next().await {
+        let (index, quota) = result.context("a quota lookup task stopped unexpectedly")?;
+        view.accounts[index].set_quota(quota);
+        if let Some(live_list) = &live_list {
+            live_list.update(index, &view.accounts[index]);
+        }
+    }
+    if let Some(live_list) = live_list {
+        live_list.finish(&view);
+    } else {
+        ui::print_list(&view, args.json)?;
+    }
 
     if !args.json {
         match live {
@@ -195,10 +250,28 @@ fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_next(store: &mut Store) -> Result<()> {
+fn ready_account_view(
+    profile: &Profile,
+    active: bool,
+    facts: CredentialFacts,
+    quota: QuotaStatus,
+) -> AccountView {
+    AccountView {
+        email: profile.email.clone(),
+        active,
+        plan: facts.plan,
+        access_expires_at: facts.access_expires_at,
+        last_refresh: facts.last_refresh,
+        status: AccountStatus::Ready,
+        quota,
+    }
+}
+
+async fn cmd_next(store: &mut Store) -> Result<()> {
     if store.profiles().is_empty() {
         bail!("no accounts are enrolled; run `kai cred add <email>` first");
     }
+    let quota_client = quota::Client::new(store.paths());
     let live = load_live_strict(store)?;
     let target = match &live {
         None => store.profiles()[0].clone(),
@@ -209,11 +282,48 @@ fn cmd_next(store: &mut Store) -> Result<()> {
                 .clone()
         }
     };
-    if activate(store, &target)? {
+    let quota_request = match &live {
+        Some(credential) if credential.facts.account_id == target.account_id => {
+            quota::Request::from_credential(credential)
+        }
+        _ => store
+            .credential(&target)
+            .and_then(|credential| quota::Request::from_credential(&credential)),
+    };
+    let quota_task = match (quota_client, quota_request) {
+        (Ok(client), Ok(request)) => Ok(tokio::spawn(async move { client.fetch(request).await })),
+        (Err(err), _) | (_, Err(err)) => Err(err),
+    };
+    let changed = match activate(store, &target) {
+        Ok(changed) => changed,
+        Err(err) => {
+            if let Ok(task) = &quota_task {
+                task.abort();
+            }
+            return Err(err);
+        }
+    };
+    if changed {
         capulus::ui::success(&format!("Codex is now using {}.", target.email));
         warn_running_codex();
     } else {
         capulus::ui::success(&format!("{} is the only enrolled account.", target.email));
+    }
+    let quota = match quota_task {
+        Ok(task) => match task.await {
+            Ok(result) => result,
+            Err(err) => Err(anyhow::anyhow!(
+                "quota lookup task stopped unexpectedly: {err}"
+            )),
+        },
+        Err(err) => Err(err),
+    };
+    match quota {
+        Ok(snapshot) => ui::print_quota(&snapshot),
+        Err(err) => capulus::ui::warn(&format!(
+            "Could not retrieve quota for {}: {err:#}",
+            target.email
+        )),
     }
     Ok(())
 }

@@ -29,6 +29,12 @@ kai cred activate personal@example.com
 kai cred remove work@example.com
 ```
 
+`kai cred list` fetches every account's current Codex quota concurrently and shows the remaining
+percentage, reset datetime, and an inline progress bar. On an interactive terminal, each account
+appears immediately with a live loading indicator and is rewritten as its quota arrives. After
+`kai next` or `kai cred next`, Kai reports the newly selected account's quota as soon as the
+in-flight lookup completes.
+
 `kai cred add` runs `codex login` with a temporary, isolated `CODEX_HOME`, verifies that the
 resulting account has the requested email, and then imports its file-backed credential. The
 credential currently used by Codex is not replaced or logged out during enrollment. Use
@@ -40,7 +46,8 @@ This preserves refresh-token changes made by Codex. It then atomically installs 
 credential. Kai never invokes `codex logout`, so switching does not deliberately revoke the
 previous credential.
 
-`kai cred list --json` emits stable, secret-free output for scripts.
+`kai cred list --json` emits stable, secret-free output for scripts, including each quota's
+remaining percentage, reset timestamp, and window length.
 
 ### Vault location and security
 

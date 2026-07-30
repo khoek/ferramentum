@@ -19,16 +19,19 @@ capulus = { workspace = true }
 
 anyhow = { workspace = true }
 base64 = "0.23"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { workspace = true }
 fs2 = "0.4"
 indicatif = { workspace = true }
 libc = { workspace = true }
 pathdiff = "0.2"
 rand = { workspace = true }
+reqwest = { workspace = true, features = ["json", "rustls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "time"] }
 walkdir = "2"
 which = { workspace = true }
 toml = "1"

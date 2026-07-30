@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -83,20 +84,11 @@ fn run_with_binary(
 
 fn write_login_config(paths: &RuntimePaths, temporary_home: &TempDir) -> Result<()> {
     let mut isolated = toml::Table::new();
-    match fs::read_to_string(paths.codex_config()) {
-        Ok(contents) => {
-            let source: toml::Table = toml::from_str(&contents)
-                .with_context(|| format!("could not parse {}", paths.codex_config().display()))?;
-            for key in AUTH_CONFIG_KEYS {
-                if let Some(value) = source.get(*key) {
-                    isolated.insert((*key).to_owned(), value.clone());
-                }
+    if let Some(source) = paths.read_codex_config()? {
+        for key in AUTH_CONFIG_KEYS {
+            if let Some(value) = source.get(*key) {
+                isolated.insert((*key).to_owned(), value.clone());
             }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("could not read {}", paths.codex_config().display()));
         }
     }
     isolated.insert(

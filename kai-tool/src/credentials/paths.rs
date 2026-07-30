@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -34,6 +35,20 @@ impl RuntimePaths {
 
     pub fn codex_config(&self) -> PathBuf {
         self.codex_home.join("config.toml")
+    }
+
+    pub fn read_codex_config(&self) -> Result<Option<toml::Table>> {
+        let path = self.codex_config();
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(err).with_context(|| format!("could not read {}", path.display()));
+            }
+        };
+        toml::from_str(&contents)
+            .with_context(|| format!("could not parse {}", path.display()))
+            .map(Some)
     }
 
     pub fn profiles_dir(&self) -> PathBuf {

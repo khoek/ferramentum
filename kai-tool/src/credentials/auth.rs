@@ -16,6 +16,7 @@ const OPENAI_AUTH_CLAIM: &str = "https://api.openai.com/auth";
 pub struct Credential {
     bytes: Zeroizing<Vec<u8>>,
     pub facts: CredentialFacts,
+    account_is_fedramp: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -74,7 +75,7 @@ impl Credential {
             bail!("credential document exceeds {MAX_AUTH_BYTES} bytes");
         }
         let bytes = Zeroizing::new(bytes);
-        let facts = {
+        let (facts, account_is_fedramp) = {
             let document: AuthDocument<'_> =
                 serde_json::from_slice(&bytes).context("credential document is not valid JSON")?;
             if document.auth_mode != Some("chatgpt") {
@@ -117,24 +118,53 @@ impl Credential {
                 .and_then(Value::as_str)
                 .filter(|plan| !plan.trim().is_empty())
                 .map(str::to_owned);
+            let account_is_fedramp = openai_auth
+                .and_then(|claims| claims.get("chatgpt_account_is_fedramp"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let access_expires_at = jwt_claims(tokens.access_token)
                 .ok()
                 .and_then(|claims| claims.get("exp").and_then(Value::as_i64));
 
-            CredentialFacts {
-                email,
-                account_id,
-                plan,
-                access_expires_at,
-                last_refresh: document.last_refresh.map(str::to_owned),
-            }
+            (
+                CredentialFacts {
+                    email,
+                    account_id,
+                    plan,
+                    access_expires_at,
+                    last_refresh: document.last_refresh.map(str::to_owned),
+                },
+                account_is_fedramp,
+            )
         };
 
-        Ok(Self { bytes, facts })
+        Ok(Self {
+            bytes,
+            facts,
+            account_is_fedramp,
+        })
     }
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub(super) fn access_token(&self) -> Result<Zeroizing<String>> {
+        let document: AuthDocument<'_> =
+            serde_json::from_slice(&self.bytes).context("credential document is not valid JSON")?;
+        let token = document
+            .tokens
+            .context("credential document has no ChatGPT token set")?
+            .access_token
+            .trim();
+        if token.is_empty() {
+            bail!("credential document has an empty access token");
+        }
+        Ok(Zeroizing::new(token.to_owned()))
+    }
+
+    pub(super) fn account_is_fedramp(&self) -> bool {
+        self.account_is_fedramp
     }
 
     pub fn matches_email(&self, email: &str) -> bool {
