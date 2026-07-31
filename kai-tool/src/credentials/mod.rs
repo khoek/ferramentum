@@ -225,7 +225,7 @@ async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
         }
     }
     if let Some(live_list) = live_list {
-        live_list.finish(&view);
+        live_list.finish(&view)?;
     } else {
         ui::print_list(&view, args.json)?;
     }
