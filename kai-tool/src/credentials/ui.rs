@@ -10,6 +10,7 @@ use serde::Serialize;
 use super::quota;
 
 const FIELD_SEPARATOR: &str = " · ";
+const ACTIVE_LABEL: &str = "active";
 const QUOTA_BAR_SEGMENTS: usize = 16;
 
 #[derive(Debug, Serialize)]
@@ -213,10 +214,11 @@ fn render_account_base(
         (_, true) => ("●", Color::Green),
         _ => ("○", Color::Cyan),
     };
-    let mut fields = Vec::new();
-    if account.active {
-        fields.push(target.paint("active", Color::Green));
-    }
+    let mut fields = vec![if account.active {
+        target.paint(ACTIVE_LABEL, Color::Green)
+    } else {
+        " ".repeat(ACTIVE_LABEL.len())
+    }];
     if let Some(plan) = &account.plan {
         fields.push(plan.to_ascii_uppercase());
     }
@@ -387,6 +389,30 @@ mod tests {
     fn quota_bar_clamps_backend_percentages() {
         assert_eq!(render_quota_bar(-5.0, &PlainTarget), "░░░░░░░░░░░░░░░░");
         assert_eq!(render_quota_bar(105.0, &PlainTarget), "████████████████");
+    }
+
+    #[test]
+    fn inactive_accounts_reserve_the_active_column() {
+        let account = |email: &str, active| AccountView {
+            email: email.to_owned(),
+            active,
+            plan: Some("pro".to_owned()),
+            access_expires_at: None,
+            last_refresh: None,
+            status: AccountStatus::Ready,
+            quota: QuotaStatus::Loading,
+        };
+        let inactive = account("one@example.com", false);
+        let active = account("two@example.com", true);
+
+        assert_eq!(
+            render_account_base(&inactive, inactive.email.len(), &PlainTarget),
+            "○ one@example.com ·        · PRO"
+        );
+        assert_eq!(
+            render_account_base(&active, active.email.len(), &PlainTarget),
+            "● two@example.com · active · PRO"
+        );
     }
 
     #[test]
