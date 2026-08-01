@@ -22,7 +22,11 @@ kai cred list
 kai next
 ```
 
-`kai next` is shorthand for `kai cred next`. You can also select or remove an account explicitly:
+`kai next` is shorthand for `kai cred next`. It checks candidate accounts concurrently in cyclic
+enrollment order, skips accounts whose quota is exhausted, and activates the first account with
+confirmed remaining quota. If the quota service is unavailable, it falls back to the first account
+whose quota could not be checked rather than treating a transient lookup failure as exhaustion. You
+can also select or remove an account explicitly:
 
 ```bash
 kai cred activate personal@example.com
@@ -37,9 +41,15 @@ in-flight lookup completes.
 
 `kai cred add` runs `codex login` with a temporary, isolated `CODEX_HOME`, verifies that the
 resulting account has the requested email, and then imports its file-backed credential. The
-credential currently used by Codex is not replaced or logged out during enrollment. Use
-`--device-auth` for Codex's device-code flow and `--activate` to switch immediately after adding an
-account.
+credential currently used by Codex is not replaced or logged out during enrollment. Kai selects
+Codex's device-code flow automatically for SSH sessions, CI, and Linux sessions without a graphical
+display. A configured `$BROWSER` relay and WSL browser interop retain the browser flow. Use
+`--browser-auth` or `--device-auth` to force either behavior.
+
+The first enrolled account is activated automatically. When another managed account is already
+active, Kai normally leaves it in place; if that account has zero remaining quota, adding a new
+account activates the new one automatically. A quota lookup failure is non-fatal and leaves the
+current account active. Use `--activate` to switch immediately regardless of its quota.
 
 Before every switch, Kai copies the live `auth.json` back into the active account's vault entry.
 This preserves refresh-token changes made by Codex. It then atomically installs the selected

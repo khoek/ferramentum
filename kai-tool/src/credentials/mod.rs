@@ -1,6 +1,6 @@
 use std::fs;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 
 mod auth;
@@ -38,7 +38,7 @@ pub enum CredCommand {
     )]
     List(ListArgs),
 
-    #[command(about = "Activate the next enrolled account and show its live quota.")]
+    #[command(about = "Activate the next enrolled account with remaining quota.")]
     Next,
 
     #[command(about = "Activate an enrolled account.")]
@@ -48,7 +48,11 @@ pub enum CredCommand {
         about = "Enroll an account through an isolated Codex login.",
         long_about = concat!(
             "Enroll an account through an isolated Codex login. If Codex is already using this ",
-            "email, Kai imports the current credential without opening a browser.",
+            "email, Kai imports the current credential without opening a browser. Kai ",
+            "automatically uses device-code authentication in SSH, CI, and headless Linux ",
+            "sessions; use --browser-auth or --device-auth to override detection. The new ",
+            "account is activated when no account is active or the managed active account has ",
+            "no remaining quota.",
         )
     )]
     Add(AddArgs),
@@ -77,11 +81,15 @@ pub struct AddArgs {
     #[arg(value_name = "EMAIL")]
     pub email: String,
 
-    /// Use Codex's device-code authentication flow.
-    #[arg(long)]
+    /// Force Codex's device-code authentication flow.
+    #[arg(long, conflicts_with = "browser_auth")]
     pub device_auth: bool,
 
-    /// Activate the account after enrollment even if another account is active.
+    /// Use Codex's browser authentication flow, overriding environment detection.
+    #[arg(long, conflicts_with = "device_auth")]
+    pub browser_auth: bool,
+
+    /// Activate after enrollment even if the current account has remaining quota.
     #[arg(long)]
     pub activate: bool,
 }
@@ -103,6 +111,13 @@ enum LiveAuth {
     Invalid(anyhow::Error),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuotaAvailability {
+    Remaining,
+    Exhausted,
+    Unknown,
+}
+
 pub fn run(command: CredCommand) -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -120,7 +135,7 @@ async fn run_async(command: CredCommand) -> Result<()> {
         CredCommand::List(args) => cmd_list(&store, args).await,
         CredCommand::Next => cmd_next(&mut store).await,
         CredCommand::Activate(args) => cmd_activate(&mut store, &args.email),
-        CredCommand::Add(args) => cmd_add(&mut store, args),
+        CredCommand::Add(args) => cmd_add(&mut store, args).await,
         CredCommand::Remove(args) => cmd_remove(&mut store, args),
     }
 }
@@ -132,6 +147,13 @@ async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
         _ => None,
     };
     let active_id = active_profile.map(|profile| profile.id.as_str());
+    let active_index = active_profile.and_then(|active| {
+        store
+            .profiles()
+            .iter()
+            .position(|profile| profile.id == active.id)
+    });
+    let can_select_next = matches!(&live, LiveAuth::Absent) || active_profile.is_some();
     let quota_client = quota::Client::new(store.paths()).map_err(|err| format!("{err:#}"));
     let mut quota_tasks = tokio::task::JoinSet::new();
     let mut accounts = Vec::with_capacity(store.profiles().len());
@@ -200,16 +222,10 @@ async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
         }
         accounts.push(account);
     }
-    let next = match (&live, active_profile) {
-        (LiveAuth::Absent, _) => store.profiles().first(),
-        (LiveAuth::Present(_), Some(active)) => next_profile(store, Some(active)),
-        _ => None,
-    }
-    .map(|profile| profile.email.clone());
     let active = active_profile.map(|profile| profile.email.clone());
     let mut view = ListView {
         active,
-        next,
+        next: None,
         accounts,
     };
     let live_list = if args.json {
@@ -223,6 +239,16 @@ async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
         if let Some(live_list) = &live_list {
             live_list.update(index, &view.accounts[index]);
         }
+    }
+    if can_select_next {
+        let order = rotation_order(store.profiles().len(), active_index);
+        view.next = preferred_rotation_index(order.iter().copied().map(|index| {
+            (
+                index,
+                quota_status_availability(&view.accounts[index].quota),
+            )
+        }))
+        .map(|index| store.profiles()[index].email.clone());
     }
     if let Some(live_list) = live_list {
         live_list.finish(&view)?;
@@ -271,53 +297,46 @@ async fn cmd_next(store: &mut Store) -> Result<()> {
     if store.profiles().is_empty() {
         bail!("no accounts are enrolled; run `kai cred add <email>` first");
     }
-    let quota_client = quota::Client::new(store.paths());
     let live = load_live_strict(store)?;
-    let target = match &live {
-        None => store.profiles()[0].clone(),
+    let active_index = match &live {
+        None => None,
         Some(credential) => {
             let active = require_managed_profile(store, credential)?;
-            next_profile(store, Some(active))
-                .context("no enrolled account is available")?
-                .clone()
+            Some(
+                store
+                    .profiles()
+                    .iter()
+                    .position(|profile| profile.id == active.id)
+                    .context("active profile disappeared while selecting the next account")?,
+            )
         }
     };
-    let quota_request = match &live {
-        Some(credential) if credential.facts.account_id == target.account_id => {
-            quota::Request::from_credential(credential)
+    let order = rotation_order(store.profiles().len(), active_index);
+    capulus::ui::stage("Checking enrolled account quotas");
+    let checks = fetch_profile_quotas(store, &order, live.as_ref()).await?;
+    let target_index = preferred_rotation_index(
+        checks
+            .iter()
+            .map(|(index, result)| (*index, quota_result_availability(result))),
+    );
+    let Some(target_index) = target_index else {
+        if active_index.is_some() && store.profiles().len() > 1 {
+            bail!("no other enrolled account has remaining Codex quota");
         }
-        _ => store
-            .credential(&target)
-            .and_then(|credential| quota::Request::from_credential(&credential)),
+        bail!("no enrolled account has remaining Codex quota");
     };
-    let quota_task = match (quota_client, quota_request) {
-        (Ok(client), Ok(request)) => Ok(tokio::spawn(async move { client.fetch(request).await })),
-        (Err(err), _) | (_, Err(err)) => Err(err),
-    };
-    let changed = match activate(store, &target) {
-        Ok(changed) => changed,
-        Err(err) => {
-            if let Ok(task) = &quota_task {
-                task.abort();
-            }
-            return Err(err);
-        }
-    };
+    let target = store.profiles()[target_index].clone();
+    let quota = checks
+        .into_iter()
+        .find_map(|(index, result)| (index == target_index).then_some(result))
+        .context("selected account quota result disappeared")?;
+    let changed = activate(store, &target)?;
     if changed {
         capulus::ui::success(&format!("Codex is now using {}.", target.email));
         warn_running_codex();
     } else {
         capulus::ui::success(&format!("{} is the only enrolled account.", target.email));
     }
-    let quota = match quota_task {
-        Ok(task) => match task.await {
-            Ok(result) => result,
-            Err(err) => Err(anyhow::anyhow!(
-                "quota lookup task stopped unexpectedly: {err}"
-            )),
-        },
-        Err(err) => Err(err),
-    };
     match quota {
         Ok(snapshot) => ui::print_quota(&snapshot),
         Err(err) => capulus::ui::warn(&format!(
@@ -326,6 +345,103 @@ async fn cmd_next(store: &mut Store) -> Result<()> {
         )),
     }
     Ok(())
+}
+
+async fn fetch_profile_quotas(
+    store: &Store,
+    profile_indices: &[usize],
+    live: Option<&Credential>,
+) -> Result<Vec<(usize, Result<quota::Snapshot>)>> {
+    let client = match quota::Client::new(store.paths()) {
+        Ok(client) => client,
+        Err(err) => {
+            let message = format!("{err:#}");
+            return Ok(profile_indices
+                .iter()
+                .map(|index| (*index, Err(anyhow!(message.clone()))))
+                .collect());
+        }
+    };
+    let mut results = std::iter::repeat_with(|| None)
+        .take(profile_indices.len())
+        .collect::<Vec<Option<Result<quota::Snapshot>>>>();
+    let mut tasks = tokio::task::JoinSet::new();
+    for (slot, index) in profile_indices.iter().copied().enumerate() {
+        let profile = &store.profiles()[index];
+        let request = match live {
+            Some(credential) if credential.facts.account_id == profile.account_id => {
+                quota::Request::from_credential(credential)
+            }
+            _ => store
+                .credential(profile)
+                .and_then(|credential| quota::Request::from_credential(&credential)),
+        };
+        match request {
+            Ok(request) => {
+                let client = client.clone();
+                tasks.spawn(async move { (slot, client.fetch(request).await) });
+            }
+            Err(err) => results[slot] = Some(Err(err)),
+        }
+    }
+    while let Some(result) = tasks.join_next().await {
+        let (slot, quota) = result.context("a quota lookup task stopped unexpectedly")?;
+        results[slot] = Some(quota);
+    }
+    Ok(profile_indices
+        .iter()
+        .copied()
+        .zip(results.into_iter().map(|result| {
+            result.expect("every quota result is set directly or by a completed task")
+        }))
+        .collect())
+}
+
+fn rotation_order(profile_count: usize, active_index: Option<usize>) -> Vec<usize> {
+    if profile_count == 0 {
+        return Vec::new();
+    }
+    match active_index {
+        None => (0..profile_count).collect(),
+        Some(active_index) if profile_count == 1 => vec![active_index],
+        Some(active_index) => (1..profile_count)
+            .map(|offset| (active_index + offset) % profile_count)
+            .collect(),
+    }
+}
+
+fn preferred_rotation_index(
+    candidates: impl IntoIterator<Item = (usize, QuotaAvailability)>,
+) -> Option<usize> {
+    let mut first_unknown = None;
+    for (index, availability) in candidates {
+        match availability {
+            QuotaAvailability::Remaining => return Some(index),
+            QuotaAvailability::Unknown => {
+                first_unknown.get_or_insert(index);
+            }
+            QuotaAvailability::Exhausted => {}
+        }
+    }
+    first_unknown
+}
+
+fn quota_result_availability(result: &Result<quota::Snapshot>) -> QuotaAvailability {
+    match result {
+        Ok(snapshot) if snapshot.remaining_percent > 0.0 => QuotaAvailability::Remaining,
+        Ok(_) => QuotaAvailability::Exhausted,
+        Err(_) => QuotaAvailability::Unknown,
+    }
+}
+
+fn quota_status_availability(status: &QuotaStatus) -> QuotaAvailability {
+    match status {
+        QuotaStatus::Available { snapshot } if snapshot.remaining_percent > 0.0 => {
+            QuotaAvailability::Remaining
+        }
+        QuotaStatus::Available { .. } => QuotaAvailability::Exhausted,
+        QuotaStatus::Loading | QuotaStatus::Unavailable { .. } => QuotaAvailability::Unknown,
+    }
 }
 
 fn cmd_activate(store: &mut Store, email: &str) -> Result<()> {
@@ -344,7 +460,7 @@ fn cmd_activate(store: &mut Store, email: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_add(store: &mut Store, args: AddArgs) -> Result<()> {
+async fn cmd_add(store: &mut Store, args: AddArgs) -> Result<()> {
     let expected = args.email.trim();
     validate_email(expected)?;
     if store.find_profile(expected).is_some() {
@@ -363,15 +479,67 @@ fn cmd_add(store: &mut Store, args: AddArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Only a currently managed account may be replaced automatically. Capture this before
+    // inserting the new profile so enrollment cannot make an unrelated live credential appear
+    // managed merely because it happens to share an account ID.
+    let managed_account_before_add = match &live {
+        LiveAuth::Present(credential) if managed_profile(store, credential).is_some() => {
+            Some(credential.facts.account_id.clone())
+        }
+        _ => None,
+    };
+
     if args.activate {
         ensure_live_can_be_replaced(store, &live)?;
     }
-    let credential = enroll::run(store.paths(), expected, args.device_auth)?;
+    let auth_preference = if args.device_auth {
+        enroll::AuthPreference::Device
+    } else if args.browser_auth {
+        enroll::AuthPreference::Browser
+    } else {
+        enroll::AuthPreference::Auto
+    };
+    let credential = enroll::run(store.paths(), expected, auth_preference)?;
     let profile = store.insert_profile(&credential)?;
-    let activate_after_add = args.activate || matches!(live, LiveAuth::Absent);
+    let active_for_quota = if !args.activate {
+        match (managed_account_before_add.as_deref(), load_live(store)) {
+            (Some(expected_account_id), LiveAuth::Present(active))
+                if active.facts.account_id == expected_account_id =>
+            {
+                Some(active)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let exhausted_active = if let Some(active) = active_for_quota {
+        match fetch_credential_quota(store, &active).await {
+            Ok(snapshot) if snapshot.remaining_percent <= 0.0 => Some(active.facts.email.clone()),
+            Ok(_) => None,
+            Err(err) => {
+                capulus::ui::warn(&format!(
+                    "Could not check whether {} has remaining quota; leaving it active: {err:#}",
+                    active.facts.email
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let activate_after_add =
+        args.activate || matches!(&live, LiveAuth::Absent) || exhausted_active.is_some();
     if activate_after_add {
         activate(store, &profile)?;
-        capulus::ui::success(&format!("Enrolled and activated {}.", profile.email));
+        if let Some(active_email) = exhausted_active {
+            capulus::ui::success(&format!(
+                "Enrolled and activated {} because {} has no remaining quota.",
+                profile.email, active_email
+            ));
+        } else {
+            capulus::ui::success(&format!("Enrolled and activated {}.", profile.email));
+        }
         warn_running_codex();
     } else {
         capulus::ui::success(&format!("Enrolled {}.", profile.email));
@@ -397,6 +565,12 @@ fn cmd_add(store: &mut Store, args: AddArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn fetch_credential_quota(store: &Store, credential: &Credential) -> Result<quota::Snapshot> {
+    let client = quota::Client::new(store.paths())?;
+    let request = quota::Request::from_credential(credential)?;
+    client.fetch(request).await
 }
 
 fn cmd_remove(store: &mut Store, args: RemoveArgs) -> Result<()> {
@@ -542,20 +716,6 @@ fn ensure_live_can_be_replaced(store: &Store, live: &LiveAuth) -> Result<()> {
     }
 }
 
-fn next_profile<'a>(store: &'a Store, active: Option<&Profile>) -> Option<&'a Profile> {
-    if store.profiles().is_empty() {
-        return None;
-    }
-    let Some(active) = active else {
-        return store.profiles().first();
-    };
-    let index = store
-        .profiles()
-        .iter()
-        .position(|profile| profile.id == active.id)?;
-    store.profiles().get((index + 1) % store.profiles().len())
-}
-
 fn next_profile_excluding<'a>(store: &'a Store, removed: &Profile) -> Option<&'a Profile> {
     if store.profiles().len() <= 1 {
         return None;
@@ -680,6 +840,51 @@ mod tests {
                 .facts
                 .account_id,
             "outside-id"
+        );
+    }
+
+    #[test]
+    fn rotation_order_starts_after_the_active_account_and_wraps() {
+        assert_eq!(rotation_order(0, None), Vec::<usize>::new());
+        assert_eq!(rotation_order(3, None), vec![0, 1, 2]);
+        assert_eq!(rotation_order(3, Some(1)), vec![2, 0]);
+        assert_eq!(rotation_order(1, Some(0)), vec![0]);
+    }
+
+    #[test]
+    fn rotation_skips_exhausted_accounts_and_prefers_confirmed_capacity() {
+        assert_eq!(
+            preferred_rotation_index([
+                (1, QuotaAvailability::Exhausted),
+                (2, QuotaAvailability::Remaining),
+            ]),
+            Some(2)
+        );
+        assert_eq!(
+            preferred_rotation_index([
+                (1, QuotaAvailability::Unknown),
+                (2, QuotaAvailability::Remaining),
+            ]),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn rotation_falls_back_to_unknown_quota_but_never_to_known_exhaustion() {
+        assert_eq!(
+            preferred_rotation_index([
+                (1, QuotaAvailability::Exhausted),
+                (2, QuotaAvailability::Unknown),
+                (3, QuotaAvailability::Unknown),
+            ]),
+            Some(2)
+        );
+        assert_eq!(
+            preferred_rotation_index([
+                (1, QuotaAvailability::Exhausted),
+                (2, QuotaAvailability::Exhausted),
+            ]),
+            None
         );
     }
 

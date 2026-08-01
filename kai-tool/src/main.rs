@@ -83,7 +83,7 @@ enum Commands {
 
     #[command(
         name = "next",
-        about = "Activate the next enrolled Codex account and show its live quota.",
+        about = "Activate the next enrolled Codex account with remaining quota.",
         after_help = "Shorthand for `kai cred next`."
     )]
     Next,

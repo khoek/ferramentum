@@ -1,3 +1,4 @@
+use std::env;
 #[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
@@ -18,17 +19,46 @@ const AUTH_CONFIG_KEYS: &[&str] = &[
     "forced_login_method",
 ];
 
-pub fn run(paths: &RuntimePaths, expected_email: &str, device_auth: bool) -> Result<Credential> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthPreference {
+    Auto,
+    Browser,
+    Device,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedAuth {
+    Browser,
+    Device {
+        automatic_reason: Option<&'static str>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LoginEnvironment {
+    browser_relay: bool,
+    ssh: bool,
+    ci: bool,
+    linux_without_display: bool,
+    wsl_browser_interop: bool,
+}
+
+pub fn run(
+    paths: &RuntimePaths,
+    expected_email: &str,
+    preference: AuthPreference,
+) -> Result<Credential> {
     let codex = which::which("codex").context("could not find `codex` on PATH")?;
-    run_with_binary(paths, expected_email, device_auth, &codex)
+    run_with_binary(paths, expected_email, preference, &codex)
 }
 
 fn run_with_binary(
     paths: &RuntimePaths,
     expected_email: &str,
-    device_auth: bool,
+    preference: AuthPreference,
     codex: &Path,
 ) -> Result<Credential> {
+    let auth = resolve_auth(preference, LoginEnvironment::current());
     let temporary_home = Builder::new()
         .prefix(".enroll-")
         .tempdir_in(&paths.credentials_home)
@@ -39,6 +69,14 @@ fn run_with_binary(
     capulus::ui::stage(&format!(
         "Starting isolated Codex sign-in for {expected_email}"
     ));
+    if let ResolvedAuth::Device {
+        automatic_reason: Some(reason),
+    } = auth
+    {
+        capulus::ui::detail(&format!(
+            "Using device-code authentication ({reason}); use `--browser-auth` to override."
+        ));
+    }
     capulus::ui::detail(
         "The account currently active in Codex will not be logged out or replaced.",
     );
@@ -53,7 +91,7 @@ fn run_with_binary(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    if device_auth {
+    if matches!(auth, ResolvedAuth::Device { .. }) {
         command.arg("--device-auth");
     }
 
@@ -80,6 +118,82 @@ fn run_with_binary(
         );
     }
     Ok(credential)
+}
+
+impl LoginEnvironment {
+    fn current() -> Self {
+        Self {
+            browser_relay: browser_relay_configured(),
+            ssh: ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
+                .into_iter()
+                .any(env_var_nonempty),
+            ci: env_var_nonempty("CI"),
+            linux_without_display: linux_without_display(),
+            wsl_browser_interop: wsl_browser_interop_available(),
+        }
+    }
+}
+
+fn resolve_auth(preference: AuthPreference, environment: LoginEnvironment) -> ResolvedAuth {
+    match preference {
+        AuthPreference::Browser => ResolvedAuth::Browser,
+        AuthPreference::Device => ResolvedAuth::Device {
+            automatic_reason: None,
+        },
+        AuthPreference::Auto if environment.browser_relay => ResolvedAuth::Browser,
+        AuthPreference::Auto if environment.ssh => ResolvedAuth::Device {
+            automatic_reason: Some("SSH session detected"),
+        },
+        AuthPreference::Auto if environment.ci => ResolvedAuth::Device {
+            automatic_reason: Some("CI environment detected"),
+        },
+        AuthPreference::Auto
+            if environment.linux_without_display && !environment.wsl_browser_interop =>
+        {
+            ResolvedAuth::Device {
+                automatic_reason: Some("no graphical display detected"),
+            }
+        }
+        AuthPreference::Auto => ResolvedAuth::Browser,
+    }
+}
+
+fn env_var_nonempty(key: &str) -> bool {
+    env::var_os(key).is_some_and(|value| !value.to_string_lossy().trim().is_empty())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn browser_relay_configured() -> bool {
+    env_var_nonempty("BROWSER")
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn browser_relay_configured() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn linux_without_display() -> bool {
+    !env_var_nonempty("DISPLAY") && !env_var_nonempty("WAYLAND_DISPLAY")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_without_display() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn wsl_browser_interop_available() -> bool {
+    if env_var_nonempty("WSL_INTEROP") {
+        return true;
+    }
+    fs::read_to_string("/proc/sys/fs/binfmt_misc/WSLInterop")
+        .is_ok_and(|contents| contents.contains("enabled"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn wsl_browser_interop_available() -> bool {
+    false
 }
 
 fn write_login_config(paths: &RuntimePaths, temporary_home: &TempDir) -> Result<()> {
@@ -158,9 +272,85 @@ mod tests {
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let credential = run_with_binary(&paths, "new@example.com", false, &script).unwrap();
+        let credential =
+            run_with_binary(&paths, "new@example.com", AuthPreference::Browser, &script).unwrap();
 
         assert_eq!(credential.facts.email, "new@example.com");
         assert_eq!(fs::read(paths.active_auth()).unwrap(), original);
+    }
+
+    #[test]
+    fn auth_preferences_override_environment_detection() {
+        let headless_ssh = LoginEnvironment {
+            ssh: true,
+            linux_without_display: true,
+            ..LoginEnvironment::default()
+        };
+
+        assert_eq!(
+            resolve_auth(AuthPreference::Browser, headless_ssh),
+            ResolvedAuth::Browser
+        );
+        assert_eq!(
+            resolve_auth(AuthPreference::Device, LoginEnvironment::default()),
+            ResolvedAuth::Device {
+                automatic_reason: None
+            }
+        );
+    }
+
+    #[test]
+    fn auto_auth_prefers_configured_browser_relays() {
+        let environment = LoginEnvironment {
+            browser_relay: true,
+            ssh: true,
+            ci: true,
+            linux_without_display: true,
+            ..LoginEnvironment::default()
+        };
+
+        assert_eq!(
+            resolve_auth(AuthPreference::Auto, environment),
+            ResolvedAuth::Browser
+        );
+    }
+
+    #[test]
+    fn auto_auth_uses_device_code_for_remote_and_headless_environments() {
+        for environment in [
+            LoginEnvironment {
+                ssh: true,
+                ..LoginEnvironment::default()
+            },
+            LoginEnvironment {
+                ci: true,
+                ..LoginEnvironment::default()
+            },
+            LoginEnvironment {
+                linux_without_display: true,
+                ..LoginEnvironment::default()
+            },
+        ] {
+            assert!(matches!(
+                resolve_auth(AuthPreference::Auto, environment),
+                ResolvedAuth::Device {
+                    automatic_reason: Some(_)
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn auto_auth_keeps_browser_flow_for_local_wsl_interop() {
+        let environment = LoginEnvironment {
+            linux_without_display: true,
+            wsl_browser_interop: true,
+            ..LoginEnvironment::default()
+        };
+
+        assert_eq!(
+            resolve_auth(AuthPreference::Auto, environment),
+            ResolvedAuth::Browser
+        );
     }
 }

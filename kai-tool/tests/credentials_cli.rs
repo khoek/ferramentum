@@ -25,15 +25,34 @@ struct MockQuotaServer {
 
 impl MockQuotaServer {
     fn start(expected_requests: usize, response_delay: Duration) -> Self {
+        Self::start_with_quotas(
+            expected_requests,
+            response_delay,
+            &[("alice-id", 25.0), ("bob-id", 80.0)],
+        )
+    }
+
+    fn start_with_quotas(
+        expected_requests: usize,
+        response_delay: Duration,
+        quotas: &[(&str, f64)],
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}/backend-api", listener.local_addr().unwrap());
         let arrivals = Arc::new(Mutex::new(Vec::with_capacity(expected_requests)));
         let server_arrivals = arrivals.clone();
+        let quotas = Arc::new(
+            quotas
+                .iter()
+                .map(|(account_id, used_percent)| (account_id.to_ascii_lowercase(), *used_percent))
+                .collect::<Vec<_>>(),
+        );
         let thread = thread::spawn(move || {
             let mut handlers = Vec::with_capacity(expected_requests);
             for _ in 0..expected_requests {
                 let (mut stream, _) = listener.accept().unwrap();
                 let arrivals = server_arrivals.clone();
+                let quotas = quotas.clone();
                 handlers.push(thread::spawn(move || {
                     let mut request = Vec::new();
                     let mut buffer = [0; 1024];
@@ -46,13 +65,16 @@ impl MockQuotaServer {
                     let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
                     assert!(request.starts_with("get /backend-api/wham/usage "));
                     assert!(request.contains("\r\nauthorization: bearer "));
-                    let used_percent = if request.contains("chatgpt-account-id: alice-id") {
-                        25
-                    } else if request.contains("chatgpt-account-id: bob-id") {
-                        80
-                    } else {
-                        panic!("request did not contain an expected account ID:\n{request}");
-                    };
+                    let used_percent = quotas
+                        .iter()
+                        .find_map(|(account_id, used_percent)| {
+                            request
+                                .contains(&format!("chatgpt-account-id: {account_id}"))
+                                .then_some(*used_percent)
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("request did not contain an expected account ID:\n{request}")
+                        });
                     thread::sleep(response_delay);
                     let body = json!({
                         "plan_type": "pro",
@@ -140,26 +162,31 @@ fn profile_id(email: &str) -> String {
 }
 
 fn seed_accounts(credentials_home: &Path, codex_home: &Path, quota_base_url: &str) {
+    seed_account_set(
+        credentials_home,
+        codex_home,
+        quota_base_url,
+        &[
+            ("alice@example.com", "alice-id", "alice-refresh"),
+            ("bob@example.com", "bob-id", "bob-refresh"),
+        ],
+        Some(("alice@example.com", "alice-id", "alice-live")),
+    );
+}
+
+fn seed_account_set(
+    credentials_home: &Path,
+    codex_home: &Path,
+    quota_base_url: &str,
+    accounts: &[(&str, &str, &str)],
+    active: Option<(&str, &str, &str)>,
+) {
     let profiles_dir = credentials_home.join("profiles");
     fs::create_dir_all(&profiles_dir).unwrap();
     fs::create_dir_all(codex_home).unwrap();
-    let accounts = [
-        (
-            "alice@example.com",
-            "alice-id",
-            "alice-refresh",
-            profile_id("alice@example.com"),
-        ),
-        (
-            "bob@example.com",
-            "bob-id",
-            "bob-refresh",
-            profile_id("bob@example.com"),
-        ),
-    ];
-    for (email, account_id, refresh_token, id) in &accounts {
+    for (email, account_id, refresh_token) in accounts {
         fs::write(
-            profiles_dir.join(format!("{id}.json")),
+            profiles_dir.join(format!("{}.json", profile_id(email))),
             auth_json(email, account_id, refresh_token),
         )
         .unwrap();
@@ -171,8 +198,8 @@ fn seed_accounts(credentials_home: &Path, codex_home: &Path, quota_base_url: &st
             "codex_home": codex_home,
             "profiles": accounts
                 .iter()
-                .map(|(email, account_id, _, id)| json!({
-                    "id": id,
+                .map(|(email, account_id, _)| json!({
+                    "id": profile_id(email),
                     "email": email,
                     "account_id": account_id,
                     "enrolled_at": 0
@@ -182,16 +209,45 @@ fn seed_accounts(credentials_home: &Path, codex_home: &Path, quota_base_url: &st
         .unwrap(),
     )
     .unwrap();
-    fs::write(
-        codex_home.join("auth.json"),
-        auth_json("alice@example.com", "alice-id", "alice-live"),
-    )
-    .unwrap();
+    if let Some((email, account_id, refresh_token)) = active {
+        fs::write(
+            codex_home.join("auth.json"),
+            auth_json(email, account_id, refresh_token),
+        )
+        .unwrap();
+    }
     fs::write(
         codex_home.join("config.toml"),
         format!("chatgpt_base_url = {quota_base_url:?}\n"),
     )
     .unwrap();
+}
+
+#[cfg(unix)]
+fn fake_codex_path(root: &Path, credential: &Path) -> std::ffi::OsString {
+    let fake_bin = root.join("bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let fake_codex = fake_bin.join("codex");
+    fs::write(
+        &fake_codex,
+        concat!(
+            "#!/bin/sh\n",
+            "printf '%s\\n' \"$@\" > \"$KAI_TEST_ARGS\"\n",
+            "cp \"$KAI_TEST_CREDENTIAL\" \"$CODEX_HOME/auth.json\"\n",
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = env::join_paths(
+        std::iter::once(fake_bin).chain(env::split_paths(&env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    fs::write(
+        credential,
+        auth_json("bob@example.com", "bob-id", "bob-refresh"),
+    )
+    .unwrap();
+    path
 }
 
 #[test]
@@ -229,6 +285,80 @@ fn help_orders_commands_logically_and_exposes_the_account_workflow() {
         .stdout(predicate::str::contains("add"))
         .stdout(predicate::str::contains("next"))
         .stdout(predicate::str::contains("activate"));
+
+    Command::cargo_bin("kai")
+        .unwrap()
+        .args([
+            "cred",
+            "add",
+            "person@example.com",
+            "--device-auth",
+            "--browser-auth",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "cannot be used with '--browser-auth'",
+        ));
+}
+
+#[cfg(unix)]
+#[test]
+fn add_automatically_uses_device_auth_over_ssh() {
+    let root = tempdir().unwrap();
+    let credentials_home = root.path().join("credentials");
+    let codex_home = root.path().join("codex");
+    let runtime_dir = root.path().join("runtime");
+    let enrolled_path = root.path().join("bob.json");
+    let args_path = root.path().join("codex-args");
+    let path = fake_codex_path(root.path(), &enrolled_path);
+
+    command(&credentials_home, &codex_home, &runtime_dir)
+        .env("PATH", path)
+        .env("KAI_TEST_CREDENTIAL", &enrolled_path)
+        .env("KAI_TEST_ARGS", &args_path)
+        .env("SSH_CONNECTION", "192.0.2.1 1234 192.0.2.2 22")
+        .env_remove("BROWSER")
+        .env_remove("CI")
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .args(["cred", "add", "bob@example.com"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Using device-code authentication (SSH session detected)",
+        ));
+
+    let args = fs::read_to_string(args_path).unwrap();
+    assert!(args.lines().any(|arg| arg == "--device-auth"));
+}
+
+#[cfg(unix)]
+#[test]
+fn browser_auth_explicitly_overrides_remote_environment_detection() {
+    let root = tempdir().unwrap();
+    let credentials_home = root.path().join("credentials");
+    let codex_home = root.path().join("codex");
+    let runtime_dir = root.path().join("runtime");
+    let enrolled_path = root.path().join("bob.json");
+    let args_path = root.path().join("codex-args");
+    let path = fake_codex_path(root.path(), &enrolled_path);
+
+    command(&credentials_home, &codex_home, &runtime_dir)
+        .env("PATH", path)
+        .env("KAI_TEST_CREDENTIAL", &enrolled_path)
+        .env("KAI_TEST_ARGS", &args_path)
+        .env("SSH_CONNECTION", "192.0.2.1 1234 192.0.2.2 22")
+        .env_remove("BROWSER")
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .args(["cred", "add", "bob@example.com", "--browser-auth"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Using device-code authentication").not());
+
+    let args = fs::read_to_string(args_path).unwrap();
+    assert!(!args.lines().any(|arg| arg == "--device-auth"));
 }
 
 #[test]
@@ -319,6 +449,125 @@ fn next_alias_reports_the_activated_accounts_quota() {
     );
 }
 
+#[test]
+fn next_skips_exhausted_accounts_in_cyclic_order() {
+    let root = tempdir().unwrap();
+    let credentials_home = root.path().join("credentials");
+    let codex_home = root.path().join("codex");
+    let runtime_dir = root.path().join("runtime");
+    let server = MockQuotaServer::start_with_quotas(
+        2,
+        Duration::from_millis(300),
+        &[("bob-id", 100.0), ("carol-id", 40.0)],
+    );
+    seed_account_set(
+        &credentials_home,
+        &codex_home,
+        &server.base_url,
+        &[
+            ("alice@example.com", "alice-id", "alice-refresh"),
+            ("bob@example.com", "bob-id", "bob-refresh"),
+            ("carol@example.com", "carol-id", "carol-refresh"),
+        ],
+        Some(("alice@example.com", "alice-id", "alice-live")),
+    );
+
+    command(&credentials_home, &codex_home, &runtime_dir)
+        .arg("next")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Codex is now using carol@example.com",
+        ))
+        .stderr(predicate::str::contains("60% remaining"));
+    assert_eq!(
+        fs::read(codex_home.join("auth.json")).unwrap(),
+        auth_json("carol@example.com", "carol-id", "carol-refresh")
+    );
+
+    let mut arrivals = server.finish();
+    arrivals.sort_unstable();
+    assert_eq!(arrivals.len(), 2);
+    assert!(
+        arrivals[1].duration_since(arrivals[0]) < Duration::from_millis(200),
+        "candidate quota requests were not started concurrently"
+    );
+}
+
+#[test]
+fn next_does_not_switch_when_every_candidate_is_exhausted() {
+    let root = tempdir().unwrap();
+    let credentials_home = root.path().join("credentials");
+    let codex_home = root.path().join("codex");
+    let runtime_dir = root.path().join("runtime");
+    let server = MockQuotaServer::start_with_quotas(
+        2,
+        Duration::ZERO,
+        &[("bob-id", 100.0), ("carol-id", 100.0)],
+    );
+    seed_account_set(
+        &credentials_home,
+        &codex_home,
+        &server.base_url,
+        &[
+            ("alice@example.com", "alice-id", "alice-refresh"),
+            ("bob@example.com", "bob-id", "bob-refresh"),
+            ("carol@example.com", "carol-id", "carol-refresh"),
+        ],
+        Some(("alice@example.com", "alice-id", "alice-live")),
+    );
+
+    command(&credentials_home, &codex_home, &runtime_dir)
+        .arg("next")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "no other enrolled account has remaining Codex quota",
+        ));
+    assert_eq!(server.finish().len(), 2);
+    assert_eq!(
+        fs::read(codex_home.join("auth.json")).unwrap(),
+        auth_json("alice@example.com", "alice-id", "alice-live")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn add_activates_the_new_account_when_the_current_quota_is_exhausted() {
+    let root = tempdir().unwrap();
+    let credentials_home = root.path().join("credentials");
+    let codex_home = root.path().join("codex");
+    let runtime_dir = root.path().join("runtime");
+    let server = MockQuotaServer::start_with_quotas(1, Duration::ZERO, &[("alice-id", 100.0)]);
+    seed_account_set(
+        &credentials_home,
+        &codex_home,
+        &server.base_url,
+        &[("alice@example.com", "alice-id", "alice-refresh")],
+        Some(("alice@example.com", "alice-id", "alice-live")),
+    );
+    let enrolled_path = root.path().join("bob.json");
+    let args_path = root.path().join("codex-args");
+    let path = fake_codex_path(root.path(), &enrolled_path);
+
+    command(&credentials_home, &codex_home, &runtime_dir)
+        .env("PATH", path)
+        .env("KAI_TEST_CREDENTIAL", &enrolled_path)
+        .env("KAI_TEST_ARGS", &args_path)
+        .args(["cred", "add", "bob@example.com", "--browser-auth"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(concat!(
+            "Enrolled and activated bob@example.com because ",
+            "alice@example.com has no remaining quota",
+        )));
+    assert_eq!(server.finish().len(), 1);
+    assert_eq!(
+        fs::read(codex_home.join("auth.json")).unwrap(),
+        auth_json("bob@example.com", "bob-id", "bob-refresh")
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn complete_rotation_preserves_a_live_refreshed_credential() {
@@ -327,7 +576,7 @@ fn complete_rotation_preserves_a_live_refreshed_credential() {
     let codex_home = root.path().join("codex");
     let runtime_dir = root.path().join("runtime");
     fs::create_dir_all(&codex_home).unwrap();
-    let quota_server = MockQuotaServer::start(5, Duration::ZERO);
+    let quota_server = MockQuotaServer::start(6, Duration::ZERO);
     fs::write(
         codex_home.join("config.toml"),
         format!("chatgpt_base_url = {:?}\n", quota_server.base_url),
@@ -415,5 +664,5 @@ fn complete_rotation_preserves_a_live_refreshed_credential() {
         .success()
         .stdout(predicate::str::contains("\"email\": \"alice@example.com\""))
         .stdout(predicate::str::contains("bob@example.com").not());
-    assert_eq!(quota_server.finish().len(), 5);
+    assert_eq!(quota_server.finish().len(), 6);
 }
