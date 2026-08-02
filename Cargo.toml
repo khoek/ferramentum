@@ -33,3 +33,6 @@ which = "8"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+[patch.crates-io]
+console = { git = "https://github.com/khoek/console.git", branch = "ansi-strip-osc8-tmux" }
