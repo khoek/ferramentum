@@ -22,15 +22,16 @@ capulus = { workspace = true }
 clap = { workspace = true }
 dialoguer = { workspace = true }
 headless_chrome = "1"
+hex = "0.4"
 indicatif = { workspace = true }
 ipnet = { version = "2", features = ["serde"] }
 libc = { workspace = true }
 openconnect-core = { git = "https://github.com/khoek/Openconnect-RS.git", branch = "ocular-peer-cert-der" }
-quick-xml = { version = "0.39", features = ["escape-html"] }
+quick-xml = { version = "0.41", features = ["escape-html"] }
 reqwest = { workspace = true, features = ["blocking", "cookies", "rustls", "socks"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha1 = "0.10"
+sha1 = "0.11"
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 thiserror = "2"

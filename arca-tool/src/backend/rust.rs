@@ -923,7 +923,7 @@ fn short_hash(values: &[String]) -> String {
         hasher.update((value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn render_containerfile(metadata: &ArtifactMetadata) -> Result<String> {
@@ -999,7 +999,7 @@ fn compute_build_fingerprint(
     for path in build_input_paths(&metadata.workspace_root, crate_dir, local_dependency_dirs) {
         hash_path(&mut hasher, &path)?;
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn build_input_paths(

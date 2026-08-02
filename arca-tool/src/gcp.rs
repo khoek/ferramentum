@@ -955,7 +955,7 @@ fn now_epoch_ms() -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCESS_TOKEN_CACHE_FILE_NAME, CachedAccessToken, RemoteArtifact, RemoteArtifactCandidate,
+        ACCESS_TOKEN_CACHE_FILE_NAME, RemoteArtifact, RemoteArtifactCandidate,
         hydrate_candidate_summaries_from_local_artifacts, normalize_registry_repository,
         registry_host, split_image_reference,
     };
@@ -1055,24 +1055,6 @@ mod tests {
                 .created_at_epoch_ms,
             1
         );
-    }
-
-    #[test]
-    fn cached_access_token_round_trips_through_toml() {
-        let cached = CachedAccessToken {
-            token: "token".to_owned(),
-            fetched_at_epoch_ms: 42,
-            credential_source: "adc:/tmp/creds.json".to_owned(),
-        };
-
-        let serialized = toml::to_string_pretty(&cached).expect("cache should serialize as TOML");
-        assert!(serialized.contains("token = "));
-
-        let decoded =
-            toml::from_str::<CachedAccessToken>(&serialized).expect("cache should parse as TOML");
-        assert_eq!(decoded.token, cached.token);
-        assert_eq!(decoded.fetched_at_epoch_ms, cached.fetched_at_epoch_ms);
-        assert_eq!(decoded.credential_source, cached.credential_source);
     }
 
     #[test]

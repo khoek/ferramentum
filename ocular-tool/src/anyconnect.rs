@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
-use quick_xml::Reader;
 use quick_xml::events::Event;
+use quick_xml::{Reader, XmlVersion};
 use reqwest::Url;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -338,7 +338,8 @@ fn parse_auth_request_response(xml: &[u8]) -> Result<AuthRequest, AppError> {
                     for attr in e.attributes() {
                         let attr = attr?;
                         if local_name(attr.key.as_ref()) == b"id" {
-                            auth_id = Some(attr.unescape_value()?.to_string());
+                            auth_id =
+                                Some(attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned());
                         }
                     }
                 }
@@ -449,7 +450,8 @@ fn parse_auth_complete_response(xml: &[u8]) -> Result<AuthComplete, AppError> {
                     for attr in e.attributes() {
                         let attr = attr?;
                         if local_name(attr.key.as_ref()) == b"id" {
-                            auth_id = Some(attr.unescape_value()?.to_string());
+                            auth_id =
+                                Some(attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned());
                         }
                     }
                 }

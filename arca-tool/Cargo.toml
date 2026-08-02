@@ -21,6 +21,7 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 dialoguer = { workspace = true }
 dirs = { workspace = true }
+hex = "0.4"
 indicatif = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true }

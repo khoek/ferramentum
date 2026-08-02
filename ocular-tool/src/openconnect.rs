@@ -1330,8 +1330,8 @@ fn peer_cert_hashes(client: &VpnClient) -> Option<PeerCertHashes> {
     };
 
     Some(PeerCertHashes {
-        sha1: format!("{:x}", Sha1::digest(&cert_der)),
-        sha256: format!("{:x}", Sha256::digest(&cert_der)),
+        sha1: hex::encode(Sha1::digest(&cert_der)),
+        sha256: hex::encode(Sha256::digest(&cert_der)),
     })
 }
 
