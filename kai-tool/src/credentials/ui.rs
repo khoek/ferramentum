@@ -1,9 +1,9 @@
 use std::io::{self, IsTerminal, Write};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Result;
 use capulus::ui::{Color, RenderTarget, stderr_render_target, stdout_render_target};
-use chrono::{DateTime, Local, Utc};
+use chrono::Utc;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::Serialize;
 
@@ -12,6 +12,14 @@ use super::quota;
 const FIELD_SEPARATOR: &str = " · ";
 const ACTIVE_LABEL: &str = "active";
 const QUOTA_BAR_SEGMENTS: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DurationUnit {
+    Second,
+    Minute,
+    Hour,
+    Day,
+}
 
 #[derive(Debug, Serialize)]
 pub struct ListView {
@@ -25,7 +33,6 @@ pub struct AccountView {
     pub email: String,
     pub active: bool,
     pub plan: Option<String>,
-    pub access_expires_at: Option<i64>,
     pub last_refresh: Option<String>,
     pub status: AccountStatus,
     pub quota: QuotaStatus,
@@ -48,6 +55,7 @@ pub enum QuotaStatus {
     },
     Unavailable {
         error: String,
+        authentication_required: bool,
     },
 }
 
@@ -63,6 +71,7 @@ impl AccountView {
             Ok(snapshot) => QuotaStatus::Available { snapshot },
             Err(err) => QuotaStatus::Unavailable {
                 error: format!("{err:#}"),
+                authentication_required: quota::requires_authentication(&err),
             },
         };
     }
@@ -139,10 +148,12 @@ fn render_list(view: &ListView, json: bool) -> Result<String> {
     }
 
     let email_width = email_width(view);
+    let now = Utc::now().timestamp();
+    let reset_alignment = reset_duration_alignment(view, now);
     let mut lines = view
         .accounts
         .iter()
-        .map(|account| render_account(account, email_width))
+        .map(|account| render_account_at(account, email_width, now, reset_alignment))
         .collect::<Vec<_>>();
     lines.push(String::new());
     lines.push(render_summary(view));
@@ -156,6 +167,29 @@ pub fn print_quota(snapshot: &quota::Snapshot) {
         "Quota: {}",
         render_quota(snapshot, &stderr_render_target())
     ));
+}
+
+pub fn print_reset_credit_notice(email: &str, reset_credits: &quota::ResetCredits) {
+    let noun = if reset_credits.available_count == 1 {
+        "credit is"
+    } else {
+        "credits are"
+    };
+    let expiry = reset_credits
+        .latest_expires_at
+        .map(|expires_at| {
+            format!(
+                "; the latest expires in {}",
+                format_time_remaining(expires_at)
+            )
+        })
+        .unwrap_or_default();
+    eprintln!(
+        "{} {email} has no remaining quota, but {} usable rate-limit reset {noun} available{expiry}. \
+         Run `/usage` in Codex to redeem one.",
+        stderr_render_target().paint("notice:", Color::Cyan),
+        reset_credits.available_count,
+    );
 }
 
 fn render_live_account(bar: &ProgressBar, account: &AccountView, email_width: usize) {
@@ -184,6 +218,15 @@ fn render_live_account(bar: &ProgressBar, account: &AccountView, email_width: us
 }
 
 fn render_account(account: &AccountView, email_width: usize) -> String {
+    render_account_at(account, email_width, Utc::now().timestamp(), None)
+}
+
+fn render_account_at(
+    account: &AccountView,
+    email_width: usize,
+    now: i64,
+    reset_alignment: Option<DurationUnit>,
+) -> String {
     let target = stdout_render_target();
     let base = render_account_base(account, email_width, &target);
     match (&account.status, &account.quota) {
@@ -191,14 +234,25 @@ fn render_account(account: &AccountView, email_width: usize) -> String {
             format!(
                 "{base}{}{}",
                 FIELD_SEPARATOR,
-                render_quota(snapshot, &target)
+                render_quota_at(snapshot, &target, now, reset_alignment)
             )
         }
         (AccountStatus::Ready, QuotaStatus::Loading) => {
             format!("{base}{FIELD_SEPARATOR}loading quota")
         }
-        (AccountStatus::Ready, QuotaStatus::Unavailable { error }) => {
-            format!("{base}{FIELD_SEPARATOR}quota unavailable: {error}")
+        (
+            AccountStatus::Ready,
+            QuotaStatus::Unavailable {
+                error,
+                authentication_required,
+            },
+        ) => {
+            let hint = if *authentication_required {
+                "; run `kai cred fix`".to_owned()
+            } else {
+                String::new()
+            };
+            format!("{base}{FIELD_SEPARATOR}quota unavailable: {error}{hint}")
         }
         (AccountStatus::Invalid { .. }, _) => base,
     }
@@ -223,13 +277,9 @@ fn render_account_base(
         fields.push(plan.to_ascii_uppercase());
     }
     match &account.status {
-        AccountStatus::Ready => {
-            if let Some(expires_at) = account.access_expires_at {
-                fields.push(render_access_expiry(expires_at, target));
-            }
-        }
+        AccountStatus::Ready => {}
         AccountStatus::Invalid { error } => {
-            fields.push(target.paint(&format!("invalid: {error}"), Color::Red));
+            fields.push(target.paint(&format!("invalid: {error}; run `kai cred fix`"), Color::Red));
         }
     }
     format!(
@@ -250,7 +300,25 @@ fn render_quota(snapshot: &quota::Snapshot, target: &impl RenderTarget) -> Strin
         snapshot.remaining_percent,
         snapshot.resets_at,
         snapshot.window_seconds,
+        snapshot.rate_limit_reset_credits.as_ref(),
         target,
+    )
+}
+
+fn render_quota_at(
+    snapshot: &quota::Snapshot,
+    target: &impl RenderTarget,
+    now: i64,
+    reset_alignment: Option<DurationUnit>,
+) -> String {
+    render_quota_values_at(
+        snapshot.remaining_percent,
+        snapshot.resets_at,
+        snapshot.window_seconds,
+        snapshot.rate_limit_reset_credits.as_ref(),
+        target,
+        now,
+        reset_alignment,
     )
 }
 
@@ -258,15 +326,59 @@ fn render_quota_values(
     remaining_percent: f64,
     resets_at: i64,
     window_seconds: Option<i64>,
+    reset_credits: Option<&quota::ResetCredits>,
     target: &impl RenderTarget,
 ) -> String {
+    render_quota_values_at(
+        remaining_percent,
+        resets_at,
+        window_seconds,
+        reset_credits,
+        target,
+        Utc::now().timestamp(),
+        None,
+    )
+}
+
+fn render_quota_values_at(
+    remaining_percent: f64,
+    resets_at: i64,
+    window_seconds: Option<i64>,
+    reset_credits: Option<&quota::ResetCredits>,
+    target: &impl RenderTarget,
+    now: i64,
+    reset_alignment: Option<DurationUnit>,
+) -> String {
     let rounded_percent = remaining_percent.clamp(0.0, 100.0).round() as u64;
-    format!(
-        "{} [{}] {rounded_percent:>3}% remaining · resets {}",
+    let mut rendered = format!(
+        "{} [{}] {rounded_percent:>3}% remaining · resets in {}",
         quota_window_label(window_seconds),
         render_quota_bar(remaining_percent, target),
-        format_reset_datetime(resets_at),
-    )
+        format_time_remaining_at(resets_at, now, reset_alignment),
+    );
+    if let Some(reset_credits) = reset_credits {
+        let noun = if reset_credits.available_count == 1 {
+            "credit"
+        } else {
+            "credits"
+        };
+        rendered.push_str(&format!(
+            " · {} reset {noun}",
+            reset_credits.available_count
+        ));
+        if let Some(expires_at) = reset_credits.latest_expires_at {
+            rendered.push_str(&format!(
+                " · {}expires in {}",
+                if reset_credits.available_count == 1 {
+                    ""
+                } else {
+                    "latest "
+                },
+                format_time_remaining_at(expires_at, now, None)
+            ));
+        }
+    }
+    rendered
 }
 
 fn render_quota_bar(remaining_percent: f64, target: &impl RenderTarget) -> String {
@@ -308,15 +420,84 @@ fn quota_color(remaining_percent: u64) -> Color {
     }
 }
 
-fn format_reset_datetime(resets_at: i64) -> String {
-    DateTime::<Utc>::from_timestamp(resets_at, 0)
-        .map(|datetime| {
-            datetime
-                .with_timezone(&Local)
-                .format("%Y-%m-%d %H:%M %Z")
-                .to_string()
+fn format_time_remaining(timestamp: i64) -> String {
+    format_duration(timestamp.saturating_sub(Utc::now().timestamp()))
+}
+
+fn format_time_remaining_at(timestamp: i64, now: i64, alignment: Option<DurationUnit>) -> String {
+    format_duration_aligned(timestamp.saturating_sub(now), alignment)
+}
+
+fn format_duration(total_seconds: i64) -> String {
+    format_duration_aligned(total_seconds, None)
+}
+
+fn format_duration_aligned(total_seconds: i64, alignment: Option<DurationUnit>) -> String {
+    let (leading_unit, components) = duration_components(total_seconds);
+    let alignment = alignment.unwrap_or(leading_unit).max(leading_unit);
+    let omitted_leading_units = alignment as usize - leading_unit as usize;
+    let mut rendered = " ".repeat(omitted_leading_units * 4);
+    rendered.push_str(
+        &components
+            .into_iter()
+            .map(|(value, suffix)| format_duration_component(value, suffix))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    rendered
+}
+
+fn duration_components(total_seconds: i64) -> (DurationUnit, Vec<(i64, &'static str)>) {
+    if total_seconds <= 0 {
+        return (DurationUnit::Second, vec![(0, "s")]);
+    }
+
+    if total_seconds >= 86_400 {
+        let rounded_hours = total_seconds.saturating_add(1_800) / 3_600;
+        return (
+            DurationUnit::Day,
+            vec![(rounded_hours / 24, "d"), (rounded_hours % 24, "h")],
+        );
+    }
+
+    if total_seconds >= 3_600 {
+        let rounded_minutes = total_seconds.saturating_add(30) / 60;
+        if rounded_minutes >= 1_440 {
+            return (
+                DurationUnit::Day,
+                vec![(rounded_minutes / 1_440, "d"), (0, "h")],
+            );
+        }
+        return (
+            DurationUnit::Hour,
+            vec![(rounded_minutes / 60, "h"), (rounded_minutes % 60, "m")],
+        );
+    }
+
+    if total_seconds >= 60 {
+        return (
+            DurationUnit::Minute,
+            vec![(total_seconds / 60, "m"), (total_seconds % 60, "s")],
+        );
+    }
+
+    (DurationUnit::Second, vec![(total_seconds, "s")])
+}
+
+fn format_duration_component(value: i64, suffix: &str) -> String {
+    format!("{value:>2}{suffix}")
+}
+
+fn reset_duration_alignment(view: &ListView, now: i64) -> Option<DurationUnit> {
+    view.accounts
+        .iter()
+        .filter_map(|account| match &account.quota {
+            QuotaStatus::Available { snapshot } => {
+                Some(duration_components(snapshot.resets_at.saturating_sub(now)).0)
+            }
+            QuotaStatus::Loading | QuotaStatus::Unavailable { .. } => None,
         })
-        .unwrap_or_else(|| format!("Unix timestamp {resets_at}"))
+        .max()
 }
 
 fn email_width(view: &ListView) -> usize {
@@ -339,24 +520,6 @@ fn render_summary(view: &ListView) -> String {
     }
 }
 
-fn render_access_expiry(expires_at: i64, target: &impl RenderTarget) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let remaining = expires_at - now;
-    if remaining <= 0 {
-        return target.paint("access refresh due", Color::Yellow);
-    }
-    if remaining < 120 {
-        return "access <2m".to_owned();
-    }
-    if remaining < 7200 {
-        return format!("access {}m", remaining / 60);
-    }
-    format!("access {}h", remaining / 3600)
-}
-
 #[cfg(test)]
 mod tests {
     use capulus::ui::TextEffect;
@@ -376,13 +539,91 @@ mod tests {
     fn quota_bar_and_summary_show_remaining_capacity() {
         assert_eq!(render_quota_bar(75.0, &PlainTarget), "████████████▓░░░");
         assert!(
-            render_quota_values(75.0, 2_000_000_000, Some(18_000), &PlainTarget)
+            render_quota_values(75.0, 2_000_000_000, Some(18_000), None, &PlainTarget)
                 .contains("5h quota")
         );
         assert!(
-            render_quota_values(75.0, 2_000_000_000, Some(18_000), &PlainTarget)
+            render_quota_values(75.0, 2_000_000_000, Some(18_000), None, &PlainTarget)
                 .contains(" 75% remaining")
         );
+        assert!(
+            render_quota_values(75.0, 2_000_000_000, Some(18_000), None, &PlainTarget)
+                .contains("resets in ")
+        );
+    }
+
+    #[test]
+    fn relative_durations_are_padded_limited_and_rounded() {
+        assert_eq!(format_duration(604_799), " 7d  0h");
+        assert_eq!(format_duration(90_061), " 1d  1h");
+        assert_eq!(format_duration(91_800), " 1d  2h");
+        assert_eq!(format_duration(86_399), " 1d  0h");
+        assert_eq!(format_duration(3_661), " 1h  1m");
+        assert_eq!(format_duration(61), " 1m  1s");
+        assert_eq!(format_duration(0), " 0s");
+    }
+
+    #[test]
+    fn shorter_duration_units_align_under_their_matching_columns() {
+        let snapshot = |resets_at| QuotaStatus::Available {
+            snapshot: quota::Snapshot {
+                remaining_percent: 50.0,
+                resets_at,
+                window_seconds: Some(604_800),
+                rate_limit_reset_credits: None,
+            },
+        };
+        let now = 1_000_000;
+        let view = ListView {
+            active: None,
+            next: None,
+            accounts: vec![
+                AccountView {
+                    email: "days@example.com".to_owned(),
+                    active: false,
+                    plan: None,
+                    last_refresh: None,
+                    status: AccountStatus::Ready,
+                    quota: snapshot(now + 2 * 86_400),
+                },
+                AccountView {
+                    email: "hours@example.com".to_owned(),
+                    active: false,
+                    plan: None,
+                    last_refresh: None,
+                    status: AccountStatus::Ready,
+                    quota: snapshot(now + 4 * 3_600 + 20 * 60),
+                },
+            ],
+        };
+        let alignment = reset_duration_alignment(&view, now);
+
+        assert_eq!(alignment, Some(DurationUnit::Day));
+        assert_eq!(
+            format_time_remaining_at(now + 4 * 3_600 + 20 * 60, now, alignment),
+            "     4h 20m"
+        );
+        assert_eq!(
+            format_duration_aligned(9 * 60 + 12, alignment),
+            "         9m 12s"
+        );
+        assert_eq!(format_duration_aligned(12, alignment), "            12s");
+    }
+
+    #[test]
+    fn quota_summary_reports_reset_credit_count_and_expiry() {
+        let rendered = render_quota_values(
+            0.0,
+            2_000_000_000,
+            Some(604_800),
+            Some(&quota::ResetCredits {
+                available_count: 2,
+                latest_expires_at: Some(2_100_000_000),
+            }),
+            &PlainTarget,
+        );
+        assert!(rendered.contains("2 reset credits"));
+        assert!(rendered.contains("latest expires in "));
     }
 
     #[test]
@@ -397,7 +638,6 @@ mod tests {
             email: email.to_owned(),
             active,
             plan: Some("pro".to_owned()),
-            access_expires_at: None,
             last_refresh: None,
             status: AccountStatus::Ready,
             quota: QuotaStatus::Loading,
@@ -424,7 +664,6 @@ mod tests {
                 email: "alice@example.com".to_owned(),
                 active: true,
                 plan: Some("pro".to_owned()),
-                access_expires_at: None,
                 last_refresh: None,
                 status: AccountStatus::Ready,
                 quota: QuotaStatus::Available {
@@ -432,6 +671,7 @@ mod tests {
                         remaining_percent: 75.0,
                         resets_at: 2_000_000_000,
                         window_seconds: Some(18_000),
+                        rate_limit_reset_credits: None,
                     },
                 },
             }],
@@ -452,9 +692,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(terminal.contents(), "");
-        assert_eq!(
-            final_output.unwrap(),
-            format!("{account}\n\n1 account enrolled\n")
-        );
+        let final_output = final_output.unwrap();
+        assert!(final_output.starts_with("● alice@example.com · active · PRO · 5h quota"));
+        assert!(final_output.ends_with("\n\n1 account enrolled\n"));
     }
 }

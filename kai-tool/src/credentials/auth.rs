@@ -24,7 +24,6 @@ pub struct CredentialFacts {
     pub email: String,
     pub account_id: String,
     pub plan: Option<String>,
-    pub access_expires_at: Option<i64>,
     pub last_refresh: Option<String>,
 }
 
@@ -122,16 +121,11 @@ impl Credential {
                 .and_then(|claims| claims.get("chatgpt_account_is_fedramp"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let access_expires_at = jwt_claims(tokens.access_token)
-                .ok()
-                .and_then(|claims| claims.get("exp").and_then(Value::as_i64));
-
             (
                 CredentialFacts {
                     email,
                     account_id,
                     plan,
-                    access_expires_at,
                     last_refresh: document.last_refresh.map(str::to_owned),
                 },
                 account_is_fedramp,
@@ -262,7 +256,6 @@ pub(crate) mod tests {
         assert_eq!(credential.facts.email, "Ada@Example.com");
         assert_eq!(credential.facts.account_id, "account-1");
         assert_eq!(credential.facts.plan.as_deref(), Some("pro"));
-        assert_eq!(credential.facts.access_expires_at, Some(2_000_000_000));
     }
 
     #[test]

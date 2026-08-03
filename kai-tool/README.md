@@ -19,14 +19,15 @@ Enroll each Codex account once, then switch without logging the previous account
 kai cred add personal@example.com
 kai cred add work@example.com
 kai cred list
+kai cred fix
 kai next
 ```
 
 `kai next` is shorthand for `kai cred next`. It checks candidate accounts concurrently in cyclic
-enrollment order, skips accounts whose quota is exhausted, and activates the first account with
-confirmed remaining quota. If the quota service is unavailable, it falls back to the first account
-whose quota could not be checked rather than treating a transient lookup failure as exhaustion. You
-can also select or remove an account explicitly:
+enrollment order and activates the first account with confirmed remaining quota. If none has
+remaining quota, accounts with usable rate-limit reset credits are eligible before accounts whose
+quota could not be checked. Exhausted accounts without reset credits and credentials rejected by
+the service are skipped. You can also select or remove an account explicitly:
 
 ```bash
 kai cred activate personal@example.com
@@ -34,10 +35,12 @@ kai cred remove work@example.com
 ```
 
 `kai cred list` fetches every account's current Codex quota concurrently and shows the remaining
-percentage, reset datetime, and an inline progress bar. On an interactive terminal, each account
-appears immediately with a live loading indicator and is rewritten as its quota arrives. After
-`kai next` or `kai cred next`, Kai reports the newly selected account's quota as soon as the
-in-flight lookup completes.
+percentage, relative time until reset, and an inline progress bar. Usable rate-limit reset credits
+are shown with their count and latest relative expiry. On an interactive terminal, each account
+appears immediately with a live loading indicator and is rewritten as its quota arrives. After `kai
+next` or `kai cred next`, Kai reports the newly selected account's quota as soon as the in-flight
+lookup completes. Selecting an exhausted account with reset credits prints a notice directing you
+to Codex's `/usage` flow to redeem one.
 
 `kai cred add` runs `codex login` with a temporary, isolated `CODEX_HOME`, verifies that the
 resulting account has the requested email, and then imports its file-backed credential. The
@@ -45,6 +48,14 @@ credential currently used by Codex is not replaced or logged out during enrollme
 Codex's device-code flow automatically for SSH sessions, CI, and Linux sessions without a graphical
 display. A configured `$BROWSER` relay and WSL browser interop retain the browser flow. Use
 `--browser-auth` or `--device-auth` to force either behavior.
+
+Rerun `kai cred add <email> --force` to reauthenticate an already-enrolled account. Kai replaces
+the credential only after both its email and account/workspace ID match the enrolled profile, and
+preserves whether it was active unless `--activate` is also supplied. `kai cred fix` checks all
+enrolled credentials concurrently and starts isolated sign-ins only for credentials that are
+invalid or rejected as unauthorized. Both commands accept the same browser/device authentication
+overrides. Repairs run one at a time; before each sign-in, Kai shows the email to select and waits
+for Enter before opening the browser.
 
 The first enrolled account is activated automatically. When another managed account is already
 active, Kai normally leaves it in place; if that account has zero remaining quota, adding a new
@@ -57,7 +68,8 @@ credential. Kai never invokes `codex logout`, so switching does not deliberately
 previous credential.
 
 `kai cred list --json` emits stable, secret-free output for scripts, including each quota's
-remaining percentage, reset timestamp, and window length.
+remaining percentage, reset timestamp, window length, and any usable reset-credit count and latest
+expiry.
 
 ### Vault location and security
 
@@ -82,7 +94,7 @@ Kai requires Codex to use file-backed CLI credentials. If `cli_auth_credentials_
 `auto` or `keyring`, change it to `file` in the active Codex `config.toml`.
 
 Already-running Codex processes may retain their previous credential in memory. Restart them after
-`kai next` or `kai cred activate`.
+`kai next`, `kai cred activate`, or repairing the active credential.
 
 ## Other commands
 

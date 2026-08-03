@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
@@ -20,6 +21,8 @@ use self::ui::{AccountStatus, AccountView, ListView, QuotaStatus};
     "Examples:\n",
     "  kai cred add personal@example.com\n",
     "  kai cred add work@example.com --device-auth\n",
+    "  kai cred add personal@example.com --force\n",
+    "  kai cred fix\n",
     "  kai cred list\n",
     "  kai next\n",
     "  kai cred activate personal@example.com\n",
@@ -38,7 +41,7 @@ pub enum CredCommand {
     )]
     List(ListArgs),
 
-    #[command(about = "Activate the next enrolled account with remaining quota.")]
+    #[command(about = "Activate the next usable enrolled account.")]
     Next,
 
     #[command(about = "Activate an enrolled account.")]
@@ -52,10 +55,22 @@ pub enum CredCommand {
             "automatically uses device-code authentication in SSH, CI, and headless Linux ",
             "sessions; use --browser-auth or --device-auth to override detection. The new ",
             "account is activated when no account is active or the managed active account has ",
-            "no remaining quota.",
+            "no remaining quota. For an already-enrolled account, --force runs a fresh isolated ",
+            "login and safely replaces its credential.",
         )
     )]
     Add(AddArgs),
+
+    #[command(
+        about = "Find and reauthenticate broken enrolled credentials.",
+        long_about = concat!(
+            "Check every enrolled account and reauthenticate credentials that are invalid or ",
+            "rejected by the Codex quota service. Each replacement is imported through an isolated ",
+            "Codex login and must match the enrolled email and account/workspace ID. Repairs run ",
+            "one at a time and wait for Enter before opening each account's sign-in.",
+        )
+    )]
+    Fix(FixArgs),
 
     #[command(about = "Remove an enrolled account.")]
     Remove(RemoveArgs),
@@ -76,11 +91,7 @@ pub struct AccountArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct AddArgs {
-    /// Email address expected from the completed Codex login.
-    #[arg(value_name = "EMAIL")]
-    pub email: String,
-
+pub struct AuthFlowArgs {
     /// Force Codex's device-code authentication flow.
     #[arg(long, conflicts_with = "browser_auth")]
     pub device_auth: bool,
@@ -88,10 +99,30 @@ pub struct AddArgs {
     /// Use Codex's browser authentication flow, overriding environment detection.
     #[arg(long, conflicts_with = "device_auth")]
     pub browser_auth: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AddArgs {
+    /// Email address expected from the completed Codex login.
+    #[arg(value_name = "EMAIL")]
+    pub email: String,
+
+    #[command(flatten)]
+    pub auth: AuthFlowArgs,
 
     /// Activate after enrollment even if the current account has remaining quota.
     #[arg(long)]
     pub activate: bool,
+
+    /// Reauthenticate and replace the credential if the account is already enrolled.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct FixArgs {
+    #[command(flatten)]
+    pub auth: AuthFlowArgs,
 }
 
 #[derive(Debug, Args)]
@@ -114,8 +145,10 @@ enum LiveAuth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuotaAvailability {
     Remaining,
+    Resettable,
     Exhausted,
     Unknown,
+    Unusable,
 }
 
 pub fn run(command: CredCommand) -> Result<()> {
@@ -136,6 +169,7 @@ async fn run_async(command: CredCommand) -> Result<()> {
         CredCommand::Next => cmd_next(&mut store).await,
         CredCommand::Activate(args) => cmd_activate(&mut store, &args.email),
         CredCommand::Add(args) => cmd_add(&mut store, args).await,
+        CredCommand::Fix(args) => cmd_fix(&mut store, args).await,
         CredCommand::Remove(args) => cmd_remove(&mut store, args),
     }
 }
@@ -185,6 +219,7 @@ async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
                     facts,
                     QuotaStatus::Unavailable {
                         error: format!("{err:#}"),
+                        authentication_required: true,
                     },
                 ),
                 None,
@@ -194,13 +229,13 @@ async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
                     email: profile.email.clone(),
                     active,
                     plan: None,
-                    access_expires_at: None,
                     last_refresh: None,
                     status: AccountStatus::Invalid {
                         error: format!("{err:#}"),
                     },
                     quota: QuotaStatus::Unavailable {
                         error: "credential is invalid".to_owned(),
+                        authentication_required: true,
                     },
                 },
                 None,
@@ -216,6 +251,7 @@ async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
                 Err(error) => {
                     account.quota = QuotaStatus::Unavailable {
                         error: error.clone(),
+                        authentication_required: false,
                     };
                 }
             }
@@ -286,7 +322,6 @@ fn ready_account_view(
         email: profile.email.clone(),
         active,
         plan: facts.plan,
-        access_expires_at: facts.access_expires_at,
         last_refresh: facts.last_refresh,
         status: AccountStatus::Ready,
         quota,
@@ -321,9 +356,9 @@ async fn cmd_next(store: &mut Store) -> Result<()> {
     );
     let Some(target_index) = target_index else {
         if active_index.is_some() && store.profiles().len() > 1 {
-            bail!("no other enrolled account has remaining Codex quota");
+            bail!("no other enrolled account has remaining Codex quota or usable reset credits");
         }
-        bail!("no enrolled account has remaining Codex quota");
+        bail!("no enrolled account has remaining Codex quota or usable reset credits");
     };
     let target = store.profiles()[target_index].clone();
     let quota = checks
@@ -338,7 +373,14 @@ async fn cmd_next(store: &mut Store) -> Result<()> {
         capulus::ui::success(&format!("{} is the only enrolled account.", target.email));
     }
     match quota {
-        Ok(snapshot) => ui::print_quota(&snapshot),
+        Ok(snapshot) => {
+            ui::print_quota(&snapshot);
+            if snapshot.remaining_percent <= 0.0
+                && let Some(reset_credits) = &snapshot.rate_limit_reset_credits
+            {
+                ui::print_reset_credit_notice(&target.email, reset_credits);
+            }
+        }
         Err(err) => capulus::ui::warn(&format!(
             "Could not retrieve quota for {}: {err:#}",
             target.email
@@ -413,23 +455,31 @@ fn rotation_order(profile_count: usize, active_index: Option<usize>) -> Vec<usiz
 fn preferred_rotation_index(
     candidates: impl IntoIterator<Item = (usize, QuotaAvailability)>,
 ) -> Option<usize> {
+    let mut first_resettable = None;
     let mut first_unknown = None;
     for (index, availability) in candidates {
         match availability {
             QuotaAvailability::Remaining => return Some(index),
+            QuotaAvailability::Resettable => {
+                first_resettable.get_or_insert(index);
+            }
             QuotaAvailability::Unknown => {
                 first_unknown.get_or_insert(index);
             }
-            QuotaAvailability::Exhausted => {}
+            QuotaAvailability::Exhausted | QuotaAvailability::Unusable => {}
         }
     }
-    first_unknown
+    first_resettable.or(first_unknown)
 }
 
 fn quota_result_availability(result: &Result<quota::Snapshot>) -> QuotaAvailability {
     match result {
         Ok(snapshot) if snapshot.remaining_percent > 0.0 => QuotaAvailability::Remaining,
+        Ok(snapshot) if snapshot.rate_limit_reset_credits.is_some() => {
+            QuotaAvailability::Resettable
+        }
         Ok(_) => QuotaAvailability::Exhausted,
+        Err(err) if quota::requires_authentication(err) => QuotaAvailability::Unusable,
         Err(_) => QuotaAvailability::Unknown,
     }
 }
@@ -439,7 +489,14 @@ fn quota_status_availability(status: &QuotaStatus) -> QuotaAvailability {
         QuotaStatus::Available { snapshot } if snapshot.remaining_percent > 0.0 => {
             QuotaAvailability::Remaining
         }
+        QuotaStatus::Available { snapshot } if snapshot.rate_limit_reset_credits.is_some() => {
+            QuotaAvailability::Resettable
+        }
         QuotaStatus::Available { .. } => QuotaAvailability::Exhausted,
+        QuotaStatus::Unavailable {
+            authentication_required: true,
+            ..
+        } => QuotaAvailability::Unusable,
         QuotaStatus::Loading | QuotaStatus::Unavailable { .. } => QuotaAvailability::Unknown,
     }
 }
@@ -463,8 +520,11 @@ fn cmd_activate(store: &mut Store, email: &str) -> Result<()> {
 async fn cmd_add(store: &mut Store, args: AddArgs) -> Result<()> {
     let expected = args.email.trim();
     validate_email(expected)?;
-    if store.find_profile(expected).is_some() {
-        bail!("{expected} is already enrolled");
+    if let Some(target) = store.find_profile(expected).cloned() {
+        if !args.force {
+            bail!("{expected} is already enrolled; rerun with `--force` to reauthenticate it");
+        }
+        return repair_profile(store, &target, args.auth.auth_preference(), args.activate);
     }
 
     let live = load_live(store);
@@ -492,14 +552,7 @@ async fn cmd_add(store: &mut Store, args: AddArgs) -> Result<()> {
     if args.activate {
         ensure_live_can_be_replaced(store, &live)?;
     }
-    let auth_preference = if args.device_auth {
-        enroll::AuthPreference::Device
-    } else if args.browser_auth {
-        enroll::AuthPreference::Browser
-    } else {
-        enroll::AuthPreference::Auto
-    };
-    let credential = enroll::run(store.paths(), expected, auth_preference)?;
+    let credential = enroll::run(store.paths(), expected, args.auth.auth_preference())?;
     let profile = store.insert_profile(&credential)?;
     let active_for_quota = if !args.activate {
         match (managed_account_before_add.as_deref(), load_live(store)) {
@@ -565,6 +618,177 @@ async fn cmd_add(store: &mut Store, args: AddArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn cmd_fix(store: &mut Store, args: FixArgs) -> Result<()> {
+    if store.profiles().is_empty() {
+        bail!("no accounts are enrolled; run `kai cred add <email>` first");
+    }
+
+    capulus::ui::stage("Checking enrolled account credentials");
+    let live = load_live(store);
+    let unreadable_active = if let LiveAuth::Invalid(err) = &live {
+        capulus::ui::warn(&format!(
+            "The active Codex credential is unreadable and cannot be matched to an enrolled account: {err:#}"
+        ));
+        Some(format!("{err:#}"))
+    } else {
+        None
+    };
+    let client = quota::Client::new(store.paths())?;
+    let mut needs_repair = vec![false; store.profiles().len()];
+    let mut indeterminate = 0;
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, profile) in store.profiles().iter().enumerate() {
+        let request = match &live {
+            LiveAuth::Present(credential) if credential.facts.account_id == profile.account_id => {
+                quota::Request::from_credential(credential)
+            }
+            _ => store
+                .credential(profile)
+                .and_then(|credential| quota::Request::from_credential(&credential)),
+        };
+        match request {
+            Ok(request) => {
+                let client = client.clone();
+                tasks.spawn(async move { (index, client.fetch(request).await) });
+            }
+            Err(_) => needs_repair[index] = true,
+        }
+    }
+    while let Some(result) = tasks.join_next().await {
+        let (index, result) = result.context("a credential check task stopped unexpectedly")?;
+        if let Err(err) = result {
+            if quota::requires_authentication(&err) {
+                needs_repair[index] = true;
+            } else {
+                indeterminate += 1;
+                capulus::ui::warn(&format!(
+                    "Could not determine whether {} needs authentication repair: {err:#}",
+                    store.profiles()[index].email
+                ));
+            }
+        }
+    }
+
+    let targets = store
+        .profiles()
+        .iter()
+        .zip(needs_repair)
+        .filter(|(_, needs_repair)| *needs_repair)
+        .map(|(profile, _)| profile.clone())
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        if indeterminate == 0 && unreadable_active.is_none() {
+            capulus::ui::success("All enrolled account credentials appear usable.");
+        } else {
+            capulus::ui::detail("No credentials were repaired.");
+        }
+    } else {
+        let noun = if targets.len() == 1 {
+            "credential"
+        } else {
+            "credentials"
+        };
+        capulus::ui::detail(&format!("Repairing {} broken {noun}.", targets.len()));
+        let preference = args.auth.auth_preference();
+        for target in targets {
+            confirm_fix_account(&target.email)?;
+            repair_profile(store, &target, preference, false)?;
+        }
+    }
+    if let Some(err) = unreadable_active {
+        bail!(
+            concat!(
+                "the active Codex credential remains unreadable and cannot be repaired ",
+                "automatically ({}); run `kai cred add <email> --force --activate` for the ",
+                "intended active account",
+            ),
+            err
+        );
+    }
+    Ok(())
+}
+
+fn confirm_fix_account(email: &str) -> Result<()> {
+    eprint!(
+        "Press Enter to open sign-in for {email}; select this account in the browser (Ctrl-C to stop): "
+    );
+    io::stderr()
+        .flush()
+        .context("could not display the credential repair confirmation")?;
+
+    let mut confirmation = String::new();
+    let bytes_read = io::stdin()
+        .read_line(&mut confirmation)
+        .context("could not read the credential repair confirmation")?;
+    if bytes_read == 0 {
+        bail!("confirmation ended before sign-in started for {email}");
+    }
+    if !io::stdin().is_terminal() {
+        eprintln!();
+    }
+    Ok(())
+}
+
+fn repair_profile(
+    store: &mut Store,
+    target: &Profile,
+    auth_preference: enroll::AuthPreference,
+    activate_target: bool,
+) -> Result<()> {
+    let live = load_live(store);
+    let target_is_active = matches!(
+        &live,
+        LiveAuth::Present(credential) if credential.facts.account_id == target.account_id
+    );
+    if activate_target && !target_is_active {
+        ensure_live_can_be_replaced(store, &live)?;
+    }
+    let credential = enroll::run(store.paths(), &target.email, auth_preference)?;
+    if credential.facts.account_id != target.account_id {
+        bail!(
+            concat!(
+                "signed in as {}, but its account/workspace ID does not match the enrolled profile; ",
+                "the new credential was discarded and no credentials were changed",
+            ),
+            credential.facts.email
+        );
+    }
+
+    if target_is_active {
+        store.write_active(&credential)?;
+    }
+    store.sync_profile(target, &credential)?;
+    if target_is_active {
+        capulus::ui::success(&format!(
+            "Updated credentials for {} and refreshed the active Codex credential.",
+            target.email
+        ));
+        warn_running_codex();
+    } else if activate_target {
+        activate(store, target)?;
+        capulus::ui::success(&format!(
+            "Updated credentials for {} and activated it.",
+            target.email
+        ));
+        warn_running_codex();
+    } else {
+        capulus::ui::success(&format!("Updated credentials for {}.", target.email));
+    }
+    Ok(())
+}
+
+impl AuthFlowArgs {
+    fn auth_preference(&self) -> enroll::AuthPreference {
+        if self.device_auth {
+            enroll::AuthPreference::Device
+        } else if self.browser_auth {
+            enroll::AuthPreference::Browser
+        } else {
+            enroll::AuthPreference::Auto
+        }
+    }
 }
 
 async fn fetch_credential_quota(store: &Store, credential: &Credential) -> Result<quota::Snapshot> {
@@ -866,6 +1090,31 @@ mod tests {
                 (2, QuotaAvailability::Remaining),
             ]),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn rotation_uses_reset_credits_after_remaining_quota_but_before_unknown_quota() {
+        assert_eq!(
+            preferred_rotation_index([
+                (1, QuotaAvailability::Resettable),
+                (2, QuotaAvailability::Remaining),
+            ]),
+            Some(2)
+        );
+        assert_eq!(
+            preferred_rotation_index([
+                (1, QuotaAvailability::Unknown),
+                (2, QuotaAvailability::Resettable),
+            ]),
+            Some(2)
+        );
+        assert_eq!(
+            preferred_rotation_index([
+                (1, QuotaAvailability::Unusable),
+                (2, QuotaAvailability::Exhausted),
+            ]),
+            None
         );
     }
 
