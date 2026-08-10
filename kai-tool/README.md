@@ -42,7 +42,9 @@ appears immediately with a live loading indicator and is rewritten as its quota 
 next` or `kai cred next`, Kai reports the newly selected account's quota as soon as the in-flight
 lookup completes. Selecting an exhausted account with reset credits prints a notice directing you
 to Codex's `/usage` flow to redeem one. A credential name and its reset time are yellow when the
-backend reports exactly seven days remaining, indicating that quota countdown has not started.
+backend reports exactly seven days remaining, indicating that quota countdown has not started. Once
+all quota lookups finish, lists with multiple accounts end with a blank-line-separated total bar
+averaging the accounts whose quota is available.
 
 `kai cred tickle` starts those untouched seven-day countdowns. It temporarily activates each
 matching credential in enrollment order, runs an ephemeral Codex request whose complete prompt is

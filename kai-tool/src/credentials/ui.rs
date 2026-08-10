@@ -164,6 +164,10 @@ fn render_list(view: &ListView, json: bool) -> Result<String> {
         .collect::<Vec<_>>();
     lines.push(String::new());
     lines.push(render_summary(view));
+    if view.accounts.len() > 1 {
+        lines.push(String::new());
+        lines.push(render_total(view, &stdout_render_target()));
+    }
     let mut output = lines.join("\n");
     output.push('\n');
     Ok(output)
@@ -560,6 +564,33 @@ fn render_summary(view: &ListView) -> String {
     }
 }
 
+fn render_total(view: &ListView, target: &impl RenderTarget) -> String {
+    let (remaining_percent, known_quotas) = view
+        .accounts
+        .iter()
+        .filter_map(|account| match &account.quota {
+            QuotaStatus::Available { snapshot } => Some(snapshot.remaining_percent),
+            QuotaStatus::Loading | QuotaStatus::Unavailable { .. } => None,
+        })
+        .fold((0.0, 0_usize), |(total, count), remaining| {
+            (total + remaining, count + 1)
+        });
+
+    if known_quotas == 0 {
+        return format!(
+            "total: [{}] quota unavailable",
+            render_quota_bar(0.0, target)
+        );
+    }
+
+    let remaining_percent = remaining_percent / known_quotas as f64;
+    let rounded_percent = remaining_percent.clamp(0.0, 100.0).round() as u64;
+    format!(
+        "total: [{}] {rounded_percent:>3}% remaining",
+        render_quota_bar(remaining_percent, target)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use capulus::ui::TextEffect;
@@ -724,6 +755,82 @@ mod tests {
     fn quota_bar_clamps_backend_percentages() {
         assert_eq!(render_quota_bar(-5.0, &PlainTarget), "░░░░░░░░░░░░░░░░");
         assert_eq!(render_quota_bar(105.0, &PlainTarget), "████████████████");
+    }
+
+    #[test]
+    fn total_bar_averages_known_quotas_and_is_separated_at_the_end() {
+        let available = |email: &str, remaining_percent| AccountView {
+            email: email.to_owned(),
+            active: false,
+            plan: Some("pro".to_owned()),
+            last_refresh: None,
+            status: AccountStatus::Ready,
+            quota: QuotaStatus::Available {
+                snapshot: quota::Snapshot {
+                    remaining_percent,
+                    resets_at: 2_000_000_000,
+                    window_seconds: Some(604_800),
+                    reset_after_seconds: None,
+                    rate_limit_reset_credits: None,
+                },
+            },
+        };
+        let view = ListView {
+            active: None,
+            next: None,
+            accounts: vec![
+                available("alice@example.com", 75.0),
+                available("bob@example.com", 25.0),
+                AccountView {
+                    email: "offline@example.com".to_owned(),
+                    active: false,
+                    plan: Some("pro".to_owned()),
+                    last_refresh: None,
+                    status: AccountStatus::Ready,
+                    quota: QuotaStatus::Unavailable {
+                        error: "offline".to_owned(),
+                        authentication_required: false,
+                    },
+                },
+            ],
+        };
+
+        assert_eq!(
+            render_total(&view, &PlainTarget),
+            "total: [████████▓░░░░░░░]  50% remaining"
+        );
+        assert!(
+            render_list(&view, false)
+                .unwrap()
+                .ends_with("\n\n3 accounts enrolled\n\ntotal: [████████▓░░░░░░░]  50% remaining\n")
+        );
+    }
+
+    #[test]
+    fn total_bar_reports_unavailable_when_no_quota_is_known() {
+        let view = ListView {
+            active: None,
+            next: None,
+            accounts: vec!["alice@example.com", "bob@example.com"]
+                .into_iter()
+                .map(|email| AccountView {
+                    email: email.to_owned(),
+                    active: false,
+                    plan: None,
+                    last_refresh: None,
+                    status: AccountStatus::Ready,
+                    quota: QuotaStatus::Unavailable {
+                        error: "offline".to_owned(),
+                        authentication_required: false,
+                    },
+                })
+                .collect(),
+        };
+
+        assert_eq!(
+            render_total(&view, &PlainTarget),
+            "total: [░░░░░░░░░░░░░░░░] quota unavailable"
+        );
     }
 
     #[test]
