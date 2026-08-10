@@ -44,7 +44,9 @@ lookup completes. Selecting an exhausted account with reset credits prints a not
 to Codex's `/usage` flow to redeem one. A credential name and its reset time are yellow when the
 backend reports exactly seven days remaining, indicating that quota countdown has not started. Once
 all quota lookups finish, lists with multiple accounts end with a blank-line-separated total bar
-averaging the accounts whose quota is available.
+averaging the accounts whose quota is available. A centered signed usage bar on the same line shows
+the average quota pace balance: elapsed window fraction minus consumed quota fraction. Positive
+values mean consumption is behind the clock, while negative values mean it is ahead of the clock.
 
 `kai cred tickle` starts those untouched seven-day countdowns. It temporarily activates each
 matching credential in enrollment order, runs an ephemeral Codex request whose complete prompt is

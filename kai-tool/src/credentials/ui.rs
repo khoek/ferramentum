@@ -12,6 +12,7 @@ use super::quota;
 const FIELD_SEPARATOR: &str = " · ";
 const ACTIVE_LABEL: &str = "active";
 const QUOTA_BAR_SEGMENTS: usize = 16;
+const USAGE_BAR_HALF_SEGMENTS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum DurationUnit {
@@ -166,7 +167,7 @@ fn render_list(view: &ListView, json: bool) -> Result<String> {
     lines.push(render_summary(view));
     if view.accounts.len() > 1 {
         lines.push(String::new());
-        lines.push(render_total(view, &stdout_render_target()));
+        lines.push(render_total(view, &stdout_render_target(), now));
     }
     let mut output = lines.join("\n");
     output.push('\n');
@@ -564,7 +565,7 @@ fn render_summary(view: &ListView) -> String {
     }
 }
 
-fn render_total(view: &ListView, target: &impl RenderTarget) -> String {
+fn render_total(view: &ListView, target: &impl RenderTarget, now: i64) -> String {
     let (remaining_percent, known_quotas) = view
         .accounts
         .iter()
@@ -576,19 +577,96 @@ fn render_total(view: &ListView, target: &impl RenderTarget) -> String {
             (total + remaining, count + 1)
         });
 
-    if known_quotas == 0 {
-        return format!(
+    let total = if known_quotas == 0 {
+        format!(
             "total: [{}] quota unavailable",
             render_quota_bar(0.0, target)
-        );
+        )
+    } else {
+        let remaining_percent = remaining_percent / known_quotas as f64;
+        let rounded_percent = remaining_percent.clamp(0.0, 100.0).round() as u64;
+        format!(
+            "total: [{}] {rounded_percent:>3}% remaining",
+            render_quota_bar(remaining_percent, target)
+        )
+    };
+
+    let usage = match average_quota_pace(view, now) {
+        Some(value) => format!(
+            "usage: [{}] {:+.2}",
+            render_usage_bar(value, target),
+            normalize_signed_zero(value)
+        ),
+        None => format!("usage: [{}] unavailable", render_usage_bar(0.0, target)),
+    };
+
+    format!("{total}{FIELD_SEPARATOR}{usage}")
+}
+
+fn average_quota_pace(view: &ListView, now: i64) -> Option<f64> {
+    let (total, count) = view
+        .accounts
+        .iter()
+        .filter_map(|account| match &account.quota {
+            QuotaStatus::Available { snapshot } => quota_pace(snapshot, now),
+            QuotaStatus::Loading | QuotaStatus::Unavailable { .. } => None,
+        })
+        .fold((0.0, 0_usize), |(total, count), pace| {
+            (total + pace, count + 1)
+        });
+
+    (count > 0).then(|| (total / count as f64).clamp(-1.0, 1.0))
+}
+
+fn quota_pace(snapshot: &quota::Snapshot, now: i64) -> Option<f64> {
+    let window_seconds = snapshot.window_seconds?;
+    if window_seconds <= 0 {
+        return None;
     }
 
-    let remaining_percent = remaining_percent / known_quotas as f64;
-    let rounded_percent = remaining_percent.clamp(0.0, 100.0).round() as u64;
-    format!(
-        "total: [{}] {rounded_percent:>3}% remaining",
-        render_quota_bar(remaining_percent, target)
-    )
+    let usage_fraction = 1.0 - snapshot.remaining_percent.clamp(0.0, 100.0) / 100.0;
+    let time_until_reset_fraction =
+        (snapshot.resets_at.saturating_sub(now) as f64 / window_seconds as f64).clamp(0.0, 1.0);
+    Some(((1.0 - time_until_reset_fraction) - usage_fraction).clamp(-1.0, 1.0))
+}
+
+fn render_usage_bar(value: f64, target: &impl RenderTarget) -> String {
+    let value = value.clamp(-1.0, 1.0);
+    let magnitude = value.abs() * USAGE_BAR_HALF_SEGMENTS as f64;
+    let filled = magnitude.floor() as usize;
+    let partial = usize::from(magnitude > filled as f64 && filled < USAGE_BAR_HALF_SEGMENTS);
+    let empty = USAGE_BAR_HALF_SEGMENTS.saturating_sub(filled + partial);
+
+    let left = if value < 0.0 {
+        format!(
+            "{}{}",
+            target.paint(&"░".repeat(empty), Color::Blue),
+            target.paint(
+                &format!("{}{}", "▓".repeat(partial), "█".repeat(filled)),
+                Color::Red
+            )
+        )
+    } else {
+        target.paint(&"░".repeat(USAGE_BAR_HALF_SEGMENTS), Color::Blue)
+    };
+    let right = if value > 0.0 {
+        format!(
+            "{}{}",
+            target.paint(
+                &format!("{}{}", "█".repeat(filled), "▓".repeat(partial)),
+                Color::Green
+            ),
+            target.paint(&"░".repeat(empty), Color::Blue)
+        )
+    } else {
+        target.paint(&"░".repeat(USAGE_BAR_HALF_SEGMENTS), Color::Blue)
+    };
+
+    format!("{left}│{right}")
+}
+
+fn normalize_signed_zero(value: f64) -> f64 {
+    if value.abs() < 0.005 { 0.0 } else { value }
 }
 
 #[cfg(test)]
@@ -758,6 +836,30 @@ mod tests {
     }
 
     #[test]
+    fn quota_pace_compares_elapsed_time_with_consumed_quota() {
+        let now = 1_000_000;
+        let snapshot = |remaining_percent| quota::Snapshot {
+            remaining_percent,
+            resets_at: now + 60,
+            window_seconds: Some(100),
+            reset_after_seconds: None,
+            rate_limit_reset_credits: None,
+        };
+
+        assert!((quota_pace(&snapshot(70.0), now).unwrap() - 0.1).abs() < f64::EPSILON * 4.0);
+        assert!((quota_pace(&snapshot(20.0), now).unwrap() + 0.4).abs() < f64::EPSILON * 4.0);
+    }
+
+    #[test]
+    fn usage_bar_is_centered_across_its_signed_range() {
+        assert_eq!(render_usage_bar(-1.0, &PlainTarget), "████████│░░░░░░░░");
+        assert_eq!(render_usage_bar(-0.5, &PlainTarget), "░░░░████│░░░░░░░░");
+        assert_eq!(render_usage_bar(0.0, &PlainTarget), "░░░░░░░░│░░░░░░░░");
+        assert_eq!(render_usage_bar(0.5, &PlainTarget), "░░░░░░░░│████░░░░");
+        assert_eq!(render_usage_bar(1.0, &PlainTarget), "░░░░░░░░│████████");
+    }
+
+    #[test]
     fn total_bar_averages_known_quotas_and_is_separated_at_the_end() {
         let available = |email: &str, remaining_percent| AccountView {
             email: email.to_owned(),
@@ -796,14 +898,17 @@ mod tests {
         };
 
         assert_eq!(
-            render_total(&view, &PlainTarget),
-            "total: [████████▓░░░░░░░]  50% remaining"
+            render_total(&view, &PlainTarget, 1_000_000),
+            concat!(
+                "total: [████████▓░░░░░░░]  50% remaining · ",
+                "usage: [░░░░████│░░░░░░░░] -0.50",
+            )
         );
-        assert!(
-            render_list(&view, false)
-                .unwrap()
-                .ends_with("\n\n3 accounts enrolled\n\ntotal: [████████▓░░░░░░░]  50% remaining\n")
-        );
+        assert!(render_list(&view, false).unwrap().ends_with(concat!(
+            "\n\n3 accounts enrolled\n\n",
+            "total: [████████▓░░░░░░░]  50% remaining · ",
+            "usage: [░░░░████│░░░░░░░░] -0.50\n",
+        )));
     }
 
     #[test]
@@ -828,8 +933,11 @@ mod tests {
         };
 
         assert_eq!(
-            render_total(&view, &PlainTarget),
-            "total: [░░░░░░░░░░░░░░░░] quota unavailable"
+            render_total(&view, &PlainTarget, 1_000_000),
+            concat!(
+                "total: [░░░░░░░░░░░░░░░░] quota unavailable · ",
+                "usage: [░░░░░░░░│░░░░░░░░] unavailable",
+            )
         );
     }
 

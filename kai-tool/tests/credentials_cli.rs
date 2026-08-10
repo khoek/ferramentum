@@ -829,9 +829,11 @@ fn list_fetches_account_quotas_concurrently_and_renders_them_inline() {
     assert!(bob.contains("20% remaining"));
     assert!(stdout.contains("[████"));
     assert!(stdout.contains("resets in "));
-    assert!(stdout.ends_with(
-        "\n\n2 accounts enrolled · next: bob@example.com\n\ntotal: [███████▓░░░░░░░░]  48% remaining\n"
-    ));
+    assert!(stdout.ends_with(concat!(
+        "\n\n2 accounts enrolled · next: bob@example.com\n\n",
+        "total: [███████▓░░░░░░░░]  48% remaining · ",
+        "usage: [░░░▓████│░░░░░░░░] -0.53\n",
+    )));
     assert!(!stdout.contains("access "));
 
     let mut arrivals = server.finish();
