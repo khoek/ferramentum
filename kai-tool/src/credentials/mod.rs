@@ -48,7 +48,7 @@ pub enum CredCommand {
         about = "Start any untouched seven-day quota countdowns.",
         long_about = concat!(
             "Find enrolled credentials whose quota reset time is still exactly seven days, ",
-            "temporarily activate each one, and send Codex an ephemeral `echo: test` request ",
+            "temporarily activate each one, and ask Codex for the current system GCC version ",
             "from the user's home directory. The original active credential is restored ",
             "afterward, including when a request fails.",
         )
@@ -422,7 +422,12 @@ fn tickle_profiles(
 
 fn run_codex_tickle(codex: &Path, home: &Path) -> Result<()> {
     let output = Command::new(codex)
-        .args(["exec", "--skip-git-repo-check", "--ephemeral", "echo: test"])
+        .args([
+            "exec",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "What is the current system `gcc` version? (Reply with only the version number.)",
+        ])
         .current_dir(home)
         .stdin(Stdio::null())
         .output()

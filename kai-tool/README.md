@@ -46,9 +46,10 @@ backend reports exactly seven days remaining, indicating that quota countdown ha
 
 `kai cred tickle` starts those untouched seven-day countdowns. It temporarily activates each
 matching credential in enrollment order, runs an ephemeral Codex request whose complete prompt is
-`echo: test` from the user's home directory, waits for and discards the response, and restores the
-original active credential afterward. Refreshed credentials are saved during each switch, and the
-original credential is restored even when a probe fails.
+``What is the current system `gcc` version? (Reply with only the version number.)`` from the user's
+home directory, waits for and discards the response, and restores the original active credential
+afterward. Refreshed credentials are saved during each switch, and the original credential is
+restored even when a probe fails.
 
 `kai cred add` runs `codex login` with a temporary, isolated `CODEX_HOME`, verifies that the
 resulting account has the requested email, and then imports its file-backed credential. The

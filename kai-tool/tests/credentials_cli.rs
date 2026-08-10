@@ -959,7 +959,13 @@ fn tickle_probes_only_exact_seven_day_countdowns_and_restores_the_active_credent
     assert_eq!(log.matches("arg:exec\n").count(), 2);
     assert_eq!(log.matches("arg:--skip-git-repo-check\n").count(), 2);
     assert_eq!(log.matches("arg:--ephemeral\n").count(), 2);
-    assert_eq!(log.matches("arg:echo: test\n").count(), 2);
+    assert_eq!(
+        log.matches(
+            "arg:What is the current system `gcc` version? (Reply with only the version number.)\n"
+        )
+        .count(),
+        2
+    );
     let alice = log.find("alice-refresh").unwrap();
     let carol = log.find("carol-refresh").unwrap();
     assert!(
