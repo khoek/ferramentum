@@ -19,6 +19,7 @@ Enroll each Codex account once, then switch without logging the previous account
 kai cred add personal@example.com
 kai cred add work@example.com
 kai cred list
+kai cred tickle
 kai cred fix
 kai next
 ```
@@ -40,7 +41,14 @@ are shown with their count and latest relative expiry. On an interactive termina
 appears immediately with a live loading indicator and is rewritten as its quota arrives. After `kai
 next` or `kai cred next`, Kai reports the newly selected account's quota as soon as the in-flight
 lookup completes. Selecting an exhausted account with reset credits prints a notice directing you
-to Codex's `/usage` flow to redeem one.
+to Codex's `/usage` flow to redeem one. A credential name and its reset time are yellow when the
+backend reports exactly seven days remaining, indicating that quota countdown has not started.
+
+`kai cred tickle` starts those untouched seven-day countdowns. It temporarily activates each
+matching credential in enrollment order, runs an ephemeral Codex request whose complete prompt is
+`echo: test` from the user's home directory, waits for and discards the response, and restores the
+original active credential afterward. Refreshed credentials are saved during each switch, and the
+original credential is restored even when a probe fails.
 
 `kai cred add` runs `codex login` with a temporary, isolated `CODEX_HOME`, verifies that the
 resulting account has the requested email, and then imports its file-backed credential. The

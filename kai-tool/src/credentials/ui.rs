@@ -21,6 +21,13 @@ enum DurationUnit {
     Day,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct QuotaRenderTiming {
+    now: i64,
+    reset_alignment: Option<DurationUnit>,
+    highlight_countdown: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ListView {
     pub active: Option<String>,
@@ -205,6 +212,7 @@ fn render_live_account(bar: &ProgressBar, account: &AccountView, email_width: us
                 account,
                 email_width,
                 &stdout_render_target(),
+                false,
             ));
             bar.enable_steady_tick(Duration::from_millis(80));
         }
@@ -228,13 +236,27 @@ fn render_account_at(
     reset_alignment: Option<DurationUnit>,
 ) -> String {
     let target = stdout_render_target();
-    let base = render_account_base(account, email_width, &target);
+    render_account_at_with_target(account, email_width, now, reset_alignment, &target)
+}
+
+fn render_account_at_with_target(
+    account: &AccountView,
+    email_width: usize,
+    now: i64,
+    reset_alignment: Option<DurationUnit>,
+    target: &impl RenderTarget,
+) -> String {
+    let highlight_countdown = matches!(
+        &account.quota,
+        QuotaStatus::Available { snapshot } if quota::countdown_has_not_started(snapshot, now)
+    );
+    let base = render_account_base(account, email_width, target, highlight_countdown);
     match (&account.status, &account.quota) {
         (AccountStatus::Ready, QuotaStatus::Available { snapshot }) => {
             format!(
                 "{base}{}{}",
                 FIELD_SEPARATOR,
-                render_quota_at(snapshot, &target, now, reset_alignment)
+                render_quota_at(snapshot, target, now, reset_alignment)
             )
         }
         (AccountStatus::Ready, QuotaStatus::Loading) => {
@@ -262,6 +284,7 @@ fn render_account_base(
     account: &AccountView,
     email_width: usize,
     target: &impl RenderTarget,
+    highlight_countdown: bool,
 ) -> String {
     let (bullet, color) = match (&account.status, account.active) {
         (AccountStatus::Invalid { .. }, _) => ("×", Color::Red),
@@ -282,10 +305,16 @@ fn render_account_base(
             fields.push(target.paint(&format!("invalid: {error}; run `kai cred fix`"), Color::Red));
         }
     }
+    let padded_email = format!("{:email_width$}", account.email);
+    let rendered_email = if highlight_countdown {
+        target.paint(&padded_email, Color::Yellow)
+    } else {
+        padded_email
+    };
     format!(
-        "{} {:email_width$}{}{}",
+        "{} {}{}{}",
         target.paint(bullet, color),
-        account.email,
+        rendered_email,
         if fields.is_empty() {
             ""
         } else {
@@ -317,8 +346,11 @@ fn render_quota_at(
         snapshot.window_seconds,
         snapshot.rate_limit_reset_credits.as_ref(),
         target,
-        now,
-        reset_alignment,
+        QuotaRenderTiming {
+            now,
+            reset_alignment,
+            highlight_countdown: quota::countdown_has_not_started(snapshot, now),
+        },
     )
 }
 
@@ -335,8 +367,11 @@ fn render_quota_values(
         window_seconds,
         reset_credits,
         target,
-        Utc::now().timestamp(),
-        None,
+        QuotaRenderTiming {
+            now: Utc::now().timestamp(),
+            reset_alignment: None,
+            highlight_countdown: false,
+        },
     )
 }
 
@@ -346,15 +381,20 @@ fn render_quota_values_at(
     window_seconds: Option<i64>,
     reset_credits: Option<&quota::ResetCredits>,
     target: &impl RenderTarget,
-    now: i64,
-    reset_alignment: Option<DurationUnit>,
+    timing: QuotaRenderTiming,
 ) -> String {
     let rounded_percent = remaining_percent.clamp(0.0, 100.0).round() as u64;
+    let reset_time = format_time_remaining_at(resets_at, timing.now, timing.reset_alignment);
+    let reset_time = if timing.highlight_countdown {
+        target.paint(&reset_time, Color::Yellow)
+    } else {
+        reset_time
+    };
     let mut rendered = format!(
         "{} [{}] {rounded_percent:>3}% remaining · resets in {}",
         quota_window_label(window_seconds),
         render_quota_bar(remaining_percent, target),
-        format_time_remaining_at(resets_at, now, reset_alignment),
+        reset_time,
     );
     if let Some(reset_credits) = reset_credits {
         let noun = if reset_credits.available_count == 1 {
@@ -374,7 +414,7 @@ fn render_quota_values_at(
                 } else {
                     "latest "
                 },
-                format_time_remaining_at(expires_at, now, None)
+                format_time_remaining_at(expires_at, timing.now, None)
             ));
         }
     }
@@ -535,6 +575,18 @@ mod tests {
         }
     }
 
+    struct TaggedTarget;
+
+    impl RenderTarget for TaggedTarget {
+        fn style(&self, text: &str, color: Option<Color>, _effect: TextEffect) -> String {
+            if color == Some(Color::Yellow) {
+                format!("<yellow>{text}</yellow>")
+            } else {
+                text.to_owned()
+            }
+        }
+    }
+
     #[test]
     fn quota_bar_and_summary_show_remaining_capacity() {
         assert_eq!(render_quota_bar(75.0, &PlainTarget), "████████████▓░░░");
@@ -564,12 +616,54 @@ mod tests {
     }
 
     #[test]
+    fn untouched_seven_day_countdowns_highlight_the_credential_and_reset_time() {
+        let now = 1_000_000;
+        let account = |reset_after_seconds| AccountView {
+            email: "idle@example.com".to_owned(),
+            active: false,
+            plan: Some("pro".to_owned()),
+            last_refresh: None,
+            status: AccountStatus::Ready,
+            quota: QuotaStatus::Available {
+                snapshot: quota::Snapshot {
+                    remaining_percent: 75.0,
+                    resets_at: now + 604_800,
+                    window_seconds: Some(604_800),
+                    reset_after_seconds: Some(reset_after_seconds),
+                    rate_limit_reset_credits: None,
+                },
+            },
+        };
+
+        let untouched = render_account_at_with_target(
+            &account(604_800),
+            "idle@example.com".len(),
+            now,
+            None,
+            &TaggedTarget,
+        );
+        assert!(untouched.contains("<yellow>idle@example.com</yellow>"));
+        assert!(untouched.contains("resets in <yellow> 7d  0h</yellow>"));
+
+        let running = render_account_at_with_target(
+            &account(604_799),
+            "idle@example.com".len(),
+            now,
+            None,
+            &TaggedTarget,
+        );
+        assert!(!running.contains("<yellow>idle@example.com</yellow>"));
+        assert!(!running.contains("resets in <yellow>"));
+    }
+
+    #[test]
     fn shorter_duration_units_align_under_their_matching_columns() {
         let snapshot = |resets_at| QuotaStatus::Available {
             snapshot: quota::Snapshot {
                 remaining_percent: 50.0,
                 resets_at,
                 window_seconds: Some(604_800),
+                reset_after_seconds: None,
                 rate_limit_reset_credits: None,
             },
         };
@@ -646,11 +740,11 @@ mod tests {
         let active = account("two@example.com", true);
 
         assert_eq!(
-            render_account_base(&inactive, inactive.email.len(), &PlainTarget),
+            render_account_base(&inactive, inactive.email.len(), &PlainTarget, false),
             "○ one@example.com ·        · PRO"
         );
         assert_eq!(
-            render_account_base(&active, active.email.len(), &PlainTarget),
+            render_account_base(&active, active.email.len(), &PlainTarget, false),
             "● two@example.com · active · PRO"
         );
     }
@@ -671,6 +765,7 @@ mod tests {
                         remaining_percent: 75.0,
                         resets_at: 2_000_000_000,
                         window_seconds: Some(18_000),
+                        reset_after_seconds: None,
                         rate_limit_reset_credits: None,
                     },
                 },

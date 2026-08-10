@@ -43,7 +43,22 @@ impl MockQuotaServer {
         response_delay: Duration,
         quotas: &[(&str, f64)],
     ) -> Self {
-        Self::start_with_fixtures(expected_requests, response_delay, quotas, &[], &[])
+        Self::start_with_fixtures(expected_requests, response_delay, quotas, &[], &[], &[])
+    }
+
+    fn start_with_countdowns(
+        expected_requests: usize,
+        quotas: &[(&str, f64)],
+        reset_after_seconds: &[(&str, i64)],
+    ) -> Self {
+        Self::start_with_fixtures(
+            expected_requests,
+            Duration::ZERO,
+            quotas,
+            &[],
+            &[],
+            reset_after_seconds,
+        )
     }
 
     fn start_with_reset_credits(
@@ -57,6 +72,7 @@ impl MockQuotaServer {
             response_delay,
             quotas,
             reset_credits,
+            &[],
             &[],
         )
     }
@@ -72,6 +88,7 @@ impl MockQuotaServer {
             quotas,
             &[],
             rejected_accounts,
+            &[],
         )
     }
 
@@ -81,6 +98,7 @@ impl MockQuotaServer {
         quotas: &[(&str, f64)],
         reset_credits: &[(&str, i64, Vec<serde_json::Value>)],
         rejected_accounts: &[&str],
+        reset_after_seconds: &[(&str, i64)],
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}/backend-api", listener.local_addr().unwrap());
@@ -112,6 +130,12 @@ impl MockQuotaServer {
                 .map(|account_id| account_id.to_ascii_lowercase())
                 .collect::<Vec<_>>(),
         );
+        let reset_after_seconds = Arc::new(
+            reset_after_seconds
+                .iter()
+                .map(|(account_id, seconds)| (account_id.to_ascii_lowercase(), *seconds))
+                .collect::<Vec<_>>(),
+        );
         let thread = thread::spawn(move || {
             let mut handlers = Vec::with_capacity(expected_requests);
             for _ in 0..expected_requests {
@@ -120,6 +144,7 @@ impl MockQuotaServer {
                 let quotas = quotas.clone();
                 let reset_credits = reset_credits.clone();
                 let rejected_accounts = rejected_accounts.clone();
+                let reset_after_seconds = reset_after_seconds.clone();
                 handlers.push(thread::spawn(move || {
                     let mut request = Vec::new();
                     let mut buffer = [0; 1024];
@@ -144,6 +169,17 @@ impl MockQuotaServer {
                         reset_credits.iter().find_map(|(candidate, fixture)| {
                             (candidate == account_id).then_some(fixture)
                         });
+                    let reset_after_seconds = reset_after_seconds
+                        .iter()
+                        .find_map(|(candidate, seconds)| {
+                            (candidate == account_id).then_some(*seconds)
+                        })
+                        .unwrap_or(600);
+                    let window_seconds = if reset_after_seconds == 604_800 {
+                        604_800
+                    } else {
+                        18_000
+                    };
                     let (status, body) = if rejected_accounts.contains(account_id) {
                         ("401 Unauthorized", "{}".to_owned())
                     } else if request.starts_with("get /backend-api/wham/usage ") {
@@ -154,8 +190,8 @@ impl MockQuotaServer {
                                 "limit_reached": false,
                                 "primary_window": {
                                     "used_percent": used_percent,
-                                    "limit_window_seconds": 18_000,
-                                    "reset_after_seconds": 600,
+                                    "limit_window_seconds": window_seconds,
+                                    "reset_after_seconds": reset_after_seconds,
                                     "reset_at": 2_000_000_000_i64
                                 },
                                 "secondary_window": null
@@ -386,6 +422,7 @@ fn help_orders_commands_logically_and_exposes_the_account_workflow() {
         .success()
         .stdout(predicate::str::contains("add"))
         .stdout(predicate::str::contains("fix"))
+        .stdout(predicate::str::contains("tickle"))
         .stdout(predicate::str::contains("next"))
         .stdout(predicate::str::contains("activate"));
 
@@ -849,6 +886,147 @@ fn list_reports_usable_reset_credits_and_the_latest_relative_expiry() {
         .stdout(predicate::str::contains("\"available_count\": 2"))
         .stdout(predicate::str::contains("\"latest_expires_at\""));
     assert_eq!(server.finish().len(), 6);
+}
+
+#[cfg(unix)]
+#[test]
+fn tickle_probes_only_exact_seven_day_countdowns_and_restores_the_active_credential() {
+    let root = tempdir().unwrap();
+    let credentials_home = root.path().join("credentials");
+    let codex_home = root.path().join("codex");
+    let runtime_dir = root.path().join("runtime");
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let server = MockQuotaServer::start_with_countdowns(
+        3,
+        &[("alice-id", 0.0), ("bob-id", 0.0), ("carol-id", 0.0)],
+        &[
+            ("alice-id", 604_800),
+            ("bob-id", 604_799),
+            ("carol-id", 604_800),
+        ],
+    );
+    seed_account_set(
+        &credentials_home,
+        &codex_home,
+        &server.base_url,
+        &[
+            ("alice@example.com", "alice-id", "alice-refresh"),
+            ("bob@example.com", "bob-id", "bob-refresh"),
+            ("carol@example.com", "carol-id", "carol-refresh"),
+        ],
+        Some(("bob@example.com", "bob-id", "bob-live")),
+    );
+
+    let fake_bin = root.path().join("bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let fake_codex = fake_bin.join("codex");
+    fs::write(
+        &fake_codex,
+        concat!(
+            "#!/bin/sh\n",
+            "printf 'cwd:%s\\n' \"$PWD\" >> \"$KAI_TEST_TICKLE_LOG\"\n",
+            "for arg in \"$@\"; do printf 'arg:%s\\n' \"$arg\" >> \"$KAI_TEST_TICKLE_LOG\"; done\n",
+            "grep '\"refresh_token\"' \"$CODEX_HOME/auth.json\" >> \"$KAI_TEST_TICKLE_LOG\"\n",
+            "printf 'end\\n' >> \"$KAI_TEST_TICKLE_LOG\"\n",
+            "printf 'discarded codex response\\n'\n",
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = env::join_paths(
+        std::iter::once(fake_bin).chain(env::split_paths(&env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let log_path = root.path().join("tickle.log");
+
+    let output = command(&credentials_home, &codex_home, &runtime_dir)
+        .env("HOME", &home)
+        .env("PATH", path)
+        .env("KAI_TEST_TICKLE_LOG", &log_path)
+        .args(["cred", "tickle"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "kai cred tickle failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("discarded codex response"));
+
+    let log = fs::read_to_string(log_path).unwrap();
+    assert_eq!(log.matches(&format!("cwd:{}\n", home.display())).count(), 2);
+    assert_eq!(log.matches("arg:exec\n").count(), 2);
+    assert_eq!(log.matches("arg:--skip-git-repo-check\n").count(), 2);
+    assert_eq!(log.matches("arg:--ephemeral\n").count(), 2);
+    assert_eq!(log.matches("arg:echo: test\n").count(), 2);
+    let alice = log.find("alice-refresh").unwrap();
+    let carol = log.find("carol-refresh").unwrap();
+    assert!(
+        alice < carol,
+        "credentials were not tickled in enrollment order:\n{log}"
+    );
+    assert!(!log.contains("bob-live"));
+    assert_eq!(
+        fs::read(codex_home.join("auth.json")).unwrap(),
+        auth_json("bob@example.com", "bob-id", "bob-live")
+    );
+    assert_eq!(server.finish().len(), 3);
+}
+
+#[cfg(unix)]
+#[test]
+fn tickle_restores_the_active_credential_after_a_codex_failure() {
+    let root = tempdir().unwrap();
+    let credentials_home = root.path().join("credentials");
+    let codex_home = root.path().join("codex");
+    let runtime_dir = root.path().join("runtime");
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let server = MockQuotaServer::start_with_countdowns(
+        2,
+        &[("alice-id", 0.0), ("bob-id", 0.0)],
+        &[("alice-id", 604_800), ("bob-id", 600)],
+    );
+    seed_account_set(
+        &credentials_home,
+        &codex_home,
+        &server.base_url,
+        &[
+            ("alice@example.com", "alice-id", "alice-refresh"),
+            ("bob@example.com", "bob-id", "bob-refresh"),
+        ],
+        Some(("bob@example.com", "bob-id", "bob-live")),
+    );
+
+    let fake_bin = root.path().join("bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let fake_codex = fake_bin.join("codex");
+    fs::write(
+        &fake_codex,
+        "#!/bin/sh\nprintf 'probe failed\\n' >&2\nexit 7\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = env::join_paths(
+        std::iter::once(fake_bin).chain(env::split_paths(&env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+
+    command(&credentials_home, &codex_home, &runtime_dir)
+        .env("HOME", &home)
+        .env("PATH", path)
+        .args(["cred", "tickle"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Codex request failed for alice@example.com",
+        ));
+    assert_eq!(
+        fs::read(codex_home.join("auth.json")).unwrap(),
+        auth_json("bob@example.com", "bob-id", "bob-live")
+    );
+    assert_eq!(server.finish().len(), 2);
 }
 
 #[test]

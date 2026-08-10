@@ -1,5 +1,7 @@
 use std::fs;
 use std::io::{self, IsTerminal, Write};
+use std::path::Path;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
@@ -24,6 +26,7 @@ use self::ui::{AccountStatus, AccountView, ListView, QuotaStatus};
     "  kai cred add personal@example.com --force\n",
     "  kai cred fix\n",
     "  kai cred list\n",
+    "  kai cred tickle\n",
     "  kai next\n",
     "  kai cred activate personal@example.com\n",
     "  kai cred remove work@example.com",
@@ -40,6 +43,17 @@ pub enum CredCommand {
         about = "List enrolled accounts with their live quota and active state."
     )]
     List(ListArgs),
+
+    #[command(
+        about = "Start any untouched seven-day quota countdowns.",
+        long_about = concat!(
+            "Find enrolled credentials whose quota reset time is still exactly seven days, ",
+            "temporarily activate each one, and send Codex an ephemeral `echo: test` request ",
+            "from the user's home directory. The original active credential is restored ",
+            "afterward, including when a request fails.",
+        )
+    )]
+    Tickle,
 
     #[command(about = "Activate the next usable enrolled account.")]
     Next,
@@ -166,6 +180,7 @@ async fn run_async(command: CredCommand) -> Result<()> {
     let mut store = Store::open(paths)?;
     match command {
         CredCommand::List(args) => cmd_list(&store, args).await,
+        CredCommand::Tickle => cmd_tickle(&mut store).await,
         CredCommand::Next => cmd_next(&mut store).await,
         CredCommand::Activate(args) => cmd_activate(&mut store, &args.email),
         CredCommand::Add(args) => cmd_add(&mut store, args).await,
@@ -310,6 +325,118 @@ async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn cmd_tickle(store: &mut Store) -> Result<()> {
+    if store.profiles().is_empty() {
+        bail!("no accounts are enrolled; run `kai cred add <email>` first");
+    }
+
+    let live = load_live_strict(store)?;
+    let original_active = match &live {
+        Some(credential) => {
+            let profile = require_managed_profile(store, credential)?.clone();
+            store.sync_profile(&profile, credential)?;
+            Some(profile)
+        }
+        None => None,
+    };
+    let profile_indices = (0..store.profiles().len()).collect::<Vec<_>>();
+    capulus::ui::stage("Checking enrolled account quotas");
+    let checks = fetch_profile_quotas(store, &profile_indices, live.as_ref()).await?;
+    let now = chrono::Utc::now().timestamp();
+    let mut targets = Vec::new();
+    for (index, result) in checks {
+        match result {
+            Ok(snapshot) if quota::countdown_has_not_started(&snapshot, now) => {
+                targets.push(store.profiles()[index].clone());
+            }
+            Ok(_) => {}
+            Err(err) => capulus::ui::warn(&format!(
+                "Could not retrieve quota for {}: {err:#}",
+                store.profiles()[index].email
+            )),
+        }
+    }
+
+    if targets.is_empty() {
+        capulus::ui::success("No enrolled credentials have an untouched seven-day countdown.");
+        return Ok(());
+    }
+
+    let codex = which::which("codex").context("could not find `codex` on PATH")?;
+    let home = capulus::paths::home_dir()
+        .context("could not determine the current user's home directory")?;
+    let noun = if targets.len() == 1 {
+        "credential"
+    } else {
+        "credentials"
+    };
+    capulus::ui::stage(&format!(
+        "Starting {} untouched seven-day quota {noun}",
+        targets.len()
+    ));
+
+    let tickle_result = tickle_profiles(store, &targets, &codex, &home);
+    let restore_result = restore_original_active(store, original_active.as_ref());
+    match (tickle_result, restore_result) {
+        (Ok(()), Ok(())) => {
+            capulus::ui::success(&format!(
+                "Tickled {} {noun} and restored the original Codex credential.",
+                targets.len()
+            ));
+            Ok(())
+        }
+        (Err(err), Ok(())) => Err(err),
+        (Ok(()), Err(restore_err)) => Err(restore_err)
+            .context("Codex requests completed, but the original credential was not restored"),
+        (Err(tickle_err), Err(restore_err)) => bail!(
+            "{tickle_err:#}; additionally, could not restore the original credential: \
+             {restore_err:#}"
+        ),
+    }
+}
+
+fn tickle_profiles(
+    store: &mut Store,
+    targets: &[Profile],
+    codex: &Path,
+    home: &Path,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    for target in targets {
+        activate(store, target)
+            .with_context(|| format!("could not temporarily activate {}", target.email))?;
+        capulus::ui::detail(&format!("Tickling {}...", target.email));
+        if let Err(err) = run_codex_tickle(codex, home) {
+            capulus::ui::warn(&format!("Could not tickle {}: {err:#}", target.email));
+            failures.push(target.email.clone());
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("Codex request failed for {}", failures.join(", "))
+    }
+}
+
+fn run_codex_tickle(codex: &Path, home: &Path) -> Result<()> {
+    let output = Command::new(codex)
+        .args(["exec", "--skip-git-repo-check", "--ephemeral", "echo: test"])
+        .current_dir(home)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("could not start {}", codex.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        bail!("Codex exited with {}", output.status);
+    }
+    bail!("Codex exited with {}: {stderr}", output.status)
 }
 
 fn ready_account_view(
@@ -867,6 +994,11 @@ fn activate(store: &mut Store, target: &Profile) -> Result<bool> {
             return Ok(false);
         }
     }
+    install_profile(store, target)?;
+    Ok(true)
+}
+
+fn install_profile(store: &Store, target: &Profile) -> Result<()> {
     let credential = store.credential(target)?;
     store.write_active(&credential)?;
     let installed = Credential::read(&store.paths().active_auth())?;
@@ -876,7 +1008,37 @@ fn activate(store: &mut Store, target: &Profile) -> Result<bool> {
             target.email
         );
     }
-    Ok(true)
+    Ok(())
+}
+
+fn restore_original_active(store: &Store, original: Option<&Profile>) -> Result<()> {
+    let sync_result = match load_live(store) {
+        LiveAuth::Absent => Ok(()),
+        LiveAuth::Present(credential) => match managed_profile(store, &credential).cloned() {
+            Some(profile) => store.sync_profile(&profile, &credential),
+            None => Err(anyhow!(
+                "the temporary Codex credential is no longer an enrolled account; its refreshed token could not be saved"
+            )),
+        },
+        LiveAuth::Invalid(err) => {
+            Err(err).context("the temporary Codex credential became unreadable")
+        }
+    };
+    let restore_result = match original {
+        Some(profile) => install_profile(store, profile),
+        None => store.remove_active(),
+    };
+
+    match (sync_result, restore_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(sync_err), Ok(())) => Err(sync_err).context(
+            "restored the original credential but could not save the temporary credential",
+        ),
+        (Ok(()), Err(restore_err)) => Err(restore_err),
+        (Err(sync_err), Err(restore_err)) => bail!(
+            "could not save the temporary credential: {sync_err:#}; could not restore the original credential: {restore_err:#}"
+        ),
+    }
 }
 
 fn load_live(store: &Store) -> LiveAuth {

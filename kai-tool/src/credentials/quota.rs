@@ -16,6 +16,7 @@ use super::paths::RuntimePaths;
 const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const QUOTA_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const QUOTA_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const UNSTARTED_COUNTDOWN_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone)]
 pub struct Client {
@@ -35,6 +36,8 @@ pub struct Snapshot {
     pub remaining_percent: f64,
     pub resets_at: i64,
     pub window_seconds: Option<i64>,
+    #[serde(skip)]
+    pub(super) reset_after_seconds: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit_reset_credits: Option<ResetCredits>,
 }
@@ -81,6 +84,8 @@ struct Window {
     used_percent: f64,
     #[serde(default)]
     limit_window_seconds: Option<i64>,
+    #[serde(default)]
+    reset_after_seconds: Option<i64>,
     reset_at: i64,
 }
 
@@ -153,6 +158,7 @@ impl Client {
             remaining_percent: (100.0 - window.used_percent).clamp(0.0, 100.0),
             resets_at: window.reset_at,
             window_seconds: window.limit_window_seconds.filter(|seconds| *seconds > 0),
+            reset_after_seconds: window.reset_after_seconds.filter(|seconds| *seconds >= 0),
             rate_limit_reset_credits,
         })
     }
@@ -230,6 +236,13 @@ pub fn requires_authentication(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<HttpStatusError>()
         .is_some_and(|error| error.0 == StatusCode::UNAUTHORIZED)
+}
+
+pub fn countdown_has_not_started(snapshot: &Snapshot, now: i64) -> bool {
+    snapshot
+        .reset_after_seconds
+        .unwrap_or_else(|| snapshot.resets_at.saturating_sub(now))
+        == UNSTARTED_COUNTDOWN_SECONDS
 }
 
 fn checked_response(response: Response) -> Result<Response> {
