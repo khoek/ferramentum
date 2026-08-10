@@ -47,6 +47,7 @@ all quota lookups finish, lists with multiple accounts end with a blank-line-sep
 averaging the accounts whose quota is available. A centered signed usage bar on the same line shows
 the average quota pace balance: elapsed window fraction minus consumed quota fraction. Positive
 values mean consumption is behind the clock, while negative values mean it is ahead of the clock.
+Values within ±0.20 are yellow, lower values are red, and higher values are green.
 
 `kai cred tickle` starts those untouched seven-day countdowns. It temporarily activates each
 matching credential in enrollment order, runs an ephemeral Codex request whose complete prompt is

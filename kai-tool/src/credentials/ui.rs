@@ -13,6 +13,7 @@ const FIELD_SEPARATOR: &str = " · ";
 const ACTIVE_LABEL: &str = "active";
 const QUOTA_BAR_SEGMENTS: usize = 16;
 const USAGE_BAR_HALF_SEGMENTS: usize = 8;
+const USAGE_NEUTRAL_THRESHOLD: f64 = 0.2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum DurationUnit {
@@ -592,11 +593,14 @@ fn render_total(view: &ListView, target: &impl RenderTarget, now: i64) -> String
     };
 
     let usage = match average_quota_pace(view, now) {
-        Some(value) => format!(
-            "usage: [{}] {:+.2}",
-            render_usage_bar(value, target),
-            normalize_signed_zero(value)
-        ),
+        Some(value) => {
+            let rendered_value = format!("{:+.2}", normalize_signed_zero(value));
+            format!(
+                "usage: [{}] {}",
+                render_usage_bar(value, target),
+                target.paint(&rendered_value, usage_color(value))
+            )
+        }
         None => format!("usage: [{}] unavailable", render_usage_bar(0.0, target)),
     };
 
@@ -632,6 +636,7 @@ fn quota_pace(snapshot: &quota::Snapshot, now: i64) -> Option<f64> {
 
 fn render_usage_bar(value: f64, target: &impl RenderTarget) -> String {
     let value = value.clamp(-1.0, 1.0);
+    let fill_color = usage_color(value);
     let magnitude = value.abs() * USAGE_BAR_HALF_SEGMENTS as f64;
     let filled = magnitude.floor() as usize;
     let partial = usize::from(magnitude > filled as f64 && filled < USAGE_BAR_HALF_SEGMENTS);
@@ -643,7 +648,7 @@ fn render_usage_bar(value: f64, target: &impl RenderTarget) -> String {
             target.paint(&"░".repeat(empty), Color::Blue),
             target.paint(
                 &format!("{}{}", "▓".repeat(partial), "█".repeat(filled)),
-                Color::Red
+                fill_color
             )
         )
     } else {
@@ -654,7 +659,7 @@ fn render_usage_bar(value: f64, target: &impl RenderTarget) -> String {
             "{}{}",
             target.paint(
                 &format!("{}{}", "█".repeat(filled), "▓".repeat(partial)),
-                Color::Green
+                fill_color
             ),
             target.paint(&"░".repeat(empty), Color::Blue)
         )
@@ -662,7 +667,17 @@ fn render_usage_bar(value: f64, target: &impl RenderTarget) -> String {
         target.paint(&"░".repeat(USAGE_BAR_HALF_SEGMENTS), Color::Blue)
     };
 
-    format!("{left}│{right}")
+    format!("{left}{}{right}", target.paint("│", Color::Yellow))
+}
+
+fn usage_color(value: f64) -> Color {
+    if value < -USAGE_NEUTRAL_THRESHOLD {
+        Color::Red
+    } else if value > USAGE_NEUTRAL_THRESHOLD {
+        Color::Green
+    } else {
+        Color::Yellow
+    }
 }
 
 fn normalize_signed_zero(value: f64) -> f64 {
@@ -857,6 +872,15 @@ mod tests {
         assert_eq!(render_usage_bar(0.0, &PlainTarget), "░░░░░░░░│░░░░░░░░");
         assert_eq!(render_usage_bar(0.5, &PlainTarget), "░░░░░░░░│████░░░░");
         assert_eq!(render_usage_bar(1.0, &PlainTarget), "░░░░░░░░│████████");
+    }
+
+    #[test]
+    fn usage_color_has_a_yellow_neutral_band() {
+        assert_eq!(usage_color(-0.21), Color::Red);
+        assert_eq!(usage_color(-0.20), Color::Yellow);
+        assert_eq!(usage_color(0.0), Color::Yellow);
+        assert_eq!(usage_color(0.20), Color::Yellow);
+        assert_eq!(usage_color(0.21), Color::Green);
     }
 
     #[test]
