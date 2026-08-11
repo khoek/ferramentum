@@ -8,6 +8,7 @@ use clap::{Args, Subcommand};
 
 mod auth;
 mod enroll;
+mod isolated_home;
 mod paths;
 mod quota;
 mod store;
@@ -208,37 +209,24 @@ async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
     let mut accounts = Vec::with_capacity(store.profiles().len());
     for profile in store.profiles() {
         let active = active_id == Some(profile.id.as_str());
-        let loaded = if active {
+        let credential = if active {
             match &live {
-                LiveAuth::Present(credential) => Ok((
-                    credential.facts.clone(),
-                    quota::Request::from_credential(credential),
-                )),
+                LiveAuth::Present(credential) => {
+                    Credential::from_bytes(credential.as_bytes().to_vec())
+                }
                 _ => unreachable!(),
             }
         } else {
-            store.credential(profile).map(|credential| {
-                let request = quota::Request::from_credential(&credential);
-                (credential.facts, request)
-            })
+            store.credential(profile)
         };
-        let (mut account, request) = match loaded {
-            Ok((facts, Ok(request))) => (
-                ready_account_view(profile, active, facts, QuotaStatus::Loading),
-                Some(request),
-            ),
-            Ok((facts, Err(err))) => (
-                ready_account_view(
-                    profile,
-                    active,
-                    facts,
-                    QuotaStatus::Unavailable {
-                        error: format!("{err:#}"),
-                        authentication_required: true,
-                    },
-                ),
-                None,
-            ),
+        let (mut account, credential) = match credential {
+            Ok(credential) => {
+                let facts = credential.facts.clone();
+                (
+                    ready_account_view(profile, active, facts, QuotaStatus::Loading),
+                    Some(credential),
+                )
+            }
             Err(err) => (
                 AccountView {
                     email: profile.email.clone(),
@@ -257,11 +245,12 @@ async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
             ),
         };
         let index = accounts.len();
-        if let Some(request) = request {
+        if let Some(credential) = credential {
             match &quota_client {
                 Ok(client) => {
                     let client = client.clone();
-                    quota_tasks.spawn(async move { (index, client.fetch(request).await) });
+                    quota_tasks
+                        .spawn(async move { (index, active, client.fetch(credential).await) });
                 }
                 Err(error) => {
                     account.quota = QuotaStatus::Unavailable {
@@ -285,8 +274,11 @@ async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
         ui::LiveList::start(&view)
     };
     while let Some(result) = quota_tasks.join_next().await {
-        let (index, quota) = result.context("a quota lookup task stopped unexpectedly")?;
-        view.accounts[index].set_quota(quota);
+        let (index, source_was_active, outcome) =
+            result.context("a quota lookup task stopped unexpectedly")?;
+        persist_quota_credential(store, &store.profiles()[index], source_was_active, &outcome)?;
+        view.accounts[index].last_refresh = outcome.credential.facts.last_refresh.clone();
+        view.accounts[index].set_quota(outcome.snapshot);
         if let Some(live_list) = &live_list {
             live_list.update(index, &view.accounts[index]);
         }
@@ -542,25 +534,33 @@ async fn fetch_profile_quotas(
     let mut tasks = tokio::task::JoinSet::new();
     for (slot, index) in profile_indices.iter().copied().enumerate() {
         let profile = &store.profiles()[index];
-        let request = match live {
+        let (credential, source_was_active) = match live {
             Some(credential) if credential.facts.account_id == profile.account_id => {
-                quota::Request::from_credential(credential)
+                (Credential::from_bytes(credential.as_bytes().to_vec()), true)
             }
-            _ => store
-                .credential(profile)
-                .and_then(|credential| quota::Request::from_credential(&credential)),
+            _ => (store.credential(profile), false),
         };
-        match request {
-            Ok(request) => {
+        match credential {
+            Ok(credential) => {
                 let client = client.clone();
-                tasks.spawn(async move { (slot, client.fetch(request).await) });
+                tasks.spawn(
+                    async move { (slot, source_was_active, client.fetch(credential).await) },
+                );
             }
             Err(err) => results[slot] = Some(Err(err)),
         }
     }
     while let Some(result) = tasks.join_next().await {
-        let (slot, quota) = result.context("a quota lookup task stopped unexpectedly")?;
-        results[slot] = Some(quota);
+        let (slot, source_was_active, outcome) =
+            result.context("a quota lookup task stopped unexpectedly")?;
+        let profile_index = profile_indices[slot];
+        persist_quota_credential(
+            store,
+            &store.profiles()[profile_index],
+            source_was_active,
+            &outcome,
+        )?;
+        results[slot] = Some(outcome.snapshot);
     }
     Ok(profile_indices
         .iter()
@@ -569,6 +569,59 @@ async fn fetch_profile_quotas(
             result.expect("every quota result is set directly or by a completed task")
         }))
         .collect())
+}
+
+/// Save a token rotation from an isolated quota worker without clobbering a newer live token.
+/// The active auth file is replaced only when it still contains the exact worker input.
+fn persist_quota_credential(
+    store: &Store,
+    profile: &Profile,
+    source_was_active: bool,
+    outcome: &quota::Outcome,
+) -> Result<()> {
+    if !source_was_active {
+        if outcome.credential_changed() {
+            sync_profile_if_changed(store, profile, &outcome.credential)?;
+        }
+        return Ok(());
+    }
+
+    match load_live(store) {
+        LiveAuth::Present(current) if current.facts.account_id == profile.account_id => {
+            if outcome.source_matches(&current) {
+                // Keep the vault copy durable before replacing the live token. If the second
+                // write fails, the newly rotated refresh token is still recoverable by activate.
+                sync_profile_if_changed(store, profile, &outcome.credential)?;
+                if outcome.credential_changed() {
+                    store.write_active(&outcome.credential)?;
+                }
+            } else {
+                // Another Codex process refreshed this account while the isolated request was in
+                // flight. Its live credential wins; overwriting it could resurrect a spent token.
+                sync_profile_if_changed(store, profile, &current)?;
+            }
+        }
+        LiveAuth::Absent | LiveAuth::Invalid(_) | LiveAuth::Present(_) => {
+            // The user switched or removed the active account concurrently. Preserve that choice
+            // while still saving this profile's potentially rotated refresh token.
+            sync_profile_if_changed(store, profile, &outcome.credential)?;
+        }
+    }
+    Ok(())
+}
+
+fn sync_profile_if_changed(
+    store: &Store,
+    profile: &Profile,
+    credential: &Credential,
+) -> Result<()> {
+    if store
+        .credential(profile)
+        .is_ok_and(|stored| stored.as_bytes() == credential.as_bytes())
+    {
+        return Ok(());
+    }
+    store.sync_profile(profile, credential)
 }
 
 fn rotation_order(profile_count: usize, active_index: Option<usize>) -> Vec<usize> {
@@ -767,29 +820,26 @@ async fn cmd_fix(store: &mut Store, args: FixArgs) -> Result<()> {
     } else {
         None
     };
-    let client = quota::Client::new(store.paths())?;
     let mut needs_repair = vec![false; store.profiles().len()];
     let mut indeterminate = 0;
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut check_indices = Vec::new();
     for (index, profile) in store.profiles().iter().enumerate() {
-        let request = match &live {
-            LiveAuth::Present(credential) if credential.facts.account_id == profile.account_id => {
-                quota::Request::from_credential(credential)
-            }
-            _ => store
-                .credential(profile)
-                .and_then(|credential| quota::Request::from_credential(&credential)),
-        };
-        match request {
-            Ok(request) => {
-                let client = client.clone();
-                tasks.spawn(async move { (index, client.fetch(request).await) });
-            }
-            Err(_) => needs_repair[index] = true,
+        let structurally_valid = matches!(
+            &live,
+            LiveAuth::Present(credential) if credential.facts.account_id == profile.account_id
+        ) || store.credential(profile).is_ok();
+        if structurally_valid {
+            check_indices.push(index);
+        } else {
+            needs_repair[index] = true;
         }
     }
-    while let Some(result) = tasks.join_next().await {
-        let (index, result) = result.context("a credential check task stopped unexpectedly")?;
+    let live_credential = match &live {
+        LiveAuth::Present(credential) => Some(credential),
+        LiveAuth::Absent | LiveAuth::Invalid(_) => None,
+    };
+    let checks = fetch_profile_quotas(store, &check_indices, live_credential).await?;
+    for (index, result) in checks {
         if let Err(err) = result {
             if quota::requires_authentication(&err) {
                 needs_repair[index] = true;
@@ -924,9 +974,16 @@ impl AuthFlowArgs {
 }
 
 async fn fetch_credential_quota(store: &Store, credential: &Credential) -> Result<quota::Snapshot> {
-    let client = quota::Client::new(store.paths())?;
-    let request = quota::Request::from_credential(credential)?;
-    client.fetch(request).await
+    let index = store
+        .profiles()
+        .iter()
+        .position(|profile| profile.account_id == credential.facts.account_id)
+        .context("active credential is not enrolled and cannot be checked safely")?;
+    fetch_profile_quotas(store, &[index], Some(credential))
+        .await?
+        .pop()
+        .context("quota result disappeared")?
+        .1
 }
 
 fn cmd_remove(store: &mut Store, args: RemoveArgs) -> Result<()> {

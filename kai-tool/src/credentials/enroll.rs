@@ -1,23 +1,13 @@
 use std::env;
 #[cfg(unix)]
 use std::fs;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, bail};
-use tempfile::{Builder, TempDir};
-
 use super::auth::Credential;
+use super::isolated_home::IsolatedCodexHome;
 use super::paths::RuntimePaths;
-use super::store::atomic_write;
-
-const AUTH_CONFIG_KEYS: &[&str] = &[
-    "chatgpt_base_url",
-    "forced_chatgpt_workspace_id",
-    "forced_login_method",
-];
+use anyhow::{Context, Result, bail};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthPreference {
@@ -59,12 +49,7 @@ fn run_with_binary(
     codex: &Path,
 ) -> Result<Credential> {
     let auth = resolve_auth(preference, LoginEnvironment::current());
-    let temporary_home = Builder::new()
-        .prefix(".enroll-")
-        .tempdir_in(&paths.credentials_home)
-        .context("could not create isolated Codex login directory")?;
-    set_private_directory(&temporary_home)?;
-    write_login_config(paths, &temporary_home)?;
+    let temporary_home = IsolatedCodexHome::create(paths, "enroll")?;
 
     capulus::ui::stage(&format!(
         "Starting isolated Codex sign-in for {expected_email}"
@@ -105,7 +90,8 @@ fn run_with_binary(
         }
     }
 
-    let credential = Credential::read(&temporary_home.path().join("auth.json"))
+    let credential = temporary_home
+        .credential()
         .context("Codex login completed but did not produce a file-backed ChatGPT credential")?;
     if !credential.matches_email(expected_email) {
         bail!(
@@ -194,31 +180,6 @@ fn wsl_browser_interop_available() -> bool {
 #[cfg(not(target_os = "linux"))]
 fn wsl_browser_interop_available() -> bool {
     false
-}
-
-fn write_login_config(paths: &RuntimePaths, temporary_home: &TempDir) -> Result<()> {
-    let mut isolated = toml::Table::new();
-    if let Some(source) = paths.read_codex_config()? {
-        for key in AUTH_CONFIG_KEYS {
-            if let Some(value) = source.get(*key) {
-                isolated.insert((*key).to_owned(), value.clone());
-            }
-        }
-    }
-    isolated.insert(
-        "cli_auth_credentials_store".to_owned(),
-        toml::Value::String("file".to_owned()),
-    );
-    atomic_write(
-        &temporary_home.path().join("config.toml"),
-        toml::to_string_pretty(&isolated)?.as_bytes(),
-    )
-}
-
-fn set_private_directory(directory: &TempDir) -> Result<()> {
-    #[cfg(unix)]
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
-    Ok(())
 }
 
 #[cfg(test)]

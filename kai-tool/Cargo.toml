@@ -1,6 +1,6 @@
 [package]
 name = "kai-tool"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2024"
 publish.workspace = true
 description = "CLI helpers for AI coding, Codex credentials, and git worktree management."
@@ -26,12 +26,11 @@ indicatif = { workspace = true }
 libc = { workspace = true }
 pathdiff = "0.2"
 rand = { workspace = true }
-reqwest = { workspace = true, features = ["json", "rustls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
-tokio = { version = "1", features = ["net", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["io-util", "net", "process", "rt-multi-thread", "time"] }
 walkdir = "2"
 which = { workspace = true }
 toml = "1"

@@ -37,17 +37,21 @@ kai cred remove work@example.com
 
 `kai cred list` fetches every account's current Codex quota concurrently and shows the remaining
 percentage, relative time until reset, and an inline progress bar. Usable rate-limit reset credits
-are shown with their count and latest relative expiry. On an interactive terminal, each account
-appears immediately with a live loading indicator and is rewritten as its quota arrives. After `kai
-next` or `kai cred next`, Kai reports the newly selected account's quota as soon as the in-flight
-lookup completes. Selecting an exhausted account with reset credits prints a notice directing you
-to Codex's `/usage` flow to redeem one. A credential name and its reset time are yellow when the
-backend reports exactly seven days remaining, indicating that quota countdown has not started. Once
-all quota lookups finish, lists with multiple accounts end with a blank-line-separated total bar
-averaging the accounts whose quota is available. A centered signed usage bar on the same line shows
-the average quota pace balance: elapsed window fraction minus consumed quota fraction. Positive
-values mean consumption is behind the clock, while negative values mean it is ahead of the clock.
-Values within ±0.20 are yellow, lower values are red, and higher values are green.
+are shown with their count and latest relative expiry. Every lookup runs `codex app-server` in its
+own temporary `CODEX_HOME`, so accounts are checked in parallel without swapping the live account
+or making quota API calls directly from Kai. Codex can refresh an expired access token inside that
+home; Kai atomically saves the resulting rotated credential back to the vault and, when appropriate,
+the live `auth.json`. On an interactive terminal, each account appears immediately with a live
+loading indicator and is rewritten as its quota arrives. After `kai next` or `kai cred next`, Kai
+reports the newly selected account's quota as soon as the in-flight lookup completes. Selecting an
+exhausted account with reset credits prints a notice directing you to Codex's `/usage` flow to
+redeem one. A credential name and its reset time are yellow when the backend reports a fresh
+seven-day window, indicating that quota countdown has not started. Once all quota lookups finish,
+lists with multiple accounts end with a blank-line-separated total bar averaging the accounts whose
+quota is available. A centered signed usage bar on the same line shows the average quota pace
+balance: elapsed window fraction minus consumed quota fraction. Positive values mean consumption is
+behind the clock, while negative values mean it is ahead of the clock. Values within ±0.20 are
+yellow, lower values are red, and higher values are green.
 
 `kai cred tickle` starts those untouched seven-day countdowns. It temporarily activates each
 matching credential in enrollment order, runs an ephemeral Codex request whose complete prompt is
@@ -102,7 +106,8 @@ Override it with `KAI_CREDENTIALS_HOME`. Kai reads and updates Codex's
 The vault is not encrypted; like Codex's own `auth.json`, it contains bearer credentials. On Unix,
 Kai enforces mode `0700` on vault directories and `0600` on credential/state files, refuses
 credential symlinks, uses atomic durable writes, and serializes credential operations with an
-invocation lock. Protect backups accordingly.
+invocation lock. Temporary Codex homes use the same private permissions and are removed as soon as
+their login or quota worker exits. Protect backups accordingly.
 
 Kai requires Codex to use file-backed CLI credentials. If `cli_auth_credentials_store` is set to
 `auto` or `keyring`, change it to `file` in the active Codex `config.toml`.
