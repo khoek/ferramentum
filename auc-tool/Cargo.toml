@@ -1,0 +1,47 @@
+[package]
+name = "auc-tool"
+version = "0.1.0"
+edition = "2024"
+publish.workspace = true
+description = "Machine-local software passkey authenticator exposed through Linux UHID."
+license = "AGPL-3.0-only"
+readme = "README.md"
+repository = "https://github.com/khoek/ferramentum/tree/master/auc-tool"
+keywords = ["passkey", "webauthn", "fido2", "uhid", "cli"]
+categories = ["authentication", "command-line-utilities"]
+
+[[bin]]
+name = "auc"
+path = "src/bin/auc.rs"
+
+[[bin]]
+name = "auc-agent"
+path = "src/bin/auc-agent.rs"
+
+[dependencies]
+capulus = { version = "0.5", features = ["managed-system"] }
+
+anyhow = { workspace = true }
+chacha20poly1305 = { workspace = true }
+ciborium = { workspace = true }
+clap = { workspace = true }
+dialoguer = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+libc = { workspace = true }
+passless-uhid = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true, features = ["json", "rustls"] }
+rustix = { workspace = true }
+semver = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_bytes = { workspace = true }
+sha2 = { workspace = true }
+soft-fido2 = { workspace = true }
+soft-fido2-transport = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net"] }
+zbus = { workspace = true }
+zeroize = { workspace = true, features = ["derive"] }
