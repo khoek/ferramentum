@@ -39,6 +39,22 @@ the graphical logind session. auc accepts that path only when logind attributes 
 same UID and that UID currently owns an active local graphical or TTY session; a caller belonging
 directly to a remote session remains ineligible.
 
+## CLI reporting
+
+One invocation-scoped reporter owns terminal capability detection, color policy, cancellation, and
+Indicatif rendering. Potentially slow queries use delayed indeterminate progress; repair, redeploy
+scheduling, and redeploy following expose their current phase immediately. Non-terminal stderr
+receives stable phase changes and periodic heartbeats without ANSI escapes. Fast queries never
+invent progress, and no determinate percentage is shown without a known count, byte total, or fixed
+duration.
+
+Progress and operational messages are written to stderr. Human-readable query payloads remain on
+stdout and only receive color when stdout is itself a terminal, unless the caller explicitly forces
+color. Prompts and sudo handoffs suspend live rendering. Redeploy polling has a deadline derived
+from the validated managed-product runtime, preserves cancellation as a typed interruption, tolerates
+brief agent restarts, and reports the durable job ID plus recorded commit, rollback, and user-CLI
+state on failure or interruption.
+
 ## User presence and CTAPHID cancellation
 
 Only one CTAP command requiring presence may be active. The authenticator callback publishes an

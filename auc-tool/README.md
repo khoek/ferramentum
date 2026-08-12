@@ -76,6 +76,17 @@ auc credentials delete CREDENTIAL_ID
 
 Deletion cannot be undone by replaying an older local event.
 
+## Terminal output
+
+auc uses a live terminal display for work that can take noticeable time and automatically falls
+back to stable, ANSI-free phase records when stderr is redirected. Fast local queries use delayed
+visibility, so successful commands do not flash a spinner unless the agent is genuinely slow.
+Command payloads such as status and credential rows stay on stdout; progress, confirmations,
+warnings, and mutation outcomes use stderr.
+
+Every command accepts `--progress auto|interactive|plain|off` and
+`--color auto|always|never`. The default color mode also honors `NO_COLOR`.
+
 ## Repair and redeploy
 
 Repair the installed files and units from the current managed installation:
