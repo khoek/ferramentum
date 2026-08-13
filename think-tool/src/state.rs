@@ -413,7 +413,10 @@ pub fn list_channels(project: &ProjectPaths) -> Result<Vec<ChannelSlug>> {
 }
 
 pub fn list_agents(role: &RolePaths) -> Result<Vec<AgentId>> {
-    list_slug_dirs(&role.agents_dir())
+    Ok(list_slug_dirs::<AgentId>(&role.agents_dir())?
+        .into_iter()
+        .filter(|agent| role.agent(agent.clone()).state().is_file())
+        .collect())
 }
 
 fn list_slug_dirs<S>(dir: &Path) -> Result<Vec<S>>
@@ -521,7 +524,9 @@ pub fn unix_timestamp() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProjectPaths, list_roles_by_display_order, natural_cmp};
+    use super::{
+        ProjectPaths, RolePaths, RoleSlug, list_agents, list_roles_by_display_order, natural_cmp,
+    };
 
     #[test]
     fn natural_sort_orders_embedded_numbers_by_value() {
@@ -555,5 +560,23 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(roles, ["episode", "supervisor", "auditor", "zeta"]);
+    }
+
+    #[test]
+    fn agents_are_listed_only_after_their_state_is_committed() {
+        let temp = tempfile::tempdir().unwrap();
+        let role = RolePaths::new(
+            ProjectPaths::new(temp.path().to_owned()),
+            RoleSlug::parse("publisher").unwrap(),
+        );
+        std::fs::create_dir_all(role.agent(super::AgentId::parse("pub1").unwrap()).root()).unwrap();
+        let committed = role.agent(super::AgentId::parse("pub2").unwrap());
+        std::fs::create_dir_all(committed.root()).unwrap();
+        std::fs::write(committed.state(), "committed").unwrap();
+
+        assert_eq!(
+            list_agents(&role).unwrap(),
+            [super::AgentId::parse("pub2").unwrap()]
+        );
     }
 }

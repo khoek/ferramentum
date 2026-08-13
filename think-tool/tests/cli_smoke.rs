@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
 
+const ASYNC_STATE_TIMEOUT: Duration = Duration::from_secs(30);
+const ASYNC_STATE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 fn think() -> Command {
     Command::new(env!("CARGO_BIN_EXE_think"))
 }
@@ -387,7 +390,7 @@ fn wait_for_only_agent_dir(
     project: &Path,
     role: &str,
 ) -> Result<std::path::PathBuf, Box<dyn Error>> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + ASYNC_STATE_TIMEOUT;
     loop {
         match only_agent_dir(project, role) {
             Ok(path) => return Ok(path),
@@ -396,23 +399,23 @@ fn wait_for_only_agent_dir(
             }
             Err(_) => {}
         }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(ASYNC_STATE_POLL_INTERVAL);
     }
 }
 
 fn wait_for_path(path: &Path) -> Result<(), Box<dyn Error>> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + ASYNC_STATE_TIMEOUT;
     while Instant::now() < deadline {
         if path.exists() {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(ASYNC_STATE_POLL_INTERVAL);
     }
     Err(format!("timed out waiting for {}", path.display()).into())
 }
 
 fn wait_for_file_contains(path: &Path, needle: &str) -> Result<(), Box<dyn Error>> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + ASYNC_STATE_TIMEOUT;
     while Instant::now() < deadline {
         if path.exists() {
             let text = fs::read_to_string(path)?;
@@ -420,7 +423,7 @@ fn wait_for_file_contains(path: &Path, needle: &str) -> Result<(), Box<dyn Error
                 return Ok(());
             }
         }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(ASYNC_STATE_POLL_INTERVAL);
     }
     Err(format!(
         "timed out waiting for {} to contain {needle:?}",
@@ -962,7 +965,10 @@ fn queued_triggers_start_agents_with_trigger_context() -> Result<(), Box<dyn Err
     )?)?;
 
     let orchestrator_agent = wait_for_only_agent_dir(&project, "orchestrator")?;
-    wait_for_path(&orchestrator_agent.join("TRIGGER.md"))?;
+    wait_for_file_contains(
+        &orchestrator_agent.join("TRIGGER.md"),
+        "trigger kind: role-agent-finished",
+    )?;
     let orchestrator_trigger = fs::read_to_string(orchestrator_agent.join("TRIGGER.md"))?;
     assert!(orchestrator_trigger.contains("trigger kind: role-agent-finished"));
     assert!(orchestrator_trigger.contains("source role: `episode`"));
@@ -973,7 +979,10 @@ fn queued_triggers_start_agents_with_trigger_context() -> Result<(), Box<dyn Err
     assert!(orchestrator_prompt.contains("role-agent-finished"));
 
     let publisher_agent = wait_for_only_agent_dir(&project, "publisher")?;
-    wait_for_path(&publisher_agent.join("TRIGGER.md"))?;
+    wait_for_file_contains(
+        &publisher_agent.join("TRIGGER.md"),
+        "trigger kind: role-agent-finished",
+    )?;
     let publisher_trigger = fs::read_to_string(publisher_agent.join("TRIGGER.md"))?;
     assert!(publisher_trigger.contains("trigger kind: role-agent-finished"));
     assert!(publisher_trigger.contains("source role: `episode`"));
@@ -1307,7 +1316,7 @@ fn manual_and_idle_triggers_start_prefixed_auto_archived_supervisors() -> Result
         .join("supervisor")
         .join("agents")
         .join("o1");
-    wait_for_path(&manual_agent.join("TRIGGER.md"))?;
+    wait_for_file_contains(&manual_agent.join("TRIGGER.md"), "trigger kind: manual")?;
     let manual_trigger = fs::read_to_string(manual_agent.join("TRIGGER.md"))?;
     assert!(manual_trigger.contains("trigger kind: manual"));
     assert!(manual_trigger.contains("manual smoke review"));
@@ -1353,7 +1362,7 @@ fn manual_and_idle_triggers_start_prefixed_auto_archived_supervisors() -> Result
         .join("supervisor")
         .join("agents")
         .join("o2");
-    wait_for_path(&idle_agent.join("TRIGGER.md"))?;
+    wait_for_file_contains(&idle_agent.join("TRIGGER.md"), "trigger kind: queue-idle")?;
     let idle_trigger = fs::read_to_string(idle_agent.join("TRIGGER.md"))?;
     assert!(idle_trigger.contains("trigger kind: queue-idle"));
     assert!(idle_trigger.contains("queue: `publisher`"));
