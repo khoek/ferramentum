@@ -2,11 +2,11 @@
 
 ## Scope and security boundary
 
-auc is a Linux software roaming authenticator. `auc-agent` is one root system service that owns a
-kernel UHID descriptor for its complete lifetime, exposes a USB/external FIDO HID device, stores the
-authenticator vault, and serves two systemd-owned Unix listeners. `auc` is an unprivileged client.
-It never receives credential private keys, the vault key, plaintext events, PIN state, or privileged
-installation controls.
+auc is a Linux software roaming authenticator. `/usr/local/bin/auc agent serve` is the one root
+system process. It owns a kernel UHID descriptor for its complete lifetime, exposes a USB/external
+FIDO HID device, stores the authenticator vault, and serves two systemd-owned Unix listeners. A
+user's Cargo-installed `auc` is an unprivileged client. It never receives credential private keys,
+the vault key, plaintext events, PIN state, or privileged installation controls.
 
 This release is deliberately machine-local. It has no pairing, synchronization, import, export,
 remote-event, replication, SSH, timer, or network transport. The event format leaves an explicit
@@ -26,8 +26,8 @@ non-vendor USB identity.
 `auc-agent.service` stays running so the UHID device remains present. systemd creates
 `/run/auc/agent.sock` (`application`) and `/run/auc/capulus.sock` (`capulus`) with `Accept=no` and
 passes both descriptors to the service. The application protocol contains status, touch, and local
-credential administration. Capulus v1 exclusively contains resolve, redeploy, job status, repair,
-and installation information. There is no presence socket, helper process, update broker, or
+credential administration. Capulus v2 contains resolve, redeploy, job status, repair, and agent
+identity. There is no separate agent executable, presence socket, helper process, update broker, or
 permanent redeploy unit.
 
 Both protocols are bounded, length-prefixed CBOR with one request per Unix-stream connection and a
@@ -52,8 +52,8 @@ Progress and operational messages are written to stderr. Human-readable query pa
 stdout and only receive color when stdout is itself a terminal, unless the caller explicitly forces
 color. Prompts and sudo handoffs suspend live rendering. Redeploy polling has a deadline derived
 from the validated managed-product runtime, preserves cancellation as a typed interruption, tolerates
-brief agent restarts, and reports the durable job ID plus recorded commit, rollback, and user-CLI
-state on failure or interruption.
+brief agent restarts, and reports the durable job ID plus recorded commit and rollback state on
+failure or interruption.
 
 ## User presence and CTAPHID cancellation
 
@@ -107,14 +107,20 @@ upgrades unknown data.
 
 ## Installation and redeployment
 
-`auc system install` re-executes the separate `auc-agent` binary through sudo for the narrowly
-defined first installation, creates the `auc` operator group, adds only the explicitly selected
-local interactive account, and installs validated same-version binaries and Capulus-rendered units.
-Subsequent repairs and redeploys use only `/run/auc/capulus.sock`. Capulus builds exact releases as
-the shared `capulus-build` system account, commits a journaled system transaction, verifies version
-and readiness through both sockets, and updates an invoking user's existing Cargo-installed `auc`
-under that UID. Root never receives Rustup or Cargo.
+The first installation requires an explicit root-controlled Cargo bootstrap of the exact release to
+`/usr/local/bin/auc`. `auc system install` verifies that root-owned executable and its version, then
+invokes only `/usr/local/bin/auc agent install` through sudo. The hidden installer verifies its own
+canonical path again. The complete system path must be rooted in non-writable root-owned
+directories and end in a mode-0755 regular file. Installation creates the `auc` operator group,
+adds only the explicitly selected local interactive account, and installs the single program plus
+Capulus-rendered units.
+
+Subsequent repairs and redeploys use only `/run/auc/capulus.sock`. The unprivileged client resolves
+the target and updates its own Cargo-installed `auc` before requesting the system cutover. Capulus
+then builds the exact release as `capulus-build`, commits a journaled system transaction, and
+verifies identity, version, and readiness through both sockets. Privileged code never executes or
+rebuilds the user-owned program.
 
 Uninstall is an explicit agent operation. It refuses while CTAP presence or a redeploy is active,
-stops/disables the units, removes only auc binaries/units/runtime state, and preserves the encrypted
-vault unless the operator separately confirms vault destruction.
+stops/disables the units, removes only `/usr/local/bin/auc`, managed units, and runtime state, and
+preserves the encrypted vault unless the operator separately confirms vault destruction.

@@ -149,12 +149,7 @@ pub(super) fn redeploy_recorded_state(job: &RedeployJob) -> String {
             None => "system commit occurred; no rollback result was recorded",
         }
     };
-    let user = match job.required_user_reinstalled {
-        Some(true) => "requesting-user CLI was reinstalled",
-        Some(false) => "requesting-user CLI was not reinstalled",
-        None => "no requesting-user CLI outcome was recorded",
-    };
-    format!("{system} · {user}")
+    system.to_string()
 }
 
 pub(super) fn render_job(job: &RedeployJob, target: &impl RenderTarget) -> Vec<String> {
@@ -174,15 +169,6 @@ pub(super) fn render_job(job: &RedeployJob, target: &impl RenderTarget) -> Vec<S
         });
     } else if job.phase == JobPhase::Failed && job.system_committed {
         state.push(target.paint("rollback outcome unrecorded", Color::Yellow));
-    }
-    if let Some(reinstalled) = job.required_user_reinstalled {
-        state.push(if reinstalled {
-            target.paint("user CLI reinstalled", Color::Green)
-        } else {
-            target.paint("user CLI not reinstalled", Color::Yellow)
-        });
-    } else if job.phase.is_terminal() {
-        state.push(target.paint("user CLI outcome unrecorded", Color::Yellow));
     }
     state.push(format!("unit {}", terminal_text(&job.unit)));
     vec![
@@ -212,13 +198,11 @@ pub(super) fn phase_name(phase: &JobPhase) -> &'static str {
         JobPhase::Queued => "queued",
         JobPhase::Preparing => "preparing",
         JobPhase::Toolchain => "checking Rust toolchain",
-        JobPhase::Resolving => "resolving release",
         JobPhase::Building => "building binaries",
         JobPhase::Validating => "validating release",
         JobPhase::Staging => "staging installation",
         JobPhase::CommittingSystem => "committing system files",
         JobPhase::RestartingAgent => "restarting auc-agent",
-        JobPhase::ReinstallingUser => "reinstalling user CLI",
         JobPhase::Complete => "complete",
         JobPhase::Failed => "failed",
     }
@@ -292,19 +276,18 @@ mod tests {
             detail: "validation failed".to_string(),
             system_committed: true,
             rollback_succeeded: Some(false),
-            required_user_reinstalled: Some(false),
         };
         assert_eq!(
             render_job(&job, &PlainTarget),
             [
                 "● job deadbeefdeadbeefdeadbeefdeadbeef · auc v0.2.0 · failed",
                 "  validation failed",
-                "  system committed · rollback failed · user CLI not reinstalled · unit auc-redeploy-deadbeef.service",
+                "  system committed · rollback failed · unit auc-redeploy-deadbeef.service",
             ]
         );
         assert_eq!(
             redeploy_recorded_state(&job),
-            "system commit occurred and rollback did not succeed · requesting-user CLI was not reinstalled"
+            "system commit occurred and rollback did not succeed"
         );
     }
 }

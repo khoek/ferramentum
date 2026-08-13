@@ -1,8 +1,8 @@
 # auc
 
-auc is a machine-local Linux software passkey authenticator. A persistent `auc-agent` system
-service exposes one external FIDO2 authenticator through Linux UHID; the ordinary `auc touch`
-command supplies one explicit user-presence gesture to one pending browser operation.
+auc is a machine-local Linux software passkey authenticator. A persistent `auc-agent.service`
+exposes one external FIDO2 authenticator through Linux UHID; the ordinary `auc touch` command
+supplies one explicit user-presence gesture to one pending browser operation.
 
 ## Requirements
 
@@ -15,8 +15,15 @@ command supplies one explicit user-presence gesture to one pending browser opera
 
 ```console
 cargo install --locked auc-tool
+sudo -i
+cargo install --locked --force --root /usr/local --version VERSION auc-tool --bin auc
+exit
 auc system install
 ```
+
+Use the same `VERSION` reported by `auc --version`. The explicit root-controlled Cargo step creates
+the trusted `/usr/local/bin/auc` bootstrap. `auc system install` then invokes only that root-owned
+program through sudo; it never executes the user-owned Cargo copy with privilege.
 
 Start a new login session after installation so membership in the `auc` group takes effect.
 

@@ -1,18 +1,18 @@
-use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use auc_tool::application::{
     ApplicationClient, ApplicationError, ApplicationRequest, ApplicationResponse,
     ErrorCode as ApplicationErrorCode,
 };
 use auc_tool::product::{APPLICATION_SOCKET_PATH, MANAGEMENT_SOCKET_PATH, managed_product};
 use capulus::managed::{
-    ErrorCode as ManagementErrorCode, JobId, JobPhase, ManagementClient, ManagementClientOptions,
-    ManagementError, ManagementRequest, ManagementResponse, RedeployJob, VersionTarget,
+    AgentLifecycleCommand, ErrorCode as ManagementErrorCode, JobId, JobPhase, ManagementClient,
+    ManagementClientOptions, ManagementError, ManagementRequest, ManagementResponse, RedeployJob,
+    UserProgramUpdateOptions, VersionTarget,
 };
 use capulus::ui::{TaskOptions, TaskVisibility, Ui};
 use clap::{Parser, Subcommand};
@@ -47,6 +47,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum CommandLine {
+    #[command(hide = true)]
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
+
     /// Show the agent, virtual authenticator, presence, and credential status.
     Status,
 
@@ -67,6 +73,26 @@ enum CommandLine {
 }
 
 #[derive(Subcommand)]
+enum AgentCommand {
+    Serve,
+
+    Install {
+        #[arg(long)]
+        operator_uid: u32,
+    },
+
+    Uninstall {
+        #[arg(long)]
+        operator_uid: u32,
+        #[arg(long)]
+        purge_vault: bool,
+    },
+
+    #[command(flatten)]
+    Lifecycle(AgentLifecycleCommand),
+}
+
+#[derive(Subcommand)]
 enum CredentialCommand {
     /// List every resident credential in the encrypted local vault.
     List,
@@ -82,7 +108,7 @@ enum CredentialCommand {
 
 #[derive(Subcommand)]
 enum SystemCommand {
-    /// Bootstrap the managed auc system service through sudo.
+    /// Initialize the managed auc system service from a trusted system installation.
     Install,
 
     /// Restore managed files and refresh the installed systemd units.
@@ -119,12 +145,40 @@ enum SystemCommand {
 }
 
 fn main() -> capulus::CliTermination {
-    let cli = Cli::parse();
-    let ui = match Ui::from_options(cli.ui.options()) {
+    let Cli {
+        ui: ui_options,
+        command,
+    } = Cli::parse();
+    if let CommandLine::Agent { command } = command {
+        return capulus::CliTermination::without_ui(run_agent(command).map(|()| 0));
+    }
+    let ui = match Ui::from_options(ui_options.options()) {
         Ok(ui) => ui,
         Err(error) => return capulus::CliTermination::without_ui(Err(error)),
     };
-    capulus::CliTermination::with_ui(&ui, run(cli.command, &ui).map(|()| 0))
+    capulus::CliTermination::with_ui(&ui, run(command, &ui).map(|()| 0))
+}
+
+fn run_agent(command: AgentCommand) -> Result<()> {
+    match command {
+        AgentCommand::Serve => auc_tool::agent::run(),
+        AgentCommand::Install { operator_uid } => {
+            auc_tool::agent::require_root()?;
+            auc_tool::agent::runtime()?.block_on(auc_tool::system::install(operator_uid))
+        }
+        AgentCommand::Uninstall {
+            operator_uid,
+            purge_vault,
+        } => {
+            auc_tool::agent::require_root()?;
+            auc_tool::agent::runtime()?
+                .block_on(auc_tool::system::uninstall(operator_uid, purge_vault))
+        }
+        AgentCommand::Lifecycle(command) => command.run(
+            Arc::new(managed_product()?),
+            auc_tool::agent::application_health,
+        ),
+    }
 }
 
 fn run(command: CommandLine, ui: &Ui) -> Result<()> {
@@ -133,6 +187,7 @@ fn run(command: CommandLine, ui: &Ui) -> Result<()> {
         CommandLine::Touch => touch(ui),
         CommandLine::Credentials { command } => credentials(command, ui),
         CommandLine::System { command } => system(command, ui),
+        CommandLine::Agent { .. } => unreachable!("agent commands bypass the interactive CLI"),
     }
 }
 
@@ -399,35 +454,81 @@ fn repair(ui: &Ui) -> Result<()> {
 }
 
 fn redeploy(ui: &Ui, version: Option<String>, no_wait: bool) -> Result<()> {
+    let product = managed_product()?;
     let wait_timeout = if no_wait {
         None
     } else {
-        Some(managed_product()?.redeploy_runtime_max() + REDEPLOY_WAIT_GRACE)
+        Some(product.redeploy_runtime_max() + REDEPLOY_WAIT_GRACE)
     };
-    let schedule = ui.task(TaskOptions {
-        label: "Scheduling an auc redeploy".to_string(),
+    let resolve = ui.task(TaskOptions {
+        label: "Resolving the auc redeploy release".to_string(),
         deadline: Some(REQUEST_TIMEOUT),
         visibility: TaskVisibility::Immediate,
         ..TaskOptions::default()
     })?;
     let target = match version {
         Some(version) => {
-            schedule.set_phase(format!(
+            resolve.set_phase(format!(
                 "requesting exact release v{}",
                 terminal_text(&version)
             ));
             VersionTarget::Exact(version)
         }
         None => {
-            schedule.set_phase("resolving the latest published release");
+            resolve.set_phase("resolving the latest published release");
             VersionTarget::Latest
         }
     };
+    let release = match management_request(ui, ManagementRequest::Resolve { target })? {
+        ManagementResponse::Resolved(release) => release,
+        _ => bail!("auc agent returned the wrong release-resolution response"),
+    };
+    let version = release.version.to_string();
+    resolve.finish(format!("Resolved auc v{}", terminal_text(&version)));
+
+    if !rustix::process::geteuid().is_root() {
+        let installer = UserProgramUpdateOptions {
+            package: "auc-tool".to_string(),
+            cargo_binary: "auc".to_string(),
+            version: version.clone(),
+            registry: release.cargo_registry,
+            install_root: capulus::managed::current_user_cargo_install_root()?,
+            ..UserProgramUpdateOptions::default()
+        }
+        .validate()?;
+        if !installer.is_current() {
+            let update = ui.task(TaskOptions {
+                label: format!("Updating the user auc CLI to v{}", terminal_text(&version)),
+                deadline: Some(Duration::from_secs(60 * 60)),
+                visibility: TaskVisibility::Immediate,
+                ..TaskOptions::default()
+            })?;
+            update.set_phase("running the invoking user's Cargo installation");
+            if let Err(error) = ui.suspend(|| installer.install(ui.cancellation())) {
+                update.abandon("User CLI update failed; no system redeploy was scheduled");
+                return Err(error);
+            }
+            update.finish(format!(
+                "Updated the user auc CLI to v{}",
+                terminal_text(&version)
+            ));
+        }
+    }
+
+    let schedule = ui.task(TaskOptions {
+        label: "Scheduling the auc system redeploy".to_string(),
+        deadline: Some(REQUEST_TIMEOUT),
+        visibility: TaskVisibility::Immediate,
+        ..TaskOptions::default()
+    })?;
+    schedule.set_phase(format!(
+        "requesting exact release v{}",
+        terminal_text(&version)
+    ));
     let outcome = match management_request(
         ui,
         ManagementRequest::Redeploy {
-            target,
-            reinstall_requesting_user: true,
+            target: VersionTarget::Exact(version),
         },
     ) {
         Ok(ManagementResponse::Redeploy(outcome)) => outcome,
@@ -477,15 +578,14 @@ fn install(ui: &Ui) -> Result<()> {
     if uid == 0 {
         bail!("run auc system install as the local user who should operate auc, not as root");
     }
-    let agent = sibling_agent()?;
-    verify_sibling_version(&agent)?;
+    let program = verified_system_program()?;
     ui.info("Installing auc through sudo; authentication may be required.");
     let status = ui
         .suspend(|| {
             Command::new("/usr/bin/sudo")
                 .arg("--")
-                .arg(agent)
-                .arg("install")
+                .arg(program)
+                .args(["agent", "install"])
                 .arg("--operator-uid")
                 .arg(uid.to_string())
                 .status()
@@ -538,20 +638,12 @@ fn uninstall(ui: &Ui, purge_vault: bool, yes: bool) -> Result<()> {
             return Ok(());
         }
     }
-    let agent = Path::new("/usr/local/bin/auc-agent");
-    let metadata = fs::symlink_metadata(agent).context("system auc-agent is not installed")?;
-    if !metadata.file_type().is_file()
-        || metadata.uid() != 0
-        || metadata.gid() != 0
-        || metadata.permissions().mode() & 0o111 == 0
-    {
-        bail!("system auc-agent failed ownership, type, or mode validation");
-    }
+    let program = verified_system_program()?;
     let mut command = Command::new("/usr/bin/sudo");
     command
         .arg("--")
-        .arg(agent)
-        .arg("uninstall")
+        .arg(program)
+        .args(["agent", "uninstall"])
         .arg("--operator-uid")
         .arg(uid.to_string());
     if purge_vault {
@@ -583,44 +675,33 @@ fn uninstall(ui: &Ui, purge_vault: bool, yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn sibling_agent() -> Result<PathBuf> {
-    let executable = fs::canonicalize("/proc/self/exe")
-        .context("failed to resolve the running auc executable")?;
-    let agent = executable
-        .parent()
-        .ok_or_else(|| anyhow!("auc executable has no parent directory"))?
-        .join("auc-agent");
-    let metadata = fs::symlink_metadata(&agent).with_context(|| {
+fn verified_system_program() -> Result<PathBuf> {
+    let product = managed_product()?;
+    let program = product.program().trusted_installed_path().with_context(|| {
         format!(
-            "auc-agent is not installed beside auc at {}",
-            agent.display()
+            "trusted system auc is not installed at {}; install auc-tool v{} as root with `cargo install --locked --force --root /usr/local --version {} auc-tool --bin auc`, then retry",
+            product.program().installed_path().display(),
+            env!("CARGO_PKG_VERSION"),
+            env!("CARGO_PKG_VERSION")
         )
-    })?;
-    if !metadata.file_type().is_file()
-        || metadata.uid() != rustix::process::geteuid().as_raw()
-        || metadata.permissions().mode() & 0o111 == 0
-    {
-        bail!("sibling auc-agent is not an executable regular file owned by the invoking user");
-    }
-    Ok(agent)
-}
-
-fn verify_sibling_version(agent: &Path) -> Result<()> {
-    let output = Command::new(agent)
+    })?.to_path_buf();
+    let output = Command::new("/usr/bin/timeout")
+        .args(["--signal=TERM", "--kill-after=2s", "10s"])
+        .arg(&program)
         .arg("--version")
         .output()
-        .context("failed to query sibling auc-agent version")?;
+        .context("failed to query trusted system auc version")?;
     if !output.status.success()
         || output.stdout.len() > 4096
         || String::from_utf8(output.stdout)?.split_whitespace().last()
             != Some(env!("CARGO_PKG_VERSION"))
     {
         bail!(
-            "sibling auc-agent does not match auc {}",
+            "trusted system auc does not match invoking auc {}",
             env!("CARGO_PKG_VERSION")
         );
     }
-    Ok(())
+    Ok(program)
 }
 
 fn wait_for_job(ui: &Ui, job: JobId, wait_timeout: Duration) -> Result<()> {
@@ -650,11 +731,6 @@ fn wait_for_job(ui: &Ui, job: JobId, wait_timeout: Duration) -> Result<()> {
                             "auc v{} redeployed · job {job}",
                             terminal_text(&status.version)
                         ));
-                        if status.required_user_reinstalled == Some(false) {
-                            ui.warn(
-                                "The system redeploy completed, but the requesting user's auc CLI was not reinstalled.",
-                            );
-                        }
                         return Ok(());
                     }
                     JobPhase::Failed => {
@@ -755,6 +831,27 @@ fn print_job(job: &RedeployJob, target: &impl capulus::ui::RenderTarget) {
 mod tests {
     use super::*;
     use capulus::ui::{ColorMode, ProgressMode, UiOptions};
+    use clap::CommandFactory;
+
+    #[test]
+    fn hidden_agent_namespace_owns_system_and_lifecycle_endpoints() {
+        assert!(
+            !Cli::command()
+                .render_long_help()
+                .to_string()
+                .contains("\n  agent ")
+        );
+        assert!(matches!(
+            Cli::try_parse_from(["auc", "agent", "serve"])
+                .expect("hidden agent service endpoint should parse")
+                .command,
+            CommandLine::Agent {
+                command: AgentCommand::Serve
+            }
+        ));
+        Cli::try_parse_from(["auc", "agent", "installation-manifest"])
+            .expect("embedded Capulus lifecycle endpoint should parse");
+    }
 
     #[test]
     fn mutation_reporting_distinguishes_rejections_from_unknown_outcomes() {

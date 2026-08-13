@@ -1,6 +1,6 @@
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,14 +26,11 @@ pub async fn install(operator_uid: u32) -> Result<()> {
     operator.validate_interactive()?;
     ensure_uhid_device()?;
     let product = managed_product()?;
-    let artifacts =
-        BuildArtifacts::from_local_directory(&product, local_binary_directory()?, &operator)?;
+    let artifacts = BuildArtifacts::from_installed_program(&product)?;
     Vault::open().context("failed to initialize or validate the auc vault")?;
     let mut access = AccessGroupSetup::prepare(operator)?;
     let mut installation =
-        match SystemInstallation::prepare(&product, JobId::random(), &artifacts, &access.operator)
-            .await
-        {
+        match SystemInstallation::prepare(&product, JobId::random(), &artifacts).await {
             Ok(installation) => installation,
             Err(error) => {
                 access.rollback()?;
@@ -162,18 +159,6 @@ fn outcome(result: &Result<()>) -> String {
         Ok(()) => "succeeded".to_string(),
         Err(error) => format!("failed: {error:#}"),
     }
-}
-
-fn local_binary_directory() -> Result<PathBuf> {
-    let executable = fs::canonicalize("/proc/self/exe")
-        .context("failed to resolve the running auc-agent executable")?;
-    if executable.file_name().and_then(|name| name.to_str()) != Some("auc-agent") {
-        bail!("the installation executable is not named auc-agent");
-    }
-    executable
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| anyhow!("auc-agent executable has no parent directory"))
 }
 
 fn validate_audit_login(operator_uid: u32) -> Result<()> {
@@ -406,12 +391,7 @@ fn user_has_group(account: &UnixAccount) -> Result<bool> {
 }
 
 fn command_success(program: &str, arguments: &[&str]) -> Result<bool> {
-    let output = Command::new(program)
-        .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .env("LANG", "C.UTF-8")
-        .args(arguments)
-        .output()?;
+    let output = bounded_command(program, arguments).output()?;
     ensure_bounded_output(&output)?;
     match output.status.code() {
         Some(0) => Ok(true),
@@ -425,11 +405,7 @@ fn checked_command(program: &str, arguments: &[&str], action: &str) -> Result<()
 }
 
 fn checked_output(program: &str, arguments: &[&str], action: &str) -> Result<Output> {
-    let output = Command::new(program)
-        .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .env("LANG", "C.UTF-8")
-        .args(arguments)
+    let output = bounded_command(program, arguments)
         .output()
         .with_context(|| format!("failed to {action}"))?;
     ensure_bounded_output(&output)?;
@@ -437,6 +413,17 @@ fn checked_output(program: &str, arguments: &[&str], action: &str) -> Result<Out
         bail!("failed to {action}: {}", output_detail(&output));
     }
     Ok(output)
+}
+
+fn bounded_command(program: &str, arguments: &[&str]) -> Command {
+    let mut command = Command::new("/usr/bin/timeout");
+    command
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("LANG", "C.UTF-8")
+        .args(["--signal=TERM", "--kill-after=2s", "15s", "--", program])
+        .args(arguments);
+    command
 }
 
 fn ensure_bounded_output(output: &Output) -> Result<()> {

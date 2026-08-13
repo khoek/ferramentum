@@ -5,10 +5,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use capulus::managed::{
-    AgentInfo, AgentServiceOptions, ApplicationSocketOptions, ManagedProduct,
-    ManagedProductOptions, ManagedRedeployOptions, ManagementClient, ManagementClientOptions,
-    ManagementRequest, ManagementResponse, ServiceHardening, SocketOptions, SystemBinary,
-    UserBinary,
+    AgentInfo, AgentServiceOptions, ManagedProduct, ManagedProductOptions, ManagedProgramOptions,
+    ManagedRedeployOptions, ManagementClient, ManagementClientOptions, ManagementRequest,
+    ManagementResponse, ServiceHardening, SocketOptions,
 };
 use semver::Version;
 
@@ -23,24 +22,14 @@ pub fn managed_product() -> Result<ManagedProduct> {
         package: "auc-tool".to_string(),
         version: Version::parse(env!("CARGO_PKG_VERSION"))
             .context("auc package version is not semantic")?,
-        system_binaries: vec![
-            SystemBinary {
-                cargo_name: "auc".to_string(),
-                destination: PathBuf::from("/usr/local/bin/auc"),
-            },
-            SystemBinary {
-                cargo_name: "auc-agent".to_string(),
-                destination: PathBuf::from("/usr/local/bin/auc-agent"),
-            },
-        ],
-        user_binary: UserBinary {
-            cargo_name: "auc".to_string(),
+        program: ManagedProgramOptions {
+            cargo_binary: "auc".to_string(),
+            installed_path: PathBuf::from("/usr/local/bin/auc"),
+            command_prefix: vec!["agent".to_string()],
         },
-        agent_binary: PathBuf::from("/usr/local/bin/auc-agent"),
         service: AgentServiceOptions {
             description: "auc machine-local passkey authenticator".to_string(),
-            executable: PathBuf::from("/usr/local/bin/auc-agent"),
-            arguments: vec!["serve".to_string()],
+            command: vec!["serve".to_string()],
             restart_delay: Duration::from_secs(2),
             network_required: false,
             state_directory_mode: 0o700,
@@ -49,11 +38,11 @@ pub fn managed_product() -> Result<ManagedProduct> {
                 device_allow: vec![PathBuf::from("/dev/uhid")],
             },
         },
-        application_socket: ApplicationSocketOptions::SystemdActivated(SocketOptions {
+        application_socket: SocketOptions {
             path: PathBuf::from(APPLICATION_SOCKET_PATH),
             mode: 0o660,
             group: Some(ACCESS_GROUP.to_string()),
-        }),
+        },
         management_socket: SocketOptions {
             path: PathBuf::from(MANAGEMENT_SOCKET_PATH),
             mode: 0o660,
@@ -132,7 +121,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manifest_has_one_agent_and_two_distinct_sockets() {
+    fn manifest_has_one_program_and_two_distinct_sockets() {
         let product = managed_product().unwrap();
         assert_eq!(product.service_name(), "auc-agent.service");
         assert_eq!(product.application_socket_name(), "auc-agent.socket");
@@ -145,5 +134,17 @@ mod tests {
             .installation_manifest()
             .validate(product.name())
             .unwrap();
+        let binaries = product
+            .installation_manifest()
+            .files
+            .into_iter()
+            .filter(|file| matches!(file, capulus::managed::ManagedFile::Binary { .. }))
+            .count();
+        assert_eq!(binaries, 1);
+        assert_eq!(product.program().cargo_binary(), "auc");
+        assert_eq!(
+            product.program().installed_path(),
+            std::path::Path::new("/usr/local/bin/auc")
+        );
     }
 }
