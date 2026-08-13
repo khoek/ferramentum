@@ -492,7 +492,7 @@ fn redeploy(ui: &Ui, version: Option<String>, no_wait: bool) -> Result<()> {
             cargo_binary: "auc".to_string(),
             version: version.clone(),
             registry: release.cargo_registry,
-            install_root: capulus::managed::current_user_cargo_install_root()?,
+            cargo_root: capulus::managed::current_user_cargo_root()?,
             ..UserProgramUpdateOptions::default()
         }
         .validate()?;
