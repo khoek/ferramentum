@@ -1,6 +1,6 @@
 [package]
 name = "auc-tool"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 publish.workspace = true
 description = "Machine-local software passkey authenticator exposed through Linux UHID."
@@ -15,7 +15,7 @@ name = "auc"
 path = "src/bin/auc.rs"
 
 [dependencies]
-capulus = { path = "../../caudex/capulus", version = "0.6", registry = "hoek-deus", features = ["managed-system"] }
+capulus = { path = "../../caudex/capulus", version = "0.6", features = ["managed-system"] }
 
 anyhow = { workspace = true }
 chacha20poly1305 = { workspace = true }
