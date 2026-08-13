@@ -15,7 +15,7 @@ name = "auc"
 path = "src/bin/auc.rs"
 
 [dependencies]
-capulus = { path = "../../caudex/capulus", version = "0.6", features = ["managed-system"] }
+capulus = { path = "../../caudex/capulus", version = "0.6", registry = "hoek-deus", features = ["managed-system"] }
 
 anyhow = { workspace = true }
 chacha20poly1305 = { workspace = true }
