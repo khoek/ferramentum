@@ -1,5 +1,6 @@
 use std::env;
 #[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};

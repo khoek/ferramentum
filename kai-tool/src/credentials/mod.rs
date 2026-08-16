@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
@@ -166,28 +167,52 @@ enum QuotaAvailability {
     Unusable,
 }
 
+#[derive(Default)]
+pub(crate) struct QuotaRecovery {
+    exhausted_account_ids: HashSet<String>,
+}
+
+impl QuotaRecovery {
+    pub(crate) fn rotate(&mut self) -> Result<()> {
+        credential_runtime()?.block_on(self.rotate_async())
+    }
+
+    async fn rotate_async(&mut self) -> Result<()> {
+        let _invocation_lock = capulus::acquire("kai-cred", false)?;
+        let mut store = open_store()?;
+        cmd_next(&mut store, Some(&mut self.exhausted_account_ids)).await
+    }
+}
+
 pub fn run(command: CredCommand) -> Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("could not initialize the credential runtime")?
-        .block_on(run_async(command))
+    credential_runtime()?.block_on(run_async(command))
 }
 
 async fn run_async(command: CredCommand) -> Result<()> {
     let _invocation_lock = capulus::acquire("kai-cred", false)?;
-    let paths = RuntimePaths::from_env()?;
-    ensure_codex_uses_file_credentials(&paths)?;
-    let mut store = Store::open(paths)?;
+    let mut store = open_store()?;
     match command {
         CredCommand::List(args) => cmd_list(&store, args).await,
         CredCommand::Tickle => cmd_tickle(&mut store).await,
-        CredCommand::Next => cmd_next(&mut store).await,
+        CredCommand::Next => cmd_next(&mut store, None).await,
         CredCommand::Activate(args) => cmd_activate(&mut store, &args.email),
         CredCommand::Add(args) => cmd_add(&mut store, args).await,
         CredCommand::Fix(args) => cmd_fix(&mut store, args).await,
         CredCommand::Remove(args) => cmd_remove(&mut store, args),
     }
+}
+
+fn credential_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("could not initialize the credential runtime")
+}
+
+fn open_store() -> Result<Store> {
+    let paths = RuntimePaths::from_env()?;
+    ensure_codex_uses_file_credentials(&paths)?;
+    Store::open(paths)
 }
 
 async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
@@ -452,7 +477,10 @@ fn ready_account_view(
     }
 }
 
-async fn cmd_next(store: &mut Store) -> Result<()> {
+async fn cmd_next(
+    store: &mut Store,
+    exhausted_account_ids: Option<&mut HashSet<String>>,
+) -> Result<()> {
     if store.profiles().is_empty() {
         bail!("no accounts are enrolled; run `kai cred add <email>` first");
     }
@@ -470,15 +498,34 @@ async fn cmd_next(store: &mut Store) -> Result<()> {
             )
         }
     };
-    let order = rotation_order(store.profiles().len(), active_index);
+    let recovering = exhausted_account_ids.is_some();
+    let exclusions = exhausted_account_ids.map(|exhausted| {
+        if let Some(credential) = &live {
+            exhausted.insert(credential.facts.account_id.clone());
+        }
+        exhausted.clone()
+    });
+    let mut order = rotation_order(store.profiles().len(), active_index);
+    if let Some(exclusions) = &exclusions {
+        order.retain(|index| !exclusions.contains(&store.profiles()[*index].account_id));
+    }
+    if order.is_empty() && recovering {
+        bail!("no other enrolled account has confirmed remaining Codex quota");
+    }
     capulus::ui::stage("Checking enrolled account quotas");
     let checks = fetch_profile_quotas(store, &order, live.as_ref()).await?;
-    let target_index = preferred_rotation_index(
-        checks
-            .iter()
-            .map(|(index, result)| (*index, quota_result_availability(result))),
-    );
+    let candidates = checks
+        .iter()
+        .map(|(index, result)| (*index, quota_result_availability(result)));
+    let target_index = if recovering {
+        confirmed_rotation_index(candidates)
+    } else {
+        preferred_rotation_index(candidates)
+    };
     let Some(target_index) = target_index else {
+        if recovering {
+            bail!("no other enrolled account has confirmed remaining Codex quota");
+        }
         if active_index.is_some() && store.profiles().len() > 1 {
             bail!("no other enrolled account has remaining Codex quota or usable reset credits");
         }
@@ -492,7 +539,9 @@ async fn cmd_next(store: &mut Store) -> Result<()> {
     let changed = activate(store, &target)?;
     if changed {
         capulus::ui::success(&format!("Codex is now using {}.", target.email));
-        warn_running_codex();
+        if !recovering {
+            warn_running_codex();
+        }
     } else {
         capulus::ui::success(&format!("{} is the only enrolled account.", target.email));
     }
@@ -655,6 +704,14 @@ fn preferred_rotation_index(
         }
     }
     first_resettable.or(first_unknown)
+}
+
+fn confirmed_rotation_index(
+    candidates: impl IntoIterator<Item = (usize, QuotaAvailability)>,
+) -> Option<usize> {
+    candidates.into_iter().find_map(|(index, availability)| {
+        (availability == QuotaAvailability::Remaining).then_some(index)
+    })
 }
 
 fn quota_result_availability(result: &Result<quota::Snapshot>) -> QuotaAvailability {
@@ -1356,6 +1413,26 @@ mod tests {
             preferred_rotation_index([
                 (1, QuotaAvailability::Exhausted),
                 (2, QuotaAvailability::Exhausted),
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn quota_recovery_requires_confirmed_remaining_quota() {
+        assert_eq!(
+            confirmed_rotation_index([
+                (1, QuotaAvailability::Resettable),
+                (2, QuotaAvailability::Unknown),
+                (3, QuotaAvailability::Remaining),
+            ]),
+            Some(3)
+        );
+        assert_eq!(
+            confirmed_rotation_index([
+                (1, QuotaAvailability::Resettable),
+                (2, QuotaAvailability::Unknown),
+                (3, QuotaAvailability::Exhausted),
             ]),
             None
         );

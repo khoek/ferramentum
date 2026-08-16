@@ -1,6 +1,8 @@
+mod codex;
 mod credentials;
 
 use std::collections::{BTreeSet, HashSet};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -58,8 +60,36 @@ const COMMON_WORDS: &[&str] = &[
     after_help = "Shorthands:\n  a     agent\n  ar    agent --resume-all, or resume SESSION_ID\n  wc    worktree create\n  wa    worktree agent\n  wo    worktree open\n  wd    worktree delete\n  next  cred next\n  lg    llm-get\n\nWorkspace setup:\n  init  Create .kai/config.toml in the current repo root\n"
 )]
 struct Cli {
+    /// Automatically switch accounts and resume after +k Codex quota exhaustion.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "auto|yes|no",
+        default_value = "auto",
+        global = true,
+        help = "Automatically restart quota-exhausted Codex sessions (auto enables this for +k Codex)"
+    )]
+    quota_auto_restart: QuotaAutoRestart,
+
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum QuotaAutoRestart {
+    Auto,
+    Yes,
+    No,
+}
+
+impl QuotaAutoRestart {
+    fn explicit(self) -> Option<bool> {
+        match self {
+            Self::Auto => None,
+            Self::Yes => Some(true),
+            Self::No => Some(false),
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -374,6 +404,57 @@ enum AgentResumeMode {
     Session(String),
 }
 
+enum AgentLauncher {
+    Codex(codex::Launcher),
+    Claude,
+}
+
+impl AgentLauncher {
+    fn detect(model: WorktreeAgentModel) -> Result<Self> {
+        match model {
+            WorktreeAgentModel::Codex => Ok(Self::Codex(codex::Launcher::detect()?)),
+            WorktreeAgentModel::Claude => Ok(Self::Claude),
+        }
+    }
+
+    fn run(
+        &self,
+        resume_mode: AgentResumeMode,
+        cwd: Option<&Path>,
+        quota_auto_restart: QuotaAutoRestart,
+    ) -> Result<ExitCode> {
+        if matches!(self, Self::Claude) && matches!(&resume_mode, AgentResumeMode::PickerAll) {
+            eprintln_warning(
+                "`claude` does not support a separate `--all` resume scope; using `--resume`.",
+            );
+        }
+
+        match self {
+            Self::Codex(launcher) => {
+                let mut recovery = credentials::QuotaRecovery::default();
+                let code = launcher.run(
+                    agent_arguments(WorktreeAgentModel::Codex, &resume_mode),
+                    cwd,
+                    quota_auto_restart.explicit(),
+                    || recovery.rotate(),
+                )?;
+                Ok(ExitCode::from(code))
+            }
+            Self::Claude => {
+                if quota_auto_restart == QuotaAutoRestart::Yes {
+                    bail!("--quota-auto-restart yes requires the Codex agent");
+                }
+                let (_, mut command) = build_agent_command(WorktreeAgentModel::Claude, resume_mode);
+                if let Some(cwd) = cwd {
+                    command.current_dir(cwd);
+                }
+                let status = command.status().context("Failed to run `claude`")?;
+                Ok(exit_code_from_status(status))
+            }
+        }
+    }
+}
+
 fn worktree_branch_mode(existing: bool, delete: bool) -> WorktreeBranchMode {
     if existing {
         WorktreeBranchMode::UseExisting
@@ -508,38 +589,50 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<ExitCode> {
-    let command = command_or_default(Cli::parse());
+    let cli = Cli::parse();
+    let quota_auto_restart = cli.quota_auto_restart;
+    let command = command_or_default(cli);
     match command {
-        Commands::Agent(args) => agent(args),
+        Commands::Agent(args) => agent(args, quota_auto_restart),
         Commands::Worktree(args) => match args.command {
             WorktreeCommands::Create(args) => {
+                reject_quota_auto_restart(quota_auto_restart)?;
                 worktree_create(args)?;
                 Ok(ExitCode::SUCCESS)
             }
-            WorktreeCommands::Agent(args) => worktree_agent(args),
-            WorktreeCommands::Open(args) => worktree_open(args),
+            WorktreeCommands::Agent(args) => worktree_agent(args, quota_auto_restart),
+            WorktreeCommands::Open(args) => {
+                reject_quota_auto_restart(quota_auto_restart)?;
+                worktree_open(args)
+            }
             WorktreeCommands::Delete(args) => {
+                reject_quota_auto_restart(quota_auto_restart)?;
                 worktree_delete(args)?;
                 Ok(ExitCode::SUCCESS)
             }
         },
         Commands::Cred(args) => {
+            reject_quota_auto_restart(quota_auto_restart)?;
             credentials::run(args.command)?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Next => {
+            reject_quota_auto_restart(quota_auto_restart)?;
             credentials::run(credentials::CredCommand::Next)?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::LlmGet(args) => {
+            reject_quota_auto_restart(quota_auto_restart)?;
             llm_get(args)?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Init(args) => {
+            reject_quota_auto_restart(quota_auto_restart)?;
             kai_init(args)?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Bump(args) => {
+            reject_quota_auto_restart(quota_auto_restart)?;
             kai_bump(args)?;
             Ok(ExitCode::SUCCESS)
         }
@@ -547,19 +640,31 @@ fn run() -> Result<ExitCode> {
             let resume_mode = args
                 .session_id
                 .map_or(AgentResumeMode::PickerAll, AgentResumeMode::Session);
-            agent_with_resume_mode(args.model, resume_mode)
+            agent_with_resume_mode(args.model, resume_mode, quota_auto_restart)
         }
         Commands::Wc(args) => {
+            reject_quota_auto_restart(quota_auto_restart)?;
             worktree_create(args)?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Wa(args) => worktree_agent(args),
-        Commands::Wo(args) => worktree_open(args),
+        Commands::Wa(args) => worktree_agent(args, quota_auto_restart),
+        Commands::Wo(args) => {
+            reject_quota_auto_restart(quota_auto_restart)?;
+            worktree_open(args)
+        }
         Commands::Wd(args) => {
+            reject_quota_auto_restart(quota_auto_restart)?;
             worktree_delete(args)?;
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+fn reject_quota_auto_restart(value: QuotaAutoRestart) -> Result<()> {
+    if value != QuotaAutoRestart::Auto {
+        bail!("--quota-auto-restart is only valid when launching an agent");
+    }
+    Ok(())
 }
 
 fn command_or_default(cli: Cli) -> Commands {
@@ -979,68 +1084,60 @@ fn build_agent_command(
     model: WorktreeAgentModel,
     resume_mode: AgentResumeMode,
 ) -> (&'static str, Command) {
-    let (tool, mut command) = match model {
-        WorktreeAgentModel::Codex => {
-            let mut command = Command::new("codex");
-            match resume_mode {
-                AgentResumeMode::Off => {}
-                AgentResumeMode::Picker => {
-                    command.arg("resume");
-                }
-                AgentResumeMode::PickerAll => {
-                    command.arg("resume").arg("--all");
-                }
-                AgentResumeMode::Session(session_id) => {
-                    command.arg("resume").arg(session_id);
-                }
-            }
-            command.arg("--dangerously-bypass-approvals-and-sandbox");
-            ("codex", command)
-        }
-        WorktreeAgentModel::Claude => {
-            let mut command = Command::new("claude");
-            match resume_mode {
-                AgentResumeMode::Off => {}
-                AgentResumeMode::Picker | AgentResumeMode::PickerAll => {
-                    command.arg("--resume");
-                }
-                AgentResumeMode::Session(session_id) => {
-                    command.arg("--resume").arg(session_id);
-                }
-            }
-            command.arg("--dangerously-skip-permissions");
-            ("claude", command)
-        }
+    let tool = match model {
+        WorktreeAgentModel::Codex => "codex",
+        WorktreeAgentModel::Claude => "claude",
     };
+    let mut command = Command::new(tool);
+    command.args(agent_arguments(model, &resume_mode));
     disable_git_terminal_prompts(&mut command);
     (tool, command)
 }
 
-fn agent(args: AgentArgs) -> Result<ExitCode> {
+fn agent_arguments(model: WorktreeAgentModel, resume_mode: &AgentResumeMode) -> Vec<OsString> {
+    let mut args = Vec::new();
+    match (model, resume_mode) {
+        (WorktreeAgentModel::Codex, AgentResumeMode::Off)
+        | (WorktreeAgentModel::Claude, AgentResumeMode::Off) => {}
+        (WorktreeAgentModel::Codex, AgentResumeMode::Picker) => args.push("resume".into()),
+        (WorktreeAgentModel::Codex, AgentResumeMode::PickerAll) => {
+            args.extend(["resume".into(), "--all".into()]);
+        }
+        (WorktreeAgentModel::Codex, AgentResumeMode::Session(session_id)) => {
+            args.extend(["resume".into(), session_id.into()]);
+        }
+        (WorktreeAgentModel::Claude, AgentResumeMode::Picker | AgentResumeMode::PickerAll) => {
+            args.push("--resume".into())
+        }
+        (WorktreeAgentModel::Claude, AgentResumeMode::Session(session_id)) => {
+            args.extend(["--resume".into(), session_id.into()]);
+        }
+    }
+    args.push(match model {
+        WorktreeAgentModel::Codex => codex::APPROVAL_BYPASS_FLAG.into(),
+        WorktreeAgentModel::Claude => "--dangerously-skip-permissions".into(),
+    });
+    args
+}
+
+fn agent(args: AgentArgs, quota_auto_restart: QuotaAutoRestart) -> Result<ExitCode> {
     let resume_mode = resolve_agent_resume_mode(args.resume, args.resume_all);
-    agent_with_resume_mode(args.model, resume_mode)
+    agent_with_resume_mode(args.model, resume_mode, quota_auto_restart)
 }
 
 fn agent_with_resume_mode(
     model: WorktreeAgentModel,
     resume_mode: AgentResumeMode,
+    quota_auto_restart: QuotaAutoRestart,
 ) -> Result<ExitCode> {
-    if matches!(model, WorktreeAgentModel::Claude)
-        && matches!(&resume_mode, AgentResumeMode::PickerAll)
-    {
-        eprintln_warning(
-            "`claude` does not support a separate `--all` resume scope; using `--resume`.",
-        );
-    }
-
-    let (tool, mut command) = build_agent_command(model, resume_mode);
-    let status = command
-        .status()
-        .with_context(|| format!("Failed to run `{tool}`"))?;
-    Ok(exit_code_from_status(status))
+    AgentLauncher::detect(model)?.run(resume_mode, None, quota_auto_restart)
 }
 
-fn worktree_agent(args: WorktreeAgentArgs) -> Result<ExitCode> {
+fn worktree_agent(
+    args: WorktreeAgentArgs,
+    quota_auto_restart: QuotaAutoRestart,
+) -> Result<ExitCode> {
+    let launcher = AgentLauncher::detect(args.model)?;
     let delete = args.delete || args.delete_force;
     let force = args.force || args.delete_force;
     let branch_mode = worktree_branch_mode(args.existing, delete);
@@ -1068,14 +1165,9 @@ fn worktree_agent(args: WorktreeAgentArgs) -> Result<ExitCode> {
 
     let start_dir = resolve_worktree_start_dir(&worktree_path, &context.spawn_rel_to_repo_root);
 
-    let (tool, mut command) = build_agent_command(args.model, AgentResumeMode::Off);
-    command.current_dir(&start_dir);
-
-    let status = command
-        .status()
-        .with_context(|| format!("Failed to run `{tool}` in {}", start_dir.display()))?;
-
-    Ok(exit_code_from_status(status))
+    launcher
+        .run(AgentResumeMode::Off, Some(&start_dir), quota_auto_restart)
+        .with_context(|| format!("Failed to run agent in {}", start_dir.display()))
 }
 
 fn worktree_open(args: WorktreeOpenArgs) -> Result<ExitCode> {
@@ -3935,6 +4027,30 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn quota_auto_restart_parses_before_or_after_agent_command() {
+        let before = Cli::try_parse_from(["kai", "--quota-auto-restart", "no", "a"])
+            .expect("parse global option before command");
+        assert_eq!(before.quota_auto_restart, QuotaAutoRestart::No);
+
+        let after =
+            Cli::try_parse_from(["kai", "worktree", "agent", "--quota-auto-restart", "yes"])
+                .expect("parse global option after nested command");
+        assert_eq!(after.quota_auto_restart, QuotaAutoRestart::Yes);
+
+        let automatic = Cli::try_parse_from(["kai", "a", "--quota-auto-restart", "auto"])
+            .expect("parse explicit auto value");
+        assert_eq!(automatic.quota_auto_restart, QuotaAutoRestart::Auto);
+
+        let default = Cli::try_parse_from(["kai", "a"]).expect("parse default value");
+        assert_eq!(default.quota_auto_restart, QuotaAutoRestart::Auto);
+    }
+
+    #[test]
+    fn quota_auto_restart_rejects_unknown_values() {
+        assert!(Cli::try_parse_from(["kai", "--quota-auto-restart", "sometimes", "a"]).is_err());
     }
 
     #[test]
