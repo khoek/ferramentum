@@ -1,6 +1,6 @@
 [package]
 name = "kai-tool"
-version = "0.1.21"
+version = "0.1.22"
 edition = "2024"
 publish.workspace = true
 description = "CLI helpers for AI coding, Codex credentials, and git worktree management."
