@@ -71,6 +71,10 @@ struct Cli {
     )]
     quota_auto_restart: QuotaAutoRestart,
 
+    /// Start Codex using the Fast service tier.
+    #[arg(long, global = true)]
+    fast: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -80,6 +84,12 @@ enum QuotaAutoRestart {
     Auto,
     Yes,
     No,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AgentLaunchOptions {
+    quota_auto_restart: QuotaAutoRestart,
+    fast: bool,
 }
 
 impl QuotaAutoRestart {
@@ -420,8 +430,8 @@ impl AgentLauncher {
     fn run(
         &self,
         resume_mode: AgentResumeMode,
-        cwd: Option<&Path>,
-        quota_auto_restart: QuotaAutoRestart,
+        cwd: &Path,
+        options: AgentLaunchOptions,
     ) -> Result<ExitCode> {
         if matches!(self, Self::Claude) && matches!(&resume_mode, AgentResumeMode::PickerAll) {
             eprintln_warning(
@@ -435,19 +445,25 @@ impl AgentLauncher {
                 let code = launcher.run(
                     agent_arguments(WorktreeAgentModel::Codex, &resume_mode),
                     cwd,
-                    quota_auto_restart.explicit(),
+                    if options.fast {
+                        codex::ServiceTier::Fast
+                    } else {
+                        codex::ServiceTier::Default
+                    },
+                    options.quota_auto_restart.explicit(),
                     || recovery.rotate(),
                 )?;
                 Ok(ExitCode::from(code))
             }
             Self::Claude => {
-                if quota_auto_restart == QuotaAutoRestart::Yes {
+                if options.fast {
+                    bail!("--fast requires the Codex agent");
+                }
+                if options.quota_auto_restart == QuotaAutoRestart::Yes {
                     bail!("--quota-auto-restart yes requires the Codex agent");
                 }
                 let (_, mut command) = build_agent_command(WorktreeAgentModel::Claude, resume_mode);
-                if let Some(cwd) = cwd {
-                    command.current_dir(cwd);
-                }
+                command.current_dir(cwd);
                 let status = command.status().context("Failed to run `claude`")?;
                 Ok(exit_code_from_status(status))
             }
@@ -590,49 +606,52 @@ fn main() -> ExitCode {
 
 fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
-    let quota_auto_restart = cli.quota_auto_restart;
+    let options = AgentLaunchOptions {
+        quota_auto_restart: cli.quota_auto_restart,
+        fast: cli.fast,
+    };
     let command = command_or_default(cli);
     match command {
-        Commands::Agent(args) => agent(args, quota_auto_restart),
+        Commands::Agent(args) => agent(args, options),
         Commands::Worktree(args) => match args.command {
             WorktreeCommands::Create(args) => {
-                reject_quota_auto_restart(quota_auto_restart)?;
+                reject_agent_launch_options(options)?;
                 worktree_create(args)?;
                 Ok(ExitCode::SUCCESS)
             }
-            WorktreeCommands::Agent(args) => worktree_agent(args, quota_auto_restart),
+            WorktreeCommands::Agent(args) => worktree_agent(args, options),
             WorktreeCommands::Open(args) => {
-                reject_quota_auto_restart(quota_auto_restart)?;
+                reject_agent_launch_options(options)?;
                 worktree_open(args)
             }
             WorktreeCommands::Delete(args) => {
-                reject_quota_auto_restart(quota_auto_restart)?;
+                reject_agent_launch_options(options)?;
                 worktree_delete(args)?;
                 Ok(ExitCode::SUCCESS)
             }
         },
         Commands::Cred(args) => {
-            reject_quota_auto_restart(quota_auto_restart)?;
+            reject_agent_launch_options(options)?;
             credentials::run(args.command)?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Next => {
-            reject_quota_auto_restart(quota_auto_restart)?;
+            reject_agent_launch_options(options)?;
             credentials::run(credentials::CredCommand::Next)?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::LlmGet(args) => {
-            reject_quota_auto_restart(quota_auto_restart)?;
+            reject_agent_launch_options(options)?;
             llm_get(args)?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Init(args) => {
-            reject_quota_auto_restart(quota_auto_restart)?;
+            reject_agent_launch_options(options)?;
             kai_init(args)?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Bump(args) => {
-            reject_quota_auto_restart(quota_auto_restart)?;
+            reject_agent_launch_options(options)?;
             kai_bump(args)?;
             Ok(ExitCode::SUCCESS)
         }
@@ -640,29 +659,32 @@ fn run() -> Result<ExitCode> {
             let resume_mode = args
                 .session_id
                 .map_or(AgentResumeMode::PickerAll, AgentResumeMode::Session);
-            agent_with_resume_mode(args.model, resume_mode, quota_auto_restart)
+            agent_with_resume_mode(args.model, resume_mode, options)
         }
         Commands::Wc(args) => {
-            reject_quota_auto_restart(quota_auto_restart)?;
+            reject_agent_launch_options(options)?;
             worktree_create(args)?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Wa(args) => worktree_agent(args, quota_auto_restart),
+        Commands::Wa(args) => worktree_agent(args, options),
         Commands::Wo(args) => {
-            reject_quota_auto_restart(quota_auto_restart)?;
+            reject_agent_launch_options(options)?;
             worktree_open(args)
         }
         Commands::Wd(args) => {
-            reject_quota_auto_restart(quota_auto_restart)?;
+            reject_agent_launch_options(options)?;
             worktree_delete(args)?;
             Ok(ExitCode::SUCCESS)
         }
     }
 }
 
-fn reject_quota_auto_restart(value: QuotaAutoRestart) -> Result<()> {
-    if value != QuotaAutoRestart::Auto {
+fn reject_agent_launch_options(options: AgentLaunchOptions) -> Result<()> {
+    if options.quota_auto_restart != QuotaAutoRestart::Auto {
         bail!("--quota-auto-restart is only valid when launching an agent");
+    }
+    if options.fast {
+        bail!("--fast is only valid when launching an agent");
     }
     Ok(())
 }
@@ -1120,23 +1142,24 @@ fn agent_arguments(model: WorktreeAgentModel, resume_mode: &AgentResumeMode) -> 
     args
 }
 
-fn agent(args: AgentArgs, quota_auto_restart: QuotaAutoRestart) -> Result<ExitCode> {
+fn agent(args: AgentArgs, options: AgentLaunchOptions) -> Result<ExitCode> {
     let resume_mode = resolve_agent_resume_mode(args.resume, args.resume_all);
-    agent_with_resume_mode(args.model, resume_mode, quota_auto_restart)
+    agent_with_resume_mode(args.model, resume_mode, options)
 }
 
 fn agent_with_resume_mode(
     model: WorktreeAgentModel,
     resume_mode: AgentResumeMode,
-    quota_auto_restart: QuotaAutoRestart,
+    options: AgentLaunchOptions,
 ) -> Result<ExitCode> {
-    AgentLauncher::detect(model)?.run(resume_mode, None, quota_auto_restart)
+    AgentLauncher::detect(model)?.run(
+        resume_mode,
+        &std::env::current_dir().context("Failed to read current working directory")?,
+        options,
+    )
 }
 
-fn worktree_agent(
-    args: WorktreeAgentArgs,
-    quota_auto_restart: QuotaAutoRestart,
-) -> Result<ExitCode> {
+fn worktree_agent(args: WorktreeAgentArgs, options: AgentLaunchOptions) -> Result<ExitCode> {
     let launcher = AgentLauncher::detect(args.model)?;
     let delete = args.delete || args.delete_force;
     let force = args.force || args.delete_force;
@@ -1166,7 +1189,7 @@ fn worktree_agent(
     let start_dir = resolve_worktree_start_dir(&worktree_path, &context.spawn_rel_to_repo_root);
 
     launcher
-        .run(AgentResumeMode::Off, Some(&start_dir), quota_auto_restart)
+        .run(AgentResumeMode::Off, &start_dir, options)
         .with_context(|| format!("Failed to run agent in {}", start_dir.display()))
 }
 
@@ -4051,6 +4074,32 @@ mod tests {
     #[test]
     fn quota_auto_restart_rejects_unknown_values() {
         assert!(Cli::try_parse_from(["kai", "--quota-auto-restart", "sometimes", "a"]).is_err());
+    }
+
+    #[test]
+    fn fast_parses_for_all_agent_entry_points() {
+        for args in [
+            vec!["kai", "--fast"],
+            vec!["kai", "a", "--fast"],
+            vec!["kai", "ar", "--fast"],
+            vec!["kai", "wa", "feature", "--fast"],
+            vec!["kai", "worktree", "agent", "feature", "--fast"],
+        ] {
+            assert!(Cli::try_parse_from(args).expect("parse --fast").fast);
+        }
+    }
+
+    #[test]
+    fn fast_is_rejected_for_non_agent_commands() {
+        let error = reject_agent_launch_options(AgentLaunchOptions {
+            quota_auto_restart: QuotaAutoRestart::Auto,
+            fast: true,
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "--fast is only valid when launching an agent"
+        );
     }
 
     #[test]

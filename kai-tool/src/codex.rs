@@ -16,11 +16,27 @@ use super::GIT_TERMINAL_PROMPT_ENV;
 pub(crate) const APPROVAL_BYPASS_FLAG: &str = "--dangerously-bypass-approvals-and-sandbox";
 const CONFIG_OVERRIDE_FLAG: &str = "-c";
 const DEFAULT_SERVICE_TIER_OVERRIDE: &str = "service_tier=default";
+const FAST_SERVICE_TIER_OVERRIDE: &str = "service_tier=fast";
 const EXIT_ON_QUOTA_FLAG: &str = "--exit-on-quota-exceeded";
 const START_IMMEDIATELY_FLAG: &str = "--start-immediately";
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const OUTPUT_TAIL_BYTES: usize = 16 * 1024;
+
+#[derive(Clone, Copy)]
+pub(crate) enum ServiceTier {
+    Default,
+    Fast,
+}
+
+impl ServiceTier {
+    fn config_override(self) -> &'static str {
+        match self {
+            Self::Default => DEFAULT_SERVICE_TIER_OVERRIDE,
+            Self::Fast => FAST_SERVICE_TIER_OVERRIDE,
+        }
+    }
+}
 
 pub struct Launcher {
     binary: PathBuf,
@@ -61,7 +77,8 @@ impl Launcher {
     pub fn run(
         &self,
         initial_args: Vec<OsString>,
-        cwd: Option<&Path>,
+        cwd: &Path,
+        service_tier: ServiceTier,
         quota_auto_restart: Option<bool>,
         rotate_account: impl FnMut() -> Result<()>,
     ) -> Result<u8> {
@@ -74,21 +91,28 @@ impl Launcher {
         };
         if !quota_auto_restart {
             let mut args = initial_args;
-            force_default_service_tier(&mut args);
+            force_service_tier(&mut args, service_tier);
             return run_direct(&self.binary, &args, cwd);
         }
-        self.run_supervised(initial_args, cwd, rotate_account, SupervisedIo::terminal())
+        self.run_supervised(
+            initial_args,
+            cwd,
+            service_tier,
+            rotate_account,
+            SupervisedIo::terminal(),
+        )
     }
 
     fn run_supervised(
         &self,
         initial_args: Vec<OsString>,
-        cwd: Option<&Path>,
+        cwd: &Path,
+        service_tier: ServiceTier,
         mut rotate_account: impl FnMut() -> Result<()>,
         io: SupervisedIo,
     ) -> Result<u8> {
         let mut args = initial_args;
-        force_default_service_tier(&mut args);
+        force_service_tier(&mut args, service_tier);
         args.push(EXIT_ON_QUOTA_FLAG.into());
         let SupervisedIo {
             input,
@@ -109,10 +133,10 @@ impl Launcher {
     }
 }
 
-fn force_default_service_tier(args: &mut Vec<OsString>) {
+fn force_service_tier(args: &mut Vec<OsString>, service_tier: ServiceTier) {
     args.extend([
         CONFIG_OVERRIDE_FLAG.into(),
-        DEFAULT_SERVICE_TIER_OVERRIDE.into(),
+        service_tier.config_override().into(),
     ]);
 }
 
@@ -128,7 +152,7 @@ fn version_is_plus_k(stdout: &[u8]) -> Result<bool> {
     Ok(version.build.as_str().split('.').any(|part| part == "k"))
 }
 
-fn run_direct(binary: &Path, args: &[OsString], cwd: Option<&Path>) -> Result<u8> {
+fn run_direct(binary: &Path, args: &[OsString], cwd: &Path) -> Result<u8> {
     let mut command = Command::new(binary);
     command
         .args(args)
@@ -136,9 +160,7 @@ fn run_direct(binary: &Path, args: &[OsString], cwd: Option<&Path>) -> Result<u8
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
-    }
+    command.current_dir(cwd);
     let status = command
         .status()
         .with_context(|| format!("Failed to run `{}`", binary.display()))?;
@@ -181,7 +203,7 @@ struct QuotaRecoveryPayload {
 fn run_pty_session(
     binary: &Path,
     args: &[OsString],
-    cwd: Option<&Path>,
+    cwd: &Path,
     input: &InputRouter,
     output: &Arc<Mutex<Box<dyn Write + Send>>>,
     raw_terminal: bool,
@@ -194,9 +216,7 @@ fn run_pty_session(
     let mut command = CommandBuilder::new(binary);
     command.args(args);
     command.env(GIT_TERMINAL_PROMPT_ENV, "0");
-    if let Some(cwd) = cwd {
-        command.cwd(cwd);
-    }
+    command.cwd(cwd);
     let reader = pair
         .master
         .try_clone_reader()
@@ -705,7 +725,8 @@ mod tests {
             launcher
                 .run(
                     vec![APPROVAL_BYPASS_FLAG.into()],
-                    Some(root.path()),
+                    root.path(),
+                    ServiceTier::Default,
                     None,
                     || {
                         rotations += 1;
@@ -724,7 +745,13 @@ mod tests {
         );
 
         let error = launcher
-            .run(Vec::new(), Some(root.path()), Some(true), || Ok(()))
+            .run(
+                Vec::new(),
+                root.path(),
+                ServiceTier::Default,
+                Some(true),
+                || Ok(()),
+            )
             .unwrap_err();
         assert_eq!(
             error.to_string(),
@@ -760,17 +787,23 @@ mod tests {
         let mut rotations = 0;
         assert_eq!(
             launcher
-                .run(Vec::new(), Some(root.path()), Some(false), || {
-                    rotations += 1;
-                    Ok(())
-                })
+                .run(
+                    Vec::new(),
+                    root.path(),
+                    ServiceTier::Fast,
+                    Some(false),
+                    || {
+                        rotations += 1;
+                        Ok(())
+                    },
+                )
                 .unwrap(),
             0
         );
         assert_eq!(rotations, 0);
         assert_eq!(
             fs::read_to_string(arguments).unwrap(),
-            format!("{CONFIG_OVERRIDE_FLAG} {DEFAULT_SERVICE_TIER_OVERRIDE}\n")
+            format!("{CONFIG_OVERRIDE_FLAG} {FAST_SERVICE_TIER_OVERRIDE}\n")
         );
     }
 
@@ -787,7 +820,7 @@ mod tests {
         let root_literal = format!("{:?}", root.path().to_str().unwrap());
         let recovery_payload_literal = format!(
             "{:?}",
-            r#"{"version":1,"resume_args":["--model","gpt-5.6","-c","model_provider=\"openai\"","-c","service_tier=\"fast\"","-c","model_reasoning_effort=\"xhigh\""]}"#
+            r#"{"version":1,"resume_args":["--model","gpt-5.6","-c","model_provider=\"openai\"","-c","service_tier=\"default\"","-c","model_reasoning_effort=\"xhigh\""]}"#
         );
         fs::write(
             &source,
@@ -858,7 +891,8 @@ fn main() {{
         let code = launcher
             .run_supervised(
                 vec![APPROVAL_BYPASS_FLAG.into()],
-                Some(root.path()),
+                root.path(),
+                ServiceTier::Fast,
                 || {
                     rotations += 1;
                     Ok(())
@@ -879,11 +913,11 @@ fn main() {{
             format!(
                 concat!(
                     "{} {} {} {}\n",
-                    "resume {} {} {} {} --model gpt-5.6 {} model_provider=\"openai\" {} service_tier=\"fast\" {} model_reasoning_effort=\"xhigh\"\n"
+                    "resume {} {} {} {} --model gpt-5.6 {} model_provider=\"openai\" {} service_tier=\"default\" {} model_reasoning_effort=\"xhigh\"\n"
                 ),
                 APPROVAL_BYPASS_FLAG,
                 CONFIG_OVERRIDE_FLAG,
-                DEFAULT_SERVICE_TIER_OVERRIDE,
+                FAST_SERVICE_TIER_OVERRIDE,
                 EXIT_ON_QUOTA_FLAG,
                 thread_id,
                 START_IMMEDIATELY_FLAG,
