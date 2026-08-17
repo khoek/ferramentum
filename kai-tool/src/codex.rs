@@ -9,10 +9,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use semver::Version;
+use serde::Deserialize;
 
 use super::GIT_TERMINAL_PROMPT_ENV;
 
 pub(crate) const APPROVAL_BYPASS_FLAG: &str = "--dangerously-bypass-approvals-and-sandbox";
+const CONFIG_OVERRIDE_FLAG: &str = "-c";
+const DEFAULT_SERVICE_TIER_OVERRIDE: &str = "service_tier=default";
 const EXIT_ON_QUOTA_FLAG: &str = "--exit-on-quota-exceeded";
 const START_IMMEDIATELY_FLAG: &str = "--start-immediately";
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -70,7 +73,9 @@ impl Launcher {
             None => self.plus_k,
         };
         if !quota_auto_restart {
-            return run_direct(&self.binary, &initial_args, cwd);
+            let mut args = initial_args;
+            force_default_service_tier(&mut args);
+            return run_direct(&self.binary, &args, cwd);
         }
         self.run_supervised(initial_args, cwd, rotate_account, SupervisedIo::terminal())
     }
@@ -83,6 +88,7 @@ impl Launcher {
         io: SupervisedIo,
     ) -> Result<u8> {
         let mut args = initial_args;
+        force_default_service_tier(&mut args);
         args.push(EXIT_ON_QUOTA_FLAG.into());
         let SupervisedIo {
             input,
@@ -94,13 +100,20 @@ impl Launcher {
         loop {
             match run_pty_session(&self.binary, &args, cwd, &input, &output, raw_terminal)? {
                 PtyOutcome::Exited(code) => return Ok(code),
-                PtyOutcome::QuotaExceeded(thread_id) => {
+                PtyOutcome::QuotaExceeded(recovery) => {
                     rotate_account()?;
-                    args = recovery_args(&thread_id);
+                    args = recovery_args(recovery);
                 }
             }
         }
     }
+}
+
+fn force_default_service_tier(args: &mut Vec<OsString>) {
+    args.extend([
+        CONFIG_OVERRIDE_FLAG.into(),
+        DEFAULT_SERVICE_TIER_OVERRIDE.into(),
+    ]);
 }
 
 fn version_is_plus_k(stdout: &[u8]) -> Result<bool> {
@@ -135,20 +148,34 @@ fn run_direct(binary: &Path, args: &[OsString], cwd: Option<&Path>) -> Result<u8
         .unwrap_or(1))
 }
 
-fn recovery_args(thread_id: &str) -> Vec<OsString> {
-    [
+fn recovery_args(recovery: QuotaRecovery) -> Vec<OsString> {
+    let mut args: Vec<OsString> = [
         "resume".into(),
-        thread_id.into(),
+        recovery.thread_id.into(),
         START_IMMEDIATELY_FLAG.into(),
         APPROVAL_BYPASS_FLAG.into(),
         EXIT_ON_QUOTA_FLAG.into(),
     ]
-    .into()
+    .into();
+    args.extend(recovery.resume_args.into_iter().map(OsString::from));
+    args
 }
 
 enum PtyOutcome {
     Exited(u8),
-    QuotaExceeded(String),
+    QuotaExceeded(QuotaRecovery),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct QuotaRecovery {
+    thread_id: String,
+    resume_args: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct QuotaRecoveryPayload {
+    version: u8,
+    resume_args: Vec<String>,
 }
 
 fn run_pty_session(
@@ -241,8 +268,8 @@ fn run_pty_session(
     if let Some(error) = observation.error() {
         bail!("could not relay Codex terminal output: {error}");
     }
-    if let Some(thread_id) = observation.quota_thread_id() {
-        return Ok(PtyOutcome::QuotaExceeded(thread_id));
+    if let Some(recovery) = observation.quota_recovery()? {
+        return Ok(PtyOutcome::QuotaExceeded(recovery));
     }
 
     Ok(PtyOutcome::Exited(
@@ -470,24 +497,59 @@ impl OutputObservation {
         self.error.clone()
     }
 
-    fn quota_thread_id(&self) -> Option<String> {
-        quota_thread_id_from_tail(&self.tail)
+    fn quota_recovery(&self) -> Result<Option<QuotaRecovery>> {
+        quota_recovery_from_tail(&self.tail)
     }
 }
 
-fn quota_thread_id_from_tail(tail: &[u8]) -> Option<String> {
+fn quota_recovery_from_tail(tail: &[u8]) -> Result<Option<QuotaRecovery>> {
     let tail = tail
         .strip_suffix(b"\r\n")
-        .or_else(|| tail.strip_suffix(b"\n"))?;
+        .or_else(|| tail.strip_suffix(b"\n"));
+    let Some(tail) = tail else {
+        return Ok(None);
+    };
+    let final_line_start = tail
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let final_line = &tail[final_line_start..];
     let prefix = b"codex+k (";
-    let start = tail
+    let Some(start) = final_line
         .windows(prefix.len())
-        .rposition(|window| window == prefix)?;
-    let marker = std::str::from_utf8(&tail[start..]).ok()?;
-    let thread_id = marker
-        .strip_prefix("codex+k (")?
-        .strip_suffix("): quota exceeded")?;
-    valid_uuid(thread_id).then(|| thread_id.to_owned())
+        .rposition(|window| window == prefix)
+    else {
+        return Ok(None);
+    };
+    let marker = std::str::from_utf8(&final_line[start..])
+        .context("+k quota recovery marker was not UTF-8")?;
+    let marker = marker
+        .strip_prefix("codex+k (")
+        .expect("marker start was located by its prefix");
+    let Some((thread_id, payload)) = marker.split_once("): quota exceeded ") else {
+        if marker.ends_with("): quota exceeded") {
+            bail!("+k quota recovery marker did not include recovery settings");
+        }
+        return Ok(None);
+    };
+    if !valid_uuid(thread_id) {
+        bail!("+k quota recovery marker contained invalid thread ID `{thread_id}`");
+    }
+    let payload: QuotaRecoveryPayload =
+        serde_json::from_str(payload).context("could not parse +k quota recovery settings")?;
+    if payload.version != 1 {
+        bail!(
+            "unsupported +k quota recovery settings version {}",
+            payload.version
+        );
+    }
+    if payload.resume_args.is_empty() {
+        bail!("+k quota recovery settings contained no resume arguments");
+    }
+    Ok(Some(QuotaRecovery {
+        thread_id: thread_id.to_owned(),
+        resume_args: payload.resume_args,
+    }))
 }
 
 fn valid_uuid(value: &str) -> bool {
@@ -533,32 +595,67 @@ mod tests {
     }
 
     #[test]
-    fn parses_only_a_terminal_final_quota_marker_with_a_uuid() {
+    fn parses_only_a_terminal_final_quota_marker_with_recovery_arguments() {
         let thread_id = "123e4567-e89b-12d3-a456-426614174000";
-        let output =
-            format!("old screen text\x1b[?1049l\x1b[?25hcodex+k ({thread_id}): quota exceeded\r\n");
-        assert_eq!(
-            quota_thread_id_from_tail(output.as_bytes()).as_deref(),
-            Some(thread_id)
+        let payload =
+            r#"{"version":1,"resume_args":["--model","gpt-5.6","-c","service_tier=\"fast\""]}"#;
+        let output = format!(
+            "old screen text\x1b[?1049l\x1b[?25hcodex+k ({thread_id}): quota exceeded {payload}\r\n"
         );
         assert_eq!(
-            quota_thread_id_from_tail(b"codex+k (not-a-uuid): quota exceeded\r\n"),
-            None
+            quota_recovery_from_tail(output.as_bytes()).unwrap(),
+            Some(QuotaRecovery {
+                thread_id: thread_id.to_string(),
+                resume_args: vec![
+                    "--model".to_string(),
+                    "gpt-5.6".to_string(),
+                    "-c".to_string(),
+                    "service_tier=\"fast\"".to_string(),
+                ],
+            })
         );
         assert_eq!(
-            quota_thread_id_from_tail(
-                format!("codex+k ({thread_id}): quota exceeded\r\nmore output").as_bytes()
-            ),
+            quota_recovery_from_tail(
+                format!("codex+k ({thread_id}): quota exceeded {payload}\r\nmore output")
+                    .as_bytes()
+            )
+            .unwrap(),
             None
+        );
+        assert!(
+            quota_recovery_from_tail(
+                format!("codex+k (not-a-uuid): quota exceeded {payload}\r\n").as_bytes()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("invalid thread ID")
+        );
+        assert!(
+            quota_recovery_from_tail(
+                format!("codex+k ({thread_id}): quota exceeded\r\n").as_bytes()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("did not include recovery settings")
         );
     }
 
     #[test]
-    fn recovery_command_resumes_the_exact_thread_and_keeps_quota_detection_enabled() {
-        let args = recovery_args("123e4567-e89b-12d3-a456-426614174000")
-            .into_iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
+    fn recovery_command_resumes_the_exact_thread_with_reported_settings() {
+        let args = recovery_args(QuotaRecovery {
+            thread_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+            resume_args: vec![
+                "--model".to_string(),
+                "gpt-5.6".to_string(),
+                CONFIG_OVERRIDE_FLAG.to_string(),
+                "service_tier=\"fast\"".to_string(),
+                CONFIG_OVERRIDE_FLAG.to_string(),
+                "model_reasoning_effort=\"xhigh\"".to_string(),
+            ],
+        })
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
         assert_eq!(
             args,
             [
@@ -567,6 +664,12 @@ mod tests {
                 START_IMMEDIATELY_FLAG,
                 APPROVAL_BYPASS_FLAG,
                 EXIT_ON_QUOTA_FLAG,
+                "--model",
+                "gpt-5.6",
+                CONFIG_OVERRIDE_FLAG,
+                "service_tier=\"fast\"",
+                CONFIG_OVERRIDE_FLAG,
+                "model_reasoning_effort=\"xhigh\"",
             ]
         );
     }
@@ -615,7 +718,9 @@ mod tests {
         assert_eq!(rotations, 0);
         assert_eq!(
             fs::read_to_string(arguments).unwrap(),
-            format!("{APPROVAL_BYPASS_FLAG}\n")
+            format!(
+                "{APPROVAL_BYPASS_FLAG} {CONFIG_OVERRIDE_FLAG} {DEFAULT_SERVICE_TIER_OVERRIDE}\n"
+            )
         );
 
         let error = launcher
@@ -663,19 +768,27 @@ mod tests {
             0
         );
         assert_eq!(rotations, 0);
-        assert_eq!(fs::read_to_string(arguments).unwrap(), "\n");
+        assert_eq!(
+            fs::read_to_string(arguments).unwrap(),
+            format!("{CONFIG_OVERRIDE_FLAG} {DEFAULT_SERVICE_TIER_OVERRIDE}\n")
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn supervised_codex_rotates_and_restarts_the_exact_session() {
+    fn supervised_codex_rotates_restarts_exact_session_and_preserves_cwd() {
         let root = tempdir().unwrap();
         let source = root.path().join("fake_codex.rs");
         let binary = root.path().join("codex");
         let state = root.path().join("state");
         let arguments = root.path().join("arguments");
+        let working_directories = root.path().join("working-directories");
         let thread_id = "123e4567-e89b-12d3-a456-426614174000";
         let root_literal = format!("{:?}", root.path().to_str().unwrap());
+        let recovery_payload_literal = format!(
+            "{:?}",
+            r#"{"version":1,"resume_args":["--model","gpt-5.6","-c","model_provider=\"openai\"","-c","service_tier=\"fast\"","-c","model_reasoning_effort=\"xhigh\""]}"#
+        );
         fs::write(
             &source,
             format!(
@@ -706,14 +819,21 @@ fn main() {{
         args.join(" ")
     )
     .unwrap();
+    writeln!(
+        OpenOptions::new().create(true).append(true).open(root.join("working-directories")).unwrap(),
+        "{{}}",
+        env::current_dir().unwrap().display()
+    )
+    .unwrap();
 
     if count == 1 {{
-        println!("codex+k ({thread_id}): quota exceeded");
+        println!("codex+k ({thread_id}): quota exceeded {{}}", {recovery_payload});
     }}
 }}
 "#,
                 root = root_literal,
                 thread_id = thread_id,
+                recovery_payload = recovery_payload_literal,
             ),
         )
         .unwrap();
@@ -757,14 +877,26 @@ fn main() {{
         assert_eq!(
             fs::read_to_string(arguments).unwrap(),
             format!(
-                concat!("{} {}\n", "resume {} {} {} {}\n"),
+                concat!(
+                    "{} {} {} {}\n",
+                    "resume {} {} {} {} --model gpt-5.6 {} model_provider=\"openai\" {} service_tier=\"fast\" {} model_reasoning_effort=\"xhigh\"\n"
+                ),
                 APPROVAL_BYPASS_FLAG,
+                CONFIG_OVERRIDE_FLAG,
+                DEFAULT_SERVICE_TIER_OVERRIDE,
                 EXIT_ON_QUOTA_FLAG,
                 thread_id,
                 START_IMMEDIATELY_FLAG,
                 APPROVAL_BYPASS_FLAG,
                 EXIT_ON_QUOTA_FLAG,
+                CONFIG_OVERRIDE_FLAG,
+                CONFIG_OVERRIDE_FLAG,
+                CONFIG_OVERRIDE_FLAG,
             )
+        );
+        assert_eq!(
+            fs::read_to_string(working_directories).unwrap(),
+            format!("{0}\n{0}\n", root.path().display())
         );
         assert!(
             String::from_utf8_lossy(&captured.lock().unwrap())
