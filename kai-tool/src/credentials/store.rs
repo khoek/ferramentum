@@ -59,10 +59,24 @@ impl Default for State {
 pub struct Store {
     paths: RuntimePaths,
     state: State,
+    primary_codex_home: bool,
 }
 
 impl Store {
     pub fn open(paths: RuntimePaths) -> Result<Self> {
+        let managed_codex_home = paths.codex_home.clone();
+        Self::open_for_home(paths, &managed_codex_home, true)
+    }
+
+    pub fn open_session(paths: RuntimePaths, managed_codex_home: &Path) -> Result<Self> {
+        Self::open_for_home(paths, managed_codex_home, false)
+    }
+
+    fn open_for_home(
+        paths: RuntimePaths,
+        managed_codex_home: &Path,
+        primary_codex_home: bool,
+    ) -> Result<Self> {
         ensure_private_directory(&paths.credentials_home)?;
         ensure_private_directory(&paths.profiles_dir())?;
 
@@ -70,7 +84,7 @@ impl Store {
         validate_state(&state)?;
         if let Some(managed_home) = &state.codex_home
             && !state.profiles.is_empty()
-            && managed_home != &paths.codex_home
+            && managed_home != managed_codex_home
         {
             bail!(
                 concat!(
@@ -78,17 +92,25 @@ impl Store {
                     "is {}; use the original CODEX_HOME or a separate KAI_CREDENTIALS_HOME",
                 ),
                 managed_home.display(),
-                paths.codex_home.display()
+                managed_codex_home.display()
             );
         }
 
-        let mut store = Self { paths, state };
+        let mut store = Self {
+            paths,
+            state,
+            primary_codex_home,
+        };
         store.recover_pending_deletions()?;
         Ok(store)
     }
 
     pub fn paths(&self) -> &RuntimePaths {
         &self.paths
+    }
+
+    pub fn uses_primary_codex_home(&self) -> bool {
+        self.primary_codex_home
     }
 
     pub fn profiles(&self) -> &[Profile] {

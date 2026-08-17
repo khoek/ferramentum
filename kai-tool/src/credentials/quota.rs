@@ -19,7 +19,7 @@ use super::paths::RuntimePaths;
 const APP_SERVER_TIMEOUT: Duration = Duration::from_secs(15);
 const APP_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const APP_SERVER_RETRY_DELAY: Duration = Duration::from_millis(100);
-const APP_SERVER_ATTEMPTS: usize = 2;
+const APP_SERVER_ATTEMPTS: usize = 3;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_RPC_MESSAGES: usize = 1_000;
 const UNSTARTED_COUNTDOWN_SECONDS: i64 = 7 * 24 * 60 * 60;

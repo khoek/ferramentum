@@ -441,18 +441,37 @@ impl AgentLauncher {
 
         match self {
             Self::Codex(launcher) => {
-                let mut recovery = credentials::QuotaRecovery::default();
-                let code = launcher.run(
-                    agent_arguments(WorktreeAgentModel::Codex, &resume_mode),
-                    cwd,
-                    if options.fast {
-                        codex::ServiceTier::Fast
-                    } else {
-                        codex::ServiceTier::Default
-                    },
-                    options.quota_auto_restart.explicit(),
-                    || recovery.rotate(),
-                )?;
+                let args = agent_arguments(WorktreeAgentModel::Codex, &resume_mode);
+                let service_tier = if options.fast {
+                    codex::ServiceTier::Fast
+                } else {
+                    codex::ServiceTier::Default
+                };
+                let code = if launcher
+                    .quota_auto_restart_enabled(options.quota_auto_restart.explicit())?
+                {
+                    let mut recovery = credentials::QuotaRecovery::default();
+                    recovery.prepare()?;
+                    let codex_home = recovery.codex_home()?.to_owned();
+                    let sqlite_home = recovery.sqlite_home()?.to_owned();
+                    let run_result = launcher.run_supervised(
+                        args,
+                        cwd,
+                        service_tier,
+                        codex::SupervisedEnvironment::new(&codex_home, &sqlite_home),
+                        || recovery.rotate(),
+                    );
+                    let finish_result = recovery.finish();
+                    match (run_result, finish_result) {
+                        (Ok(code), Ok(())) => code,
+                        (Err(err), Ok(())) | (Ok(_), Err(err)) => return Err(err),
+                        (Err(run_err), Err(finish_err)) => bail!(
+                            "{run_err:#}; additionally could not save the supervised Codex credential: {finish_err:#}"
+                        ),
+                    }
+                } else {
+                    launcher.run_direct(args, cwd, service_tier)?
+                };
                 Ok(ExitCode::from(code))
             }
             Self::Claude => {

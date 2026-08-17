@@ -39,10 +39,12 @@ kai cred remove work@example.com
 percentage, relative time until reset, and an inline progress bar. Usable rate-limit reset credits
 are shown with their count and latest relative expiry. Every lookup runs `codex app-server` in its
 own temporary `CODEX_HOME`, so accounts are checked in parallel without swapping the live account
-or making quota API calls directly from Kai. Codex can refresh an expired access token inside that
-home; Kai atomically saves the resulting rotated credential back to the vault and, when appropriate,
-the live `auth.json`. On an interactive terminal, each account appears immediately with a live
-loading indicator and is rewritten as its quota arrives. After `kai next` or `kai cred next`, Kai
+or making quota API calls directly from Kai. Transient failures are retried up to three total
+attempts through this same lookup path for every command that polls quota. Codex can refresh an
+expired access token inside that home; Kai atomically saves the resulting rotated credential back
+to the vault and, when appropriate, the live `auth.json`. On an interactive terminal, each account
+appears immediately with a live loading indicator and is rewritten as its quota arrives. After
+`kai next` or `kai cred next`, Kai
 reports the newly selected account's quota as soon as the in-flight lookup completes. Selecting an
 exhausted account with reset credits prints a notice directing you to Codex's `/usage` flow to
 redeem one. A credential name and its reset time are yellow when the backend reports a fresh
@@ -114,6 +116,13 @@ Kai requires Codex to use file-backed CLI credentials. If `cli_auth_credentials_
 
 Already-running Codex processes may retain their previous credential in memory. Restart them after
 `kai next`, `kai cred activate`, or repairing the active credential.
+
+Automatically supervised +k agents avoid that shared-credential race: each run receives a private
+temporary `CODEX_HOME` while continuing to share the user's session and SQLite state. Quota recovery
+uses the same cyclic account selection as `kai next`, switches only that run's private credential,
+and saves refreshed credentials back to the vault without replacing the global `auth.json`. If no
+enrolled account has usable quota, an interactive run asks whether to check again (default yes) and
+repeats that prompt after every unsuccessful retry.
 
 ## Other commands
 

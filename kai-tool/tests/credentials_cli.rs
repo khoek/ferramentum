@@ -192,8 +192,9 @@ impl MockQuotaServer {
                     "  if [ \"$delay\" != 0 ]; then sleep \"$delay\"; fi\n",
                     "  if [ \"${{KAI_TEST_CONCURRENT_ACCOUNT-}}\" = \"$account_id\" ]; then cp \"$KAI_TEST_CONCURRENT_AUTH\" \"$KAI_TEST_LIVE_AUTH\"; fi\n",
                     "  if [ -f '{}/'$account_id'.auth.json' ]; then cp '{}/'$account_id'.auth.json' \"$CODEX_HOME/auth.json\"; fi\n",
-                    "  if [ -f '{}/'$account_id'.first.rpc' ] && [ ! -f '{}/'$account_id'.attempted' ]; then\n",
-                    "    : > '{}/'$account_id'.attempted'\n",
+                    "  if [ -f '{}/'$account_id'.failures' ] && [ \"$(cat '{}/'$account_id'.failures')\" -gt 0 ]; then\n",
+                    "    failures=$(cat '{}/'$account_id'.failures')\n",
+                    "    printf '%s\\n' \"$((failures - 1))\" > '{}/'$account_id'.failures'\n",
                     "    cat '{}/'$account_id'.first.rpc'\n",
                     "  else\n",
                     "    cat '{}/'$account_id'.rpc'\n",
@@ -216,6 +217,7 @@ impl MockQuotaServer {
                 ),
                 arrivals.display(),
                 fixtures.join("delay").display(),
+                fixtures.display(),
                 fixtures.display(),
                 fixtures.display(),
                 fixtures.display(),
@@ -256,7 +258,7 @@ impl MockQuotaServer {
         .unwrap();
     }
 
-    fn fail_once(&self, account_id: &str) {
+    fn fail_times(&self, account_id: &str, attempts: usize) {
         fs::write(
             self._root
                 .path()
@@ -266,6 +268,14 @@ impl MockQuotaServer {
                 "{\"id\":1,\"error\":{\"code\":-32603,",
                 "\"message\":\"temporary backend failure\"}}\n",
             ),
+        )
+        .unwrap();
+        fs::write(
+            self._root
+                .path()
+                .join("fixtures")
+                .join(format!("{account_id}.failures")),
+            format!("{attempts}\n"),
         )
         .unwrap();
     }
@@ -961,13 +971,13 @@ fn list_fetches_account_quotas_concurrently_and_renders_them_inline() {
 
 #[cfg(unix)]
 #[test]
-fn transient_app_server_failures_retry_in_a_fresh_isolated_home() {
+fn quota_polling_retries_twice_in_fresh_isolated_homes() {
     let root = tempdir().unwrap();
     let credentials_home = root.path().join("credentials");
     let codex_home = root.path().join("codex");
     let runtime_dir = root.path().join("runtime");
-    let server = MockQuotaServer::start_with_quotas(2, Duration::ZERO, &[("alice-id", 25.0)]);
-    server.fail_once("alice-id");
+    let server = MockQuotaServer::start_with_quotas(3, Duration::ZERO, &[("alice-id", 25.0)]);
+    server.fail_times("alice-id", 2);
     seed_account_set(
         &credentials_home,
         &codex_home,
@@ -984,8 +994,9 @@ fn transient_app_server_failures_retry_in_a_fresh_isolated_home() {
         .stdout(predicate::str::contains("\"remaining_percent\": 75.0"));
 
     let arrivals = server.finish();
-    assert_eq!(arrivals.len(), 2);
+    assert_eq!(arrivals.len(), 3);
     assert_ne!(arrivals[0].1, arrivals[1].1);
+    assert_ne!(arrivals[1].1, arrivals[2].1);
     assert!(arrivals.iter().all(|(_, home)| !home.exists()));
 }
 
@@ -1405,6 +1416,12 @@ fn next_does_not_switch_when_every_candidate_is_exhausted() {
         .failure()
         .stderr(predicate::str::contains(
             "no other enrolled account has remaining Codex quota",
+        ))
+        .stderr(predicate::str::contains(
+            "bob@example.com (quota exhausted)",
+        ))
+        .stderr(predicate::str::contains(
+            "carol@example.com (quota exhausted)",
         ));
     assert_eq!(server.finish().len(), 2);
     assert_eq!(

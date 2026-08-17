@@ -1,12 +1,14 @@
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use semver::Version;
 use serde::Deserialize;
@@ -19,14 +21,38 @@ const DEFAULT_SERVICE_TIER_OVERRIDE: &str = "service_tier=default";
 const FAST_SERVICE_TIER_OVERRIDE: &str = "service_tier=fast";
 const EXIT_ON_QUOTA_FLAG: &str = "--exit-on-quota-exceeded";
 const START_IMMEDIATELY_FLAG: &str = "--start-immediately";
+const EXTERNAL_AUTH_ENV_VARS: &[&str] = &["CODEX_ACCESS_TOKEN", "CODEX_API_KEY", "OPENAI_API_KEY"];
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const OUTPUT_TAIL_BYTES: usize = 16 * 1024;
+const NO_QUOTA_RETRY_PROMPT: &str =
+    "No enrolled account with usable Codex quota was found; retry? (Y/n)";
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AccountRotation {
+    Rotated,
+    NoQuota(String),
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum ServiceTier {
     Default,
     Fast,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SupervisedEnvironment<'a> {
+    codex_home: &'a Path,
+    sqlite_home: &'a Path,
+}
+
+impl<'a> SupervisedEnvironment<'a> {
+    pub(crate) fn new(codex_home: &'a Path, sqlite_home: &'a Path) -> Self {
+        Self {
+            codex_home,
+            sqlite_home,
+        }
+    }
 }
 
 impl ServiceTier {
@@ -74,41 +100,51 @@ impl Launcher {
         })
     }
 
-    pub fn run(
+    pub fn quota_auto_restart_enabled(&self, requested: Option<bool>) -> Result<bool> {
+        match requested {
+            Some(true) if !self.plus_k => {
+                bail!("--quota-auto-restart yes requires a +k Codex build")
+            }
+            Some(enabled) => Ok(enabled),
+            None => Ok(self.plus_k),
+        }
+    }
+
+    pub fn run_direct(
+        &self,
+        mut args: Vec<OsString>,
+        cwd: &Path,
+        service_tier: ServiceTier,
+    ) -> Result<u8> {
+        force_service_tier(&mut args, service_tier);
+        run_direct(&self.binary, &args, cwd)
+    }
+
+    pub fn run_supervised(
         &self,
         initial_args: Vec<OsString>,
         cwd: &Path,
         service_tier: ServiceTier,
-        quota_auto_restart: Option<bool>,
-        rotate_account: impl FnMut() -> Result<()>,
+        environment: SupervisedEnvironment<'_>,
+        rotate_account: impl FnMut() -> Result<AccountRotation>,
     ) -> Result<u8> {
-        let quota_auto_restart = match quota_auto_restart {
-            Some(true) if !self.plus_k => {
-                bail!("--quota-auto-restart yes requires a +k Codex build")
-            }
-            Some(enabled) => enabled,
-            None => self.plus_k,
-        };
-        if !quota_auto_restart {
-            let mut args = initial_args;
-            force_service_tier(&mut args, service_tier);
-            return run_direct(&self.binary, &args, cwd);
-        }
-        self.run_supervised(
+        self.run_supervised_with_io(
             initial_args,
             cwd,
             service_tier,
+            environment,
             rotate_account,
             SupervisedIo::terminal(),
         )
     }
 
-    fn run_supervised(
+    fn run_supervised_with_io(
         &self,
         initial_args: Vec<OsString>,
         cwd: &Path,
         service_tier: ServiceTier,
-        mut rotate_account: impl FnMut() -> Result<()>,
+        environment: SupervisedEnvironment<'_>,
+        mut rotate_account: impl FnMut() -> Result<AccountRotation>,
         io: SupervisedIo,
     ) -> Result<u8> {
         let mut args = initial_args;
@@ -118,19 +154,83 @@ impl Launcher {
             input,
             output,
             raw_terminal,
+            prompt_terminal,
         } = io;
         let input = InputRouter::start(input);
 
         loop {
-            match run_pty_session(&self.binary, &args, cwd, &input, &output, raw_terminal)? {
+            match run_pty_session(
+                &self.binary,
+                &args,
+                cwd,
+                environment,
+                &input,
+                &output,
+                raw_terminal,
+            )? {
                 PtyOutcome::Exited(code) => return Ok(code),
                 PtyOutcome::QuotaExceeded(recovery) => {
-                    rotate_account()?;
+                    rotate_account_with_retry(&mut rotate_account, &mut |details| {
+                        prompt_no_quota_retry(&input, prompt_terminal, details)
+                    })?;
                     args = recovery_args(recovery);
                 }
             }
         }
     }
+}
+
+fn rotate_account_with_retry(
+    rotate_account: &mut impl FnMut() -> Result<AccountRotation>,
+    retry: &mut impl FnMut(&str) -> Result<bool>,
+) -> Result<()> {
+    loop {
+        match rotate_account()? {
+            AccountRotation::Rotated => return Ok(()),
+            AccountRotation::NoQuota(details) => {
+                if !retry(&details)? {
+                    bail!(details);
+                }
+            }
+        }
+    }
+}
+
+fn prompt_no_quota_retry(
+    input: &InputRouter,
+    prompt_terminal: bool,
+    details: &str,
+) -> Result<bool> {
+    if !prompt_terminal {
+        bail!(details.to_owned());
+    }
+
+    let _raw_mode = RawModeGuard::enter(true)?;
+    let prompt = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr());
+    prompt.set_style(
+        ProgressStyle::with_template("{msg}").context("could not configure quota retry prompt")?,
+    );
+    prompt.set_message(NO_QUOTA_RETRY_PROMPT);
+    prompt.tick();
+
+    let answer = match input.read_confirmation(|selection| {
+        prompt.set_message(match selection {
+            Some(true) => format!("{NO_QUOTA_RETRY_PROMPT} y"),
+            Some(false) => format!("{NO_QUOTA_RETRY_PROMPT} n"),
+            None => NO_QUOTA_RETRY_PROMPT.to_owned(),
+        });
+    }) {
+        Ok(answer) => answer,
+        Err(error) => {
+            prompt.finish_and_clear();
+            return Err(error).context("could not read quota retry confirmation");
+        }
+    };
+    prompt.finish_with_message(format!(
+        "{NO_QUOTA_RETRY_PROMPT} {}",
+        if answer { "yes" } else { "no" }
+    ));
+    Ok(answer)
 }
 
 fn force_service_tier(args: &mut Vec<OsString>, service_tier: ServiceTier) {
@@ -204,6 +304,7 @@ fn run_pty_session(
     binary: &Path,
     args: &[OsString],
     cwd: &Path,
+    environment: SupervisedEnvironment<'_>,
     input: &InputRouter,
     output: &Arc<Mutex<Box<dyn Write + Send>>>,
     raw_terminal: bool,
@@ -216,6 +317,11 @@ fn run_pty_session(
     let mut command = CommandBuilder::new(binary);
     command.args(args);
     command.env(GIT_TERMINAL_PROMPT_ENV, "0");
+    command.env("CODEX_HOME", environment.codex_home);
+    command.env("CODEX_SQLITE_HOME", environment.sqlite_home);
+    for name in EXTERNAL_AUTH_ENV_VARS {
+        command.env_remove(name);
+    }
     command.cwd(cwd);
     let reader = pair
         .master
@@ -301,6 +407,7 @@ struct SupervisedIo {
     input: Box<dyn Read + Send>,
     output: Arc<Mutex<Box<dyn Write + Send>>>,
     raw_terminal: bool,
+    prompt_terminal: bool,
 }
 
 impl SupervisedIo {
@@ -309,65 +416,97 @@ impl SupervisedIo {
             input: Box::new(io::stdin()),
             output: Arc::new(Mutex::new(Box::new(io::stdout()))),
             raw_terminal: io::stdin().is_terminal() && io::stdout().is_terminal(),
+            prompt_terminal: io::stdin().is_terminal() && io::stderr().is_terminal(),
         }
     }
 }
 
 struct InputRouter {
-    state: Arc<Mutex<InputState>>,
+    shared: Arc<SharedInputState>,
+}
+
+struct SharedInputState {
+    state: Mutex<InputState>,
+    ready: Condvar,
 }
 
 struct InputState {
     writer: Option<Box<dyn Write + Send>>,
+    pending: VecDeque<u8>,
     error: Option<String>,
+    closed: bool,
 }
 
 impl InputRouter {
     fn start(mut reader: Box<dyn Read + Send>) -> Self {
-        let state = Arc::new(Mutex::new(InputState {
-            writer: None,
-            error: None,
-        }));
-        let thread_state = Arc::clone(&state);
+        let shared = Arc::new(SharedInputState {
+            state: Mutex::new(InputState {
+                writer: None,
+                pending: VecDeque::new(),
+                error: None,
+                closed: false,
+            }),
+            ready: Condvar::new(),
+        });
+        let thread_shared = Arc::clone(&shared);
         thread::spawn(move || {
             let mut buffer = [0; 4096];
             loop {
                 let count = match reader.read(&mut buffer) {
-                    Ok(0) => return,
+                    Ok(0) => {
+                        if let Ok(mut state) = thread_shared.state.lock() {
+                            state.closed = true;
+                            thread_shared.ready.notify_all();
+                        }
+                        return;
+                    }
                     Ok(count) => count,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) => {
-                        if let Ok(mut state) = thread_state.lock() {
+                        if let Ok(mut state) = thread_shared.state.lock() {
                             state.error = Some(error.to_string());
+                            thread_shared.ready.notify_all();
                         }
                         return;
                     }
                 };
-                let Ok(mut state) = thread_state.lock() else {
+                let Ok(mut state) = thread_shared.state.lock() else {
                     return;
                 };
-                if let Some(writer) = state.writer.as_mut()
-                    && let Err(error) = writer.write_all(&buffer[..count])
-                    && error.kind() != io::ErrorKind::BrokenPipe
-                {
-                    state.error = Some(error.to_string());
+                if let Some(writer) = state.writer.as_mut() {
+                    if let Err(error) = writer.write_all(&buffer[..count])
+                        && error.kind() != io::ErrorKind::BrokenPipe
+                    {
+                        state.error = Some(error.to_string());
+                    }
+                } else {
+                    state.pending.extend(&buffer[..count]);
                 }
+                thread_shared.ready.notify_all();
             }
         });
-        Self { state }
+        Self { shared }
     }
 
-    fn attach(&self, writer: Box<dyn Write + Send>) -> Result<()> {
+    fn attach(&self, mut writer: Box<dyn Write + Send>) -> Result<()> {
         let mut state = self
+            .shared
             .state
             .lock()
             .map_err(|_| anyhow!("terminal input router lock was poisoned"))?;
+        if !state.pending.is_empty() {
+            let pending = state.pending.drain(..).collect::<Vec<_>>();
+            writer
+                .write_all(&pending)
+                .context("could not forward buffered terminal input to Codex")?;
+        }
         state.writer = Some(writer);
         Ok(())
     }
 
     fn detach(&self) -> Result<()> {
         let mut state = self
+            .shared
             .state
             .lock()
             .map_err(|_| anyhow!("terminal input router lock was poisoned"))?;
@@ -380,11 +519,59 @@ impl InputRouter {
 
     fn error(&self) -> Result<Option<String>> {
         Ok(self
+            .shared
             .state
             .lock()
             .map_err(|_| anyhow!("terminal input router lock was poisoned"))?
             .error
             .clone())
+    }
+
+    fn read_confirmation(&self, mut selection_changed: impl FnMut(Option<bool>)) -> Result<bool> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| anyhow!("terminal input router lock was poisoned"))?;
+        let mut answer = None;
+        loop {
+            while let Some(byte) = state.pending.pop_front() {
+                match byte {
+                    b'y' | b'Y' => {
+                        answer = Some(true);
+                        selection_changed(answer);
+                    }
+                    b'n' | b'N' => {
+                        answer = Some(false);
+                        selection_changed(answer);
+                    }
+                    b'\r' => {
+                        if state.pending.front() == Some(&b'\n') {
+                            state.pending.pop_front();
+                        }
+                        return Ok(answer.unwrap_or(true));
+                    }
+                    b'\n' => return Ok(answer.unwrap_or(true)),
+                    8 | 127 => {
+                        answer = None;
+                        selection_changed(answer);
+                    }
+                    3 | 4 | 27 => bail!("quota retry prompt was interrupted"),
+                    _ => {}
+                }
+            }
+            if let Some(error) = &state.error {
+                bail!("could not read terminal input: {error}");
+            }
+            if state.closed {
+                bail!("terminal input closed while waiting for retry confirmation");
+            }
+            state = self
+                .shared
+                .ready
+                .wait(state)
+                .map_err(|_| anyhow!("terminal input router lock was poisoned"))?;
+        }
     }
 }
 
@@ -694,6 +881,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unavailable_quota_reprompts_until_rotation_succeeds() {
+        let mut outcomes = VecDeque::from([
+            AccountRotation::NoQuota("first check found no quota".to_owned()),
+            AccountRotation::NoQuota("second check found no quota".to_owned()),
+            AccountRotation::Rotated,
+        ]);
+        let mut prompts = Vec::new();
+
+        rotate_account_with_retry(&mut || Ok(outcomes.pop_front().unwrap()), &mut |details| {
+            prompts.push(details.to_owned());
+            Ok(true)
+        })
+        .unwrap();
+
+        assert!(outcomes.is_empty());
+        assert_eq!(
+            prompts,
+            ["first check found no quota", "second check found no quota"]
+        );
+    }
+
+    #[test]
+    fn declining_quota_retry_returns_the_latest_no_quota_error() {
+        let mut rotations = 0;
+        let error = rotate_account_with_retry(
+            &mut || {
+                rotations += 1;
+                Ok(AccountRotation::NoQuota(
+                    "all checked accounts are exhausted".to_owned(),
+                ))
+            },
+            &mut |_| Ok(false),
+        )
+        .unwrap_err();
+
+        assert_eq!(rotations, 1);
+        assert_eq!(error.to_string(), "all checked accounts are exhausted");
+    }
+
+    #[test]
+    fn quota_rotation_errors_do_not_prompt() {
+        let mut prompts = 0;
+        let error = rotate_account_with_retry(
+            &mut || Err(anyhow!("credential store is unavailable")),
+            &mut |_| {
+                prompts += 1;
+                Ok(true)
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(prompts, 0);
+        assert_eq!(error.to_string(), "credential store is unavailable");
+    }
+
+    #[test]
+    fn input_router_reads_default_yes_and_explicit_answers_while_detached() {
+        let default_yes = InputRouter::start(Box::new(io::Cursor::new(b"\r")));
+        let explicit_yes = InputRouter::start(Box::new(io::Cursor::new(b"Y\r")));
+        let explicit_no = InputRouter::start(Box::new(io::Cursor::new(b"n\r")));
+
+        assert!(default_yes.read_confirmation(|_| {}).unwrap());
+        assert!(explicit_yes.read_confirmation(|_| {}).unwrap());
+        assert!(!explicit_no.read_confirmation(|_| {}).unwrap());
+    }
+
+    #[test]
+    fn noninteractive_quota_retry_preserves_the_selection_details() {
+        let input = InputRouter::start(Box::new(io::empty()));
+        let error =
+            prompt_no_quota_retry(&input, false, "checked: alice (quota exhausted)").unwrap_err();
+
+        assert_eq!(error.to_string(), "checked: alice (quota exhausted)");
+    }
+
     #[cfg(unix)]
     #[test]
     fn official_codex_keeps_direct_launch_without_the_quota_flag() {
@@ -720,23 +983,17 @@ mod tests {
 
         let launcher = Launcher::from_binary(script).unwrap();
         assert!(!launcher.plus_k);
-        let mut rotations = 0;
+        assert!(!launcher.quota_auto_restart_enabled(None).unwrap());
         assert_eq!(
             launcher
-                .run(
+                .run_direct(
                     vec![APPROVAL_BYPASS_FLAG.into()],
                     root.path(),
                     ServiceTier::Default,
-                    None,
-                    || {
-                        rotations += 1;
-                        Ok(())
-                    },
                 )
                 .unwrap(),
             0
         );
-        assert_eq!(rotations, 0);
         assert_eq!(
             fs::read_to_string(arguments).unwrap(),
             format!(
@@ -744,15 +1001,7 @@ mod tests {
             )
         );
 
-        let error = launcher
-            .run(
-                Vec::new(),
-                root.path(),
-                ServiceTier::Default,
-                Some(true),
-                || Ok(()),
-            )
-            .unwrap_err();
+        let error = launcher.quota_auto_restart_enabled(Some(true)).unwrap_err();
         assert_eq!(
             error.to_string(),
             "--quota-auto-restart yes requires a +k Codex build"
@@ -784,23 +1033,13 @@ mod tests {
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
 
         let launcher = Launcher::from_binary(script).unwrap();
-        let mut rotations = 0;
+        assert!(!launcher.quota_auto_restart_enabled(Some(false)).unwrap());
         assert_eq!(
             launcher
-                .run(
-                    Vec::new(),
-                    root.path(),
-                    ServiceTier::Fast,
-                    Some(false),
-                    || {
-                        rotations += 1;
-                        Ok(())
-                    },
-                )
+                .run_direct(Vec::new(), root.path(), ServiceTier::Fast)
                 .unwrap(),
             0
         );
-        assert_eq!(rotations, 0);
         assert_eq!(
             fs::read_to_string(arguments).unwrap(),
             format!("{CONFIG_OVERRIDE_FLAG} {FAST_SERVICE_TIER_OVERRIDE}\n")
@@ -889,18 +1128,20 @@ fn main() {{
         let captured = Arc::new(Mutex::new(Vec::new()));
         let mut rotations = 0;
         let code = launcher
-            .run_supervised(
+            .run_supervised_with_io(
                 vec![APPROVAL_BYPASS_FLAG.into()],
                 root.path(),
                 ServiceTier::Fast,
+                SupervisedEnvironment::new(root.path(), root.path()),
                 || {
                     rotations += 1;
-                    Ok(())
+                    Ok(AccountRotation::Rotated)
                 },
                 SupervisedIo {
                     input: Box::new(io::empty()),
                     output: Arc::new(Mutex::new(Box::new(SharedWriter(Arc::clone(&captured))))),
                     raw_terminal: false,
+                    prompt_terminal: false,
                 },
             )
             .unwrap();

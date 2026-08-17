@@ -1,11 +1,14 @@
-use std::collections::HashSet;
+use std::env;
+use std::fmt;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
+
+use crate::codex::AccountRotation;
 
 mod auth;
 mod enroll;
@@ -16,6 +19,7 @@ mod store;
 mod ui;
 
 use self::auth::{Credential, CredentialFacts, validate_email};
+use self::isolated_home::SupervisedCodexHome;
 use self::paths::RuntimePaths;
 use self::store::{Profile, Store, ensure_codex_uses_file_credentials};
 use self::ui::{AccountStatus, AccountView, ListView, QuotaStatus};
@@ -167,20 +171,177 @@ enum QuotaAvailability {
     Unusable,
 }
 
+#[derive(Debug)]
+struct NoUsableQuota(String);
+
+impl fmt::Display for NoUsableQuota {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoUsableQuota {}
+
 #[derive(Default)]
 pub(crate) struct QuotaRecovery {
-    exhausted_account_ids: HashSet<String>,
+    source_paths: Option<RuntimePaths>,
+    supervised_home: Option<SupervisedCodexHome>,
+    active_source: Option<Credential>,
+    sqlite_home: Option<PathBuf>,
+    finished: bool,
 }
 
 impl QuotaRecovery {
-    pub(crate) fn rotate(&mut self) -> Result<()> {
-        credential_runtime()?.block_on(self.rotate_async())
+    pub(crate) fn prepare(&mut self) -> Result<()> {
+        if self.source_paths.is_some() {
+            return Ok(());
+        }
+        let _invocation_lock = capulus::acquire("kai-cred", true)?;
+        let store = open_store()?;
+        let source_paths = store.paths().clone();
+        let sqlite_home = env::var_os("CODEX_SQLITE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| source_paths.codex_home.clone());
+        let (supervised_home, active_source) = match load_live_strict(&store)? {
+            Some(credential) => match managed_profile(&store, &credential).cloned() {
+                Some(profile) => {
+                    store.sync_profile(&profile, &credential)?;
+                    let source = Credential::from_bytes(credential.as_bytes().to_vec())
+                        .context("could not retain the supervised Codex credential baseline")?;
+                    (
+                        Some(SupervisedCodexHome::with_credential(
+                            &source_paths,
+                            &credential,
+                        )?),
+                        Some(source),
+                    )
+                }
+                None => (None, None),
+            },
+            None => (None, None),
+        };
+        self.source_paths = Some(source_paths);
+        self.supervised_home = supervised_home;
+        self.active_source = active_source;
+        self.sqlite_home = Some(sqlite_home);
+        Ok(())
+    }
+
+    pub(crate) fn codex_home(&self) -> Result<&Path> {
+        if let Some(home) = &self.supervised_home {
+            return Ok(home.path());
+        }
+        Ok(&self
+            .source_paths
+            .as_ref()
+            .context("quota recovery was not prepared")?
+            .codex_home)
+    }
+
+    pub(crate) fn sqlite_home(&self) -> Result<&Path> {
+        self.sqlite_home
+            .as_deref()
+            .context("quota recovery was not prepared")
+    }
+
+    pub(crate) fn rotate(&mut self) -> Result<AccountRotation> {
+        classify_account_rotation(credential_runtime()?.block_on(self.rotate_async()))
     }
 
     async fn rotate_async(&mut self) -> Result<()> {
         let _invocation_lock = capulus::acquire("kai-cred", true)?;
-        let mut store = open_store()?;
-        cmd_next(&mut store, Some(&mut self.exhausted_account_ids)).await
+        let mut store = self.open_store()?;
+        self.reconcile_session_credential(&store)?;
+        cmd_next(&mut store).await?;
+        self.capture_active_source(&store)
+    }
+
+    pub(crate) fn finish(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        if self.supervised_home.is_none() {
+            return Ok(());
+        }
+        let _invocation_lock = capulus::acquire("kai-cred", true)?;
+        let store = self.open_store()?;
+        self.reconcile_session_credential(&store)
+    }
+
+    fn open_store(&self) -> Result<Store> {
+        let source_paths = self
+            .source_paths
+            .as_ref()
+            .context("quota recovery was not prepared")?;
+        let Some(home) = &self.supervised_home else {
+            ensure_codex_uses_file_credentials(source_paths)?;
+            return Store::open(source_paths.clone());
+        };
+        let session_paths = RuntimePaths::new(
+            source_paths.credentials_home.clone(),
+            home.path().to_owned(),
+        )?;
+        ensure_codex_uses_file_credentials(&session_paths)?;
+        Store::open_session(session_paths, &source_paths.codex_home)
+    }
+
+    fn reconcile_session_credential(&mut self, store: &Store) -> Result<()> {
+        if self.supervised_home.is_none() {
+            return Ok(());
+        }
+        let live = match load_live(store) {
+            LiveAuth::Absent => {
+                self.active_source = None;
+                return Ok(());
+            }
+            LiveAuth::Present(credential) => credential,
+            LiveAuth::Invalid(err) => {
+                return Err(err).context("could not save the supervised Codex credential");
+            }
+        };
+        let source = self
+            .active_source
+            .as_ref()
+            .context("supervised Codex changed from a signed-out state unexpectedly")?;
+        if source.facts.account_id != live.facts.account_id {
+            bail!(
+                "supervised Codex changed accounts outside Kai; refusing to overwrite either credential"
+            );
+        }
+        let profile = require_managed_profile(store, &live)?.clone();
+        let stored = store.credential(&profile)?;
+        let authoritative = if stored.as_bytes() == live.as_bytes() {
+            live
+        } else if stored.as_bytes() == source.as_bytes() {
+            store.sync_profile(&profile, &live)?;
+            live
+        } else {
+            // Another supervised run saved a newer credential after this run started. Keep that
+            // vault copy and install it into this run before resuming, rather than resurrecting a
+            // refresh token which may already have been consumed.
+            store.write_active(&stored)?;
+            stored
+        };
+        self.active_source = Some(Credential::from_bytes(authoritative.as_bytes().to_vec())?);
+        Ok(())
+    }
+
+    fn capture_active_source(&mut self, store: &Store) -> Result<()> {
+        self.active_source = load_live_strict(store)?
+            .map(|credential| Credential::from_bytes(credential.as_bytes().to_vec()))
+            .transpose()?;
+        Ok(())
+    }
+}
+
+fn classify_account_rotation(result: Result<()>) -> Result<AccountRotation> {
+    match result {
+        Ok(()) => Ok(AccountRotation::Rotated),
+        Err(error) if error.downcast_ref::<NoUsableQuota>().is_some() => {
+            Ok(AccountRotation::NoQuota(format!("{error:#}")))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -194,7 +355,7 @@ async fn run_async(command: CredCommand) -> Result<()> {
     match command {
         CredCommand::List(args) => cmd_list(&store, args).await,
         CredCommand::Tickle => cmd_tickle(&mut store).await,
-        CredCommand::Next => cmd_next(&mut store, None).await,
+        CredCommand::Next => cmd_next(&mut store).await,
         CredCommand::Activate(args) => cmd_activate(&mut store, &args.email),
         CredCommand::Add(args) => cmd_add(&mut store, args).await,
         CredCommand::Fix(args) => cmd_fix(&mut store, args).await,
@@ -477,12 +638,12 @@ fn ready_account_view(
     }
 }
 
-async fn cmd_next(
-    store: &mut Store,
-    exhausted_account_ids: Option<&mut HashSet<String>>,
-) -> Result<()> {
+async fn cmd_next(store: &mut Store) -> Result<()> {
     if store.profiles().is_empty() {
-        bail!("no accounts are enrolled; run `kai cred add <email>` first");
+        return Err(NoUsableQuota(
+            "no accounts are enrolled; run `kai cred add <email>` first".to_owned(),
+        )
+        .into());
     }
     let live = load_live_strict(store)?;
     let active_index = match &live {
@@ -498,38 +659,24 @@ async fn cmd_next(
             )
         }
     };
-    let recovering = exhausted_account_ids.is_some();
-    let exclusions = exhausted_account_ids.map(|exhausted| {
-        if let Some(credential) = &live {
-            exhausted.insert(credential.facts.account_id.clone());
-        }
-        exhausted.clone()
-    });
-    let mut order = rotation_order(store.profiles().len(), active_index);
-    if let Some(exclusions) = &exclusions {
-        order.retain(|index| !exclusions.contains(&store.profiles()[*index].account_id));
-    }
-    if order.is_empty() && recovering {
-        bail!("no other enrolled account has confirmed remaining Codex quota");
-    }
+    let order = rotation_order(store.profiles().len(), active_index);
     capulus::ui::stage("Checking enrolled account quotas");
     let checks = fetch_profile_quotas(store, &order, live.as_ref()).await?;
     let candidates = checks
         .iter()
         .map(|(index, result)| (*index, quota_result_availability(result)));
-    let target_index = if recovering {
-        confirmed_rotation_index(candidates)
-    } else {
-        preferred_rotation_index(candidates)
-    };
+    let target_index = preferred_rotation_index(candidates);
     let Some(target_index) = target_index else {
-        if recovering {
-            bail!("no other enrolled account has confirmed remaining Codex quota");
-        }
-        if active_index.is_some() && store.profiles().len() > 1 {
-            bail!("no other enrolled account has remaining Codex quota or usable reset credits");
-        }
-        bail!("no enrolled account has remaining Codex quota or usable reset credits");
+        let scope = if active_index.is_some() && store.profiles().len() > 1 {
+            "no other enrolled account has remaining Codex quota or usable reset credits"
+        } else {
+            "no enrolled account has remaining Codex quota or usable reset credits"
+        };
+        return Err(NoUsableQuota(format!(
+            "{scope}; checked: {}",
+            quota_check_summary(store, &checks)
+        ))
+        .into());
     };
     let target = store.profiles()[target_index].clone();
     let quota = checks
@@ -539,7 +686,7 @@ async fn cmd_next(
     let changed = activate(store, &target)?;
     if changed {
         capulus::ui::success(&format!("Codex is now using {}.", target.email));
-        if !recovering {
+        if store.uses_primary_codex_home() {
             warn_running_codex();
         }
     } else {
@@ -706,14 +853,6 @@ fn preferred_rotation_index(
     first_resettable.or(first_unknown)
 }
 
-fn confirmed_rotation_index(
-    candidates: impl IntoIterator<Item = (usize, QuotaAvailability)>,
-) -> Option<usize> {
-    candidates.into_iter().find_map(|(index, availability)| {
-        (availability == QuotaAvailability::Remaining).then_some(index)
-    })
-}
-
 fn quota_result_availability(result: &Result<quota::Snapshot>) -> QuotaAvailability {
     match result {
         Ok(snapshot) if snapshot.remaining_percent > 0.0 => QuotaAvailability::Remaining,
@@ -724,6 +863,27 @@ fn quota_result_availability(result: &Result<quota::Snapshot>) -> QuotaAvailabil
         Err(err) if quota::requires_authentication(err) => QuotaAvailability::Unusable,
         Err(_) => QuotaAvailability::Unknown,
     }
+}
+
+fn quota_check_summary(store: &Store, checks: &[(usize, Result<quota::Snapshot>)]) -> String {
+    checks
+        .iter()
+        .map(|(index, result)| {
+            let status = match result {
+                Ok(snapshot) if snapshot.remaining_percent > 0.0 => "quota remaining".to_owned(),
+                Ok(snapshot) if snapshot.rate_limit_reset_credits.is_some() => {
+                    "reset credit available".to_owned()
+                }
+                Ok(_) => "quota exhausted".to_owned(),
+                Err(err) if quota::requires_authentication(err) => {
+                    format!("authentication failed: {err:#}")
+                }
+                Err(err) => format!("quota unavailable: {err:#}"),
+            };
+            format!("{} ({status})", store.profiles()[*index].email)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn quota_status_availability(status: &QuotaStatus) -> QuotaAvailability {
@@ -1323,6 +1483,53 @@ mod tests {
     }
 
     #[test]
+    fn supervised_recovery_does_not_overwrite_a_newer_vault_credential() {
+        let (_root, mut source_store) = setup();
+        let source = credential("alice@example.com", "alice-id", "alice-source");
+        let alice = source_store.insert_profile(&source).unwrap();
+        source_store.write_active(&source).unwrap();
+        let source_paths = source_store.paths().clone();
+        let home = SupervisedCodexHome::with_credential(&source_paths, &source).unwrap();
+        let session_paths = RuntimePaths::new(
+            source_paths.credentials_home.clone(),
+            home.path().to_owned(),
+        )
+        .unwrap();
+        let session_store = Store::open_session(session_paths, &source_paths.codex_home).unwrap();
+        session_store
+            .write_active(&credential(
+                "alice@example.com",
+                "alice-id",
+                "alice-session-refresh",
+            ))
+            .unwrap();
+        let newer = credential("alice@example.com", "alice-id", "alice-newer-vault");
+        source_store.sync_profile(&alice, &newer).unwrap();
+        let mut recovery = QuotaRecovery {
+            source_paths: Some(source_paths),
+            supervised_home: Some(home),
+            active_source: Some(source),
+            sqlite_home: None,
+            finished: false,
+        };
+
+        recovery
+            .reconcile_session_credential(&session_store)
+            .unwrap();
+
+        assert_eq!(
+            source_store.credential(&alice).unwrap().as_bytes(),
+            newer.as_bytes()
+        );
+        assert_eq!(
+            Credential::read(&session_store.paths().active_auth())
+                .unwrap()
+                .as_bytes(),
+            newer.as_bytes()
+        );
+    }
+
+    #[test]
     fn switching_refuses_to_overwrite_an_unenrolled_live_account() {
         let (_root, mut store) = setup();
         let bob = store
@@ -1354,6 +1561,19 @@ mod tests {
         assert_eq!(rotation_order(3, None), vec![0, 1, 2]);
         assert_eq!(rotation_order(3, Some(1)), vec![2, 0]);
         assert_eq!(rotation_order(1, Some(0)), vec![0]);
+    }
+
+    #[test]
+    fn supervised_rotation_classifies_only_no_usable_quota() {
+        assert_eq!(
+            classify_account_rotation(Err(NoUsableQuota("none available".to_owned()).into()))
+                .unwrap(),
+            AccountRotation::NoQuota("none available".to_owned())
+        );
+
+        let error =
+            classify_account_rotation(Err(anyhow!("could not read auth.json"))).unwrap_err();
+        assert_eq!(error.to_string(), "could not read auth.json");
     }
 
     #[test]
@@ -1413,26 +1633,6 @@ mod tests {
             preferred_rotation_index([
                 (1, QuotaAvailability::Exhausted),
                 (2, QuotaAvailability::Exhausted),
-            ]),
-            None
-        );
-    }
-
-    #[test]
-    fn quota_recovery_requires_confirmed_remaining_quota() {
-        assert_eq!(
-            confirmed_rotation_index([
-                (1, QuotaAvailability::Resettable),
-                (2, QuotaAvailability::Unknown),
-                (3, QuotaAvailability::Remaining),
-            ]),
-            Some(3)
-        );
-        assert_eq!(
-            confirmed_rotation_index([
-                (1, QuotaAvailability::Resettable),
-                (2, QuotaAvailability::Unknown),
-                (3, QuotaAvailability::Exhausted),
             ]),
             None
         );
