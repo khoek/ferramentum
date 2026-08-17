@@ -1,8 +1,14 @@
 use std::env;
 use std::fs;
 #[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::Stdio;
+#[cfg(unix)]
+use std::thread;
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
@@ -843,6 +849,62 @@ fn empty_list_has_human_and_json_output() {
         .success()
         .stdout(predicate::str::contains("\"accounts\": []"))
         .stdout(predicate::str::contains("refresh_token").not());
+}
+
+#[cfg(unix)]
+#[test]
+fn credential_commands_wait_for_the_invocation_lock() {
+    let root = tempdir().unwrap();
+    let credentials_home = root.path().join("credentials");
+    let codex_home = root.path().join("codex");
+    let runtime_dir = root.path().join("runtime");
+    let lock_dir = runtime_dir.join("capulus");
+    fs::create_dir_all(&lock_dir).unwrap();
+    let lockfile = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_dir.join("kai-cred.lock"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lockfile).unwrap();
+
+    let mut children = (0..3)
+        .map(|_| {
+            let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin!("kai"));
+            child
+                .env("KAI_CREDENTIALS_HOME", &credentials_home)
+                .env("CODEX_HOME", &codex_home)
+                .env("XDG_RUNTIME_DIR", &runtime_dir)
+                .args(["cred", "list", "--json"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            child.spawn().unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    thread::sleep(Duration::from_millis(250));
+    for child in &mut children {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "credential command exited instead of waiting for the lock"
+        );
+    }
+
+    drop(lockfile);
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "waiting credential command failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("\"accounts\": []"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("Waiting for another `kai-cred` invocation to finish")
+        );
+    }
 }
 
 #[cfg(unix)]

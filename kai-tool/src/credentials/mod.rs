@@ -178,7 +178,7 @@ impl QuotaRecovery {
     }
 
     async fn rotate_async(&mut self) -> Result<()> {
-        let _invocation_lock = capulus::acquire("kai-cred", false)?;
+        let _invocation_lock = capulus::acquire("kai-cred", true)?;
         let mut store = open_store()?;
         cmd_next(&mut store, Some(&mut self.exhausted_account_ids)).await
     }
@@ -189,7 +189,7 @@ pub fn run(command: CredCommand) -> Result<()> {
 }
 
 async fn run_async(command: CredCommand) -> Result<()> {
-    let _invocation_lock = capulus::acquire("kai-cred", false)?;
+    let _invocation_lock = capulus::acquire("kai-cred", true)?;
     let mut store = open_store()?;
     match command {
         CredCommand::List(args) => cmd_list(&store, args).await,
