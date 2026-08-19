@@ -1,6 +1,6 @@
 [package]
 name = "ocular-tool"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 publish.workspace = true
 description = "CLI bridge for SSO authentication with OpenConnect/AnyConnect VPNs"
@@ -26,7 +26,7 @@ hex = "0.4"
 indicatif = { workspace = true }
 ipnet = { version = "2", features = ["serde"] }
 libc = { workspace = true }
-openconnect-core = { git = "https://github.com/khoek/Openconnect-RS.git", branch = "ocular-peer-cert-der" }
+openconnect-core = { version = "0.1", git = "https://github.com/khoek/Openconnect-RS.git", branch = "ocular-peer-cert-der" }
 quick-xml = { version = "0.41", features = ["escape-html"] }
 reqwest = { workspace = true, features = ["blocking", "cookies", "rustls", "socks"] }
 serde = { workspace = true }
