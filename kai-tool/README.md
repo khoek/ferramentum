@@ -108,8 +108,10 @@ Override it with `KAI_CREDENTIALS_HOME`. Kai reads and updates Codex's
 The vault is not encrypted; like Codex's own `auth.json`, it contains bearer credentials. On Unix,
 Kai enforces mode `0700` on vault directories and `0600` on credential/state files, refuses
 credential symlinks, uses atomic durable writes, and serializes credential operations with an
-invocation lock. Temporary Codex homes use the same private permissions and are removed as soon as
-their login or quota worker exits. Protect backups accordingly.
+invocation lock. Temporary Codex homes and supervised auth directories use the same private
+permissions and are removed as soon as their login, quota worker, or supervised run exits normally.
+A hard-killed process can leave only a private, unreferenced auth directory; it cannot leave
+sessions or SQLite state pointing at a temporary home. Protect backups accordingly.
 
 Kai requires Codex to use file-backed CLI credentials. If `cli_auth_credentials_store` is set to
 `auto` or `keyring`, change it to `file` in the active Codex `config.toml`.
@@ -117,12 +119,15 @@ Kai requires Codex to use file-backed CLI credentials. If `cli_auth_credentials_
 Already-running Codex processes may retain their previous credential in memory. Restart them after
 `kai next`, `kai cred activate`, or repairing the active credential.
 
-Automatically supervised +k agents avoid that shared-credential race: each run receives a private
-temporary `CODEX_HOME` while continuing to share the user's session and SQLite state. Quota recovery
-uses the same cyclic account selection as `kai next`, switches only that run's private credential,
-and saves refreshed credentials back to the vault without replacing the global `auth.json`. If no
-enrolled account has usable quota, an interactive run asks whether to check again (default yes) and
-repeats that prompt after every unsuccessful retry.
+Automatically supervised +k agents avoid that shared-credential race while keeping the user's
+canonical `CODEX_HOME` and SQLite state. Each run receives a private auth file through the custom
+Codex `CODEX_AUTH_FILE` variable; sessions, configuration, plugins, skills, and rollout paths stay
+in the normal `CODEX_HOME`. Quota recovery uses the same cyclic account selection as `kai next`,
+switches only that run's private credential, and saves refreshed credentials back to the vault
+without replacing the global `auth.json`. At startup Kai also repairs stale rollout paths left by
+older temporary-home runs when the persistent rollout exists. If no enrolled account has usable
+quota, an interactive run asks whether to check again (default yes) and repeats that prompt after
+every unsuccessful retry.
 
 ## Other commands
 

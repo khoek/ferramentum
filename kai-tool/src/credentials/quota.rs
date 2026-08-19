@@ -248,6 +248,7 @@ async fn run_app_server(codex: &Path, codex_home: &Path) -> Result<Snapshot> {
         .env_remove("CODEX_ACCESS_TOKEN")
         .env_remove("CODEX_API_KEY")
         .env_remove("OPENAI_API_KEY")
+        .env_remove("CODEX_AUTH_FILE")
         .current_dir(codex_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

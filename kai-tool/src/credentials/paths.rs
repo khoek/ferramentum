@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 pub struct RuntimePaths {
     pub credentials_home: PathBuf,
     pub codex_home: PathBuf,
+    active_auth: Option<PathBuf>,
 }
 
 impl RuntimePaths {
@@ -26,11 +27,20 @@ impl RuntimePaths {
             credentials_home: absolute(&credentials_home)
                 .context("could not resolve KAI_CREDENTIALS_HOME")?,
             codex_home: absolute(&codex_home).context("could not resolve CODEX_HOME")?,
+            active_auth: None,
         })
     }
 
     pub fn active_auth(&self) -> PathBuf {
-        self.codex_home.join("auth.json")
+        self.active_auth
+            .clone()
+            .unwrap_or_else(|| self.codex_home.join("auth.json"))
+    }
+
+    pub fn with_active_auth(&self, active_auth: PathBuf) -> Result<Self> {
+        let mut paths = self.clone();
+        paths.active_auth = Some(absolute(&active_auth).context("could not resolve active auth")?);
+        Ok(paths)
     }
 
     pub fn codex_config(&self) -> PathBuf {

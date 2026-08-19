@@ -15,11 +15,12 @@ mod enroll;
 mod isolated_home;
 mod paths;
 mod quota;
+mod rollout;
 mod store;
 mod ui;
 
 use self::auth::{Credential, CredentialFacts, validate_email};
-use self::isolated_home::SupervisedCodexHome;
+use self::isolated_home::SupervisedAuthHome;
 use self::paths::RuntimePaths;
 use self::store::{Profile, Store, ensure_codex_uses_file_credentials};
 use self::ui::{AccountStatus, AccountView, ListView, QuotaStatus};
@@ -182,34 +183,58 @@ impl fmt::Display for NoUsableQuota {
 
 impl std::error::Error for NoUsableQuota {}
 
+fn resolve_sqlite_home(cwd: &Path, codex_home: &Path, configured: Option<&str>) -> PathBuf {
+    configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        })
+        .unwrap_or_else(|| codex_home.to_owned())
+}
+
 #[derive(Default)]
 pub(crate) struct QuotaRecovery {
     source_paths: Option<RuntimePaths>,
-    supervised_home: Option<SupervisedCodexHome>,
+    supervised_auth_home: Option<SupervisedAuthHome>,
     active_source: Option<Credential>,
     sqlite_home: Option<PathBuf>,
     finished: bool,
 }
 
 impl QuotaRecovery {
-    pub(crate) fn prepare(&mut self) -> Result<()> {
+    pub(crate) fn prepare(&mut self, cwd: &Path) -> Result<()> {
         if self.source_paths.is_some() {
             return Ok(());
         }
         let _invocation_lock = capulus::acquire("kai-cred", true)?;
         let store = open_store()?;
         let source_paths = store.paths().clone();
-        let sqlite_home = env::var_os("CODEX_SQLITE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| source_paths.codex_home.clone());
-        let (supervised_home, active_source) = match load_live_strict(&store)? {
+        let configured_sqlite_home = env::var("CODEX_SQLITE_HOME").ok();
+        let sqlite_home = resolve_sqlite_home(
+            cwd,
+            &source_paths.codex_home,
+            configured_sqlite_home.as_deref(),
+        );
+        rollout::normalize_rollout_paths(
+            &sqlite_home,
+            &source_paths.credentials_home,
+            &source_paths.codex_home,
+        )
+        .context("could not repair stale supervised Codex rollout paths")?;
+        let (supervised_auth_home, active_source) = match load_live_strict(&store)? {
             Some(credential) => match managed_profile(&store, &credential).cloned() {
                 Some(profile) => {
                     store.sync_profile(&profile, &credential)?;
                     let source = Credential::from_bytes(credential.as_bytes().to_vec())
                         .context("could not retain the supervised Codex credential baseline")?;
                     (
-                        Some(SupervisedCodexHome::with_credential(
+                        Some(SupervisedAuthHome::with_credential(
                             &source_paths,
                             &credential,
                         )?),
@@ -221,21 +246,26 @@ impl QuotaRecovery {
             None => (None, None),
         };
         self.source_paths = Some(source_paths);
-        self.supervised_home = supervised_home;
+        self.supervised_auth_home = supervised_auth_home;
         self.active_source = active_source;
         self.sqlite_home = Some(sqlite_home);
         Ok(())
     }
 
     pub(crate) fn codex_home(&self) -> Result<&Path> {
-        if let Some(home) = &self.supervised_home {
-            return Ok(home.path());
-        }
         Ok(&self
             .source_paths
             .as_ref()
             .context("quota recovery was not prepared")?
             .codex_home)
+    }
+
+    /// The private auth file used by a supervised `+k` child, if there is a managed active
+    /// credential to supervise. All non-auth Codex state remains under [`Self::codex_home`].
+    pub(crate) fn auth_file(&self) -> Option<PathBuf> {
+        self.supervised_auth_home
+            .as_ref()
+            .map(SupervisedAuthHome::auth_path)
     }
 
     pub(crate) fn sqlite_home(&self) -> Result<&Path> {
@@ -261,12 +291,12 @@ impl QuotaRecovery {
             return Ok(());
         }
         self.finished = true;
-        if self.supervised_home.is_none() {
-            return Ok(());
-        }
         let _invocation_lock = capulus::acquire("kai-cred", true)?;
-        let store = self.open_store()?;
-        self.reconcile_session_credential(&store)
+        if self.supervised_auth_home.is_some() {
+            let store = self.open_store()?;
+            self.reconcile_session_credential(&store)?;
+        }
+        Ok(())
     }
 
     fn open_store(&self) -> Result<Store> {
@@ -274,20 +304,17 @@ impl QuotaRecovery {
             .source_paths
             .as_ref()
             .context("quota recovery was not prepared")?;
-        let Some(home) = &self.supervised_home else {
+        let Some(home) = &self.supervised_auth_home else {
             ensure_codex_uses_file_credentials(source_paths)?;
             return Store::open(source_paths.clone());
         };
-        let session_paths = RuntimePaths::new(
-            source_paths.credentials_home.clone(),
-            home.path().to_owned(),
-        )?;
+        let session_paths = source_paths.with_active_auth(home.auth_path())?;
         ensure_codex_uses_file_credentials(&session_paths)?;
         Store::open_session(session_paths, &source_paths.codex_home)
     }
 
     fn reconcile_session_credential(&mut self, store: &Store) -> Result<()> {
-        if self.supervised_home.is_none() {
+        if self.supervised_auth_home.is_none() {
             return Ok(());
         }
         let live = match load_live(store) {
@@ -606,6 +633,7 @@ fn run_codex_tickle(codex: &Path, home: &Path) -> Result<()> {
             "--ephemeral",
             "What is the current system `gcc` version? (Reply with only the version number.)",
         ])
+        .env_remove("CODEX_AUTH_FILE")
         .current_dir(home)
         .stdin(Stdio::null())
         .output()
@@ -1449,6 +1477,32 @@ mod tests {
     }
 
     #[test]
+    fn supervised_sqlite_home_matches_codex_environment_resolution() {
+        let root = tempdir().unwrap();
+        let cwd = root.path().join("workspace");
+        let codex_home = root.path().join("codex");
+        let shared_home = root.path().join("shared-state");
+
+        assert_eq!(
+            resolve_sqlite_home(&cwd, &codex_home, Some(" state ")),
+            cwd.join("state")
+        );
+        assert_eq!(
+            resolve_sqlite_home(
+                &cwd,
+                &codex_home,
+                Some(&format!(" {} ", shared_home.display())),
+            ),
+            shared_home
+        );
+        assert_eq!(
+            resolve_sqlite_home(&cwd, &codex_home, Some("  ")),
+            codex_home
+        );
+        assert_eq!(resolve_sqlite_home(&cwd, &codex_home, None), codex_home);
+    }
+
+    #[test]
     fn switching_saves_the_live_rotated_token_before_installing_next() {
         let (_root, mut store) = setup();
         let alice = store
@@ -1489,12 +1543,8 @@ mod tests {
         let alice = source_store.insert_profile(&source).unwrap();
         source_store.write_active(&source).unwrap();
         let source_paths = source_store.paths().clone();
-        let home = SupervisedCodexHome::with_credential(&source_paths, &source).unwrap();
-        let session_paths = RuntimePaths::new(
-            source_paths.credentials_home.clone(),
-            home.path().to_owned(),
-        )
-        .unwrap();
+        let home = SupervisedAuthHome::with_credential(&source_paths, &source).unwrap();
+        let session_paths = source_paths.with_active_auth(home.auth_path()).unwrap();
         let session_store = Store::open_session(session_paths, &source_paths.codex_home).unwrap();
         session_store
             .write_active(&credential(
@@ -1507,7 +1557,7 @@ mod tests {
         source_store.sync_profile(&alice, &newer).unwrap();
         let mut recovery = QuotaRecovery {
             source_paths: Some(source_paths),
-            supervised_home: Some(home),
+            supervised_auth_home: Some(home),
             active_source: Some(source),
             sqlite_home: None,
             finished: false,

@@ -241,7 +241,9 @@ impl Store {
                 fs::remove_file(&path).with_context(|| {
                     format!("could not remove active credential {}", path.display())
                 })?;
-                sync_directory(&self.paths.codex_home)
+                path.parent()
+                    .context("active credential path has no parent")
+                    .and_then(sync_directory)
             }
             Ok(_) => bail!(
                 "active credential is not a regular file: {}",

@@ -21,6 +21,11 @@ const DEFAULT_SERVICE_TIER_OVERRIDE: &str = "service_tier=default";
 const FAST_SERVICE_TIER_OVERRIDE: &str = "service_tier=fast";
 const EXIT_ON_QUOTA_FLAG: &str = "--exit-on-quota-exceeded";
 const START_IMMEDIATELY_FLAG: &str = "--start-immediately";
+const RESTORE_INPUT_HANDOFF_FLAG: &str = "--restore-input-handoff";
+const INPUT_HANDOFF_FORMAT: &str = "codex+k-input-handoff";
+const INPUT_HANDOFF_VERSION: u8 = 1;
+const MAX_INPUT_HANDOFF_BYTES: u64 = 16 * 1024 * 1024;
+const AUTH_FILE_ENV_VAR: &str = "CODEX_AUTH_FILE";
 const EXTERNAL_AUTH_ENV_VARS: &[&str] = &["CODEX_ACCESS_TOKEN", "CODEX_API_KEY", "OPENAI_API_KEY"];
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -44,13 +49,19 @@ pub(crate) enum ServiceTier {
 pub(crate) struct SupervisedEnvironment<'a> {
     codex_home: &'a Path,
     sqlite_home: &'a Path,
+    auth_file: Option<&'a Path>,
 }
 
 impl<'a> SupervisedEnvironment<'a> {
-    pub(crate) fn new(codex_home: &'a Path, sqlite_home: &'a Path) -> Self {
+    pub(crate) fn new(
+        codex_home: &'a Path,
+        sqlite_home: &'a Path,
+        auth_file: Option<&'a Path>,
+    ) -> Self {
         Self {
             codex_home,
             sqlite_home,
+            auth_file,
         }
     }
 }
@@ -78,6 +89,7 @@ impl Launcher {
     fn from_binary(binary: PathBuf) -> Result<Self> {
         let output = Command::new(&binary)
             .arg("--version")
+            .env_remove(AUTH_FILE_ENV_VAR)
             .stdin(Stdio::null())
             .stderr(Stdio::piped())
             .output()
@@ -257,6 +269,7 @@ fn run_direct(binary: &Path, args: &[OsString], cwd: &Path) -> Result<u8> {
     command
         .args(args)
         .env(GIT_TERMINAL_PROMPT_ENV, "0")
+        .env_remove(AUTH_FILE_ENV_VAR)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -271,15 +284,23 @@ fn run_direct(binary: &Path, args: &[OsString], cwd: &Path) -> Result<u8> {
 }
 
 fn recovery_args(recovery: QuotaRecovery) -> Vec<OsString> {
+    let QuotaRecovery {
+        thread_id,
+        resume_args,
+        handoff_path,
+    } = recovery;
     let mut args: Vec<OsString> = [
         "resume".into(),
-        recovery.thread_id.into(),
+        thread_id.into(),
         START_IMMEDIATELY_FLAG.into(),
         APPROVAL_BYPASS_FLAG.into(),
         EXIT_ON_QUOTA_FLAG.into(),
     ]
     .into();
-    args.extend(recovery.resume_args.into_iter().map(OsString::from));
+    if let Some(path) = handoff_path {
+        args.extend([RESTORE_INPUT_HANDOFF_FLAG.into(), path.into_os_string()]);
+    }
+    args.extend(resume_args.into_iter().map(OsString::from));
     args
 }
 
@@ -292,11 +313,22 @@ enum PtyOutcome {
 struct QuotaRecovery {
     thread_id: String,
     resume_args: Vec<String>,
+    handoff_path: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
 struct QuotaRecoveryPayload {
     version: u8,
+    #[serde(default)]
+    resume_args: Vec<String>,
+    handoff_path: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+struct InputHandoffHeader {
+    format: String,
+    version: u8,
+    thread_id: String,
     resume_args: Vec<String>,
 }
 
@@ -319,6 +351,10 @@ fn run_pty_session(
     command.env(GIT_TERMINAL_PROMPT_ENV, "0");
     command.env("CODEX_HOME", environment.codex_home);
     command.env("CODEX_SQLITE_HOME", environment.sqlite_home);
+    command.env_remove(AUTH_FILE_ENV_VAR);
+    if let Some(auth_file) = environment.auth_file {
+        command.env(AUTH_FILE_ENV_VAR, auth_file);
+    }
     for name in EXTERNAL_AUTH_ENV_VARS {
         command.env_remove(name);
     }
@@ -744,19 +780,74 @@ fn quota_recovery_from_tail(tail: &[u8]) -> Result<Option<QuotaRecovery>> {
     }
     let payload: QuotaRecoveryPayload =
         serde_json::from_str(payload).context("could not parse +k quota recovery settings")?;
-    if payload.version != 1 {
+    let recovery = match payload.version {
+        1 => {
+            if payload.resume_args.is_empty() {
+                bail!("+k quota recovery settings contained no resume arguments");
+            }
+            QuotaRecovery {
+                thread_id: thread_id.to_owned(),
+                resume_args: payload.resume_args,
+                handoff_path: None,
+            }
+        }
+        2 => {
+            let handoff_path = payload
+                .handoff_path
+                .context("+k quota recovery settings contained no input handoff path")?;
+            if !handoff_path.is_absolute() {
+                bail!(
+                    "+k input handoff path was not absolute: {}",
+                    handoff_path.display()
+                );
+            }
+            let handoff = read_input_handoff_header(&handoff_path)?;
+            if handoff.format != INPUT_HANDOFF_FORMAT {
+                bail!("unsupported +k input handoff format `{}`", handoff.format);
+            }
+            if handoff.version != INPUT_HANDOFF_VERSION {
+                bail!(
+                    "unsupported +k input handoff version {}; expected {INPUT_HANDOFF_VERSION}",
+                    handoff.version
+                );
+            }
+            if handoff.thread_id != thread_id {
+                bail!(
+                    "+k input handoff belongs to thread {}, not {thread_id}",
+                    handoff.thread_id
+                );
+            }
+            if handoff.resume_args.is_empty() {
+                bail!("+k input handoff contained no resume arguments");
+            }
+            QuotaRecovery {
+                thread_id: thread_id.to_owned(),
+                resume_args: handoff.resume_args,
+                handoff_path: Some(handoff_path),
+            }
+        }
+        version => bail!("unsupported +k quota recovery settings version {version}"),
+    };
+    Ok(Some(recovery))
+}
+
+fn read_input_handoff_header(path: &Path) -> Result<InputHandoffHeader> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("could not inspect +k input handoff {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("+k input handoff {} is not a regular file", path.display());
+    }
+    if metadata.len() > MAX_INPUT_HANDOFF_BYTES {
         bail!(
-            "unsupported +k quota recovery settings version {}",
-            payload.version
+            "+k input handoff {} is larger than the {} MiB safety limit",
+            path.display(),
+            MAX_INPUT_HANDOFF_BYTES / (1024 * 1024)
         );
     }
-    if payload.resume_args.is_empty() {
-        bail!("+k quota recovery settings contained no resume arguments");
-    }
-    Ok(Some(QuotaRecovery {
-        thread_id: thread_id.to_owned(),
-        resume_args: payload.resume_args,
-    }))
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("could not read +k input handoff {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("could not parse +k input handoff {}", path.display()))
 }
 
 fn valid_uuid(value: &str) -> bool {
@@ -819,6 +910,7 @@ mod tests {
                     "-c".to_string(),
                     "service_tier=\"fast\"".to_string(),
                 ],
+                handoff_path: None,
             })
         );
         assert_eq!(
@@ -859,6 +951,7 @@ mod tests {
                 CONFIG_OVERRIDE_FLAG.to_string(),
                 "model_reasoning_effort=\"xhigh\"".to_string(),
             ],
+            handoff_path: None,
         })
         .into_iter()
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -877,6 +970,97 @@ mod tests {
                 "service_tier=\"fast\"",
                 CONFIG_OVERRIDE_FLAG,
                 "model_reasoning_effort=\"xhigh\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn version_two_marker_loads_resume_settings_from_the_handoff() {
+        let directory = tempdir().unwrap();
+        let handoff_path = directory.path().join("session.codex+k-handoff.json");
+        let thread_id = "123e4567-e89b-12d3-a456-426614174000";
+        fs::write(
+            &handoff_path,
+            serde_json::to_vec(&serde_json::json!({
+                "format": INPUT_HANDOFF_FORMAT,
+                "version": INPUT_HANDOFF_VERSION,
+                "thread_id": thread_id,
+                "resume_args": ["--model", "gpt-5.6"],
+                "messages": [],
+                "draft": null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let marker = serde_json::json!({
+            "version": 2,
+            "handoff_path": handoff_path,
+        });
+        let output = format!("codex+k ({thread_id}): quota exceeded {marker}\r\n");
+
+        assert_eq!(
+            quota_recovery_from_tail(output.as_bytes()).unwrap(),
+            Some(QuotaRecovery {
+                thread_id: thread_id.to_string(),
+                resume_args: vec!["--model".to_string(), "gpt-5.6".to_string()],
+                handoff_path: Some(handoff_path),
+            })
+        );
+    }
+
+    #[test]
+    fn version_two_marker_rejects_a_handoff_for_another_thread() {
+        let directory = tempdir().unwrap();
+        let handoff_path = directory.path().join("session.codex+k-handoff.json");
+        fs::write(
+            &handoff_path,
+            serde_json::to_vec(&serde_json::json!({
+                "format": INPUT_HANDOFF_FORMAT,
+                "version": INPUT_HANDOFF_VERSION,
+                "thread_id": "123e4567-e89b-12d3-a456-426614174001",
+                "resume_args": ["--model", "gpt-5.6"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let marker = serde_json::json!({
+            "version": 2,
+            "handoff_path": handoff_path,
+        });
+        let output =
+            format!("codex+k (123e4567-e89b-12d3-a456-426614174000): quota exceeded {marker}\r\n");
+
+        assert!(
+            quota_recovery_from_tail(output.as_bytes())
+                .unwrap_err()
+                .to_string()
+                .contains("belongs to thread")
+        );
+    }
+
+    #[test]
+    fn recovery_command_passes_the_handoff_back_to_codex() {
+        let args = recovery_args(QuotaRecovery {
+            thread_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+            resume_args: vec!["--model".to_string(), "gpt-5.6".to_string()],
+            handoff_path: Some(PathBuf::from("/tmp/session.codex+k-handoff.json")),
+        })
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            [
+                "resume",
+                "123e4567-e89b-12d3-a456-426614174000",
+                START_IMMEDIATELY_FLAG,
+                APPROVAL_BYPASS_FLAG,
+                EXIT_ON_QUOTA_FLAG,
+                RESTORE_INPUT_HANDOFF_FLAG,
+                "/tmp/session.codex+k-handoff.json",
+                "--model",
+                "gpt-5.6",
             ]
         );
     }
@@ -1132,7 +1316,7 @@ fn main() {{
                 vec![APPROVAL_BYPASS_FLAG.into()],
                 root.path(),
                 ServiceTier::Fast,
-                SupervisedEnvironment::new(root.path(), root.path()),
+                SupervisedEnvironment::new(root.path(), root.path(), None),
                 || {
                     rotations += 1;
                     Ok(AccountRotation::Rotated)

@@ -1,4 +1,3 @@
-use std::ffi::OsStr;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -25,13 +24,12 @@ pub struct IsolatedCodexHome {
     directory: TempDir,
 }
 
-/// A process-lifetime Codex home with private authentication and shared user state.
+/// A process-lifetime private credential file for a supervised Codex process.
 ///
-/// Codex keeps sessions, plugins, skills, and other user state below `CODEX_HOME`, so an empty
-/// temporary home would break session resume. This home gives a supervised agent its own
-/// `auth.json` and `config.toml` while linking the remaining top-level entries back to the user's
-/// real Codex home. SQLite state is shared separately through `CODEX_SQLITE_HOME`.
-pub struct SupervisedCodexHome {
+/// The supervised process keeps the user's real `CODEX_HOME` so sessions, configuration, plugins,
+/// skills, and SQLite state remain canonical. The downstream `+k` Codex build reads and refreshes
+/// authentication from this separate file through `CODEX_AUTH_FILE`.
+pub struct SupervisedAuthHome {
     directory: TempDir,
 }
 
@@ -94,19 +92,17 @@ impl IsolatedCodexHome {
     }
 }
 
-impl SupervisedCodexHome {
+impl SupervisedAuthHome {
     pub fn with_credential(paths: &RuntimePaths, credential: &Credential) -> Result<Self> {
         let directory = Builder::new()
-            .prefix(".agent-")
+            .prefix(".agent-auth-")
             .tempdir_in(&paths.credentials_home)
-            .context("could not create supervised Codex home")?;
+            .context("could not create supervised Codex auth directory")?;
         set_private_directory(&directory)?;
 
         let home = Self { directory };
-        home.link_shared_state(paths)?;
-        home.write_config(paths)?;
         atomic_write(&home.auth_path(), credential.as_bytes())
-            .context("could not seed supervised Codex credential")?;
+            .context("could not seed supervised Codex auth file")?;
         Ok(home)
     }
 
@@ -117,65 +113,6 @@ impl SupervisedCodexHome {
     pub fn auth_path(&self) -> PathBuf {
         self.path().join("auth.json")
     }
-
-    fn link_shared_state(&self, paths: &RuntimePaths) -> Result<()> {
-        for entry in fs::read_dir(&paths.codex_home)
-            .with_context(|| format!("could not read {}", paths.codex_home.display()))?
-        {
-            let entry = entry?;
-            let name = entry.file_name();
-            if supervised_private_entry(&name) {
-                continue;
-            }
-            link_shared_entry(&entry.path(), &self.path().join(&name), &entry.file_type()?)?;
-        }
-        Ok(())
-    }
-
-    fn write_config(&self, paths: &RuntimePaths) -> Result<()> {
-        let mut config = paths.read_codex_config()?.unwrap_or_default();
-        config.insert(
-            "cli_auth_credentials_store".to_owned(),
-            toml::Value::String("file".to_owned()),
-        );
-        atomic_write(
-            &self.path().join("config.toml"),
-            toml::to_string_pretty(&config)?.as_bytes(),
-        )
-        .context("could not configure supervised Codex home")
-    }
-}
-
-fn supervised_private_entry(name: &OsStr) -> bool {
-    let name = name.to_string_lossy();
-    matches!(name.as_ref(), "auth.json" | "config.toml") || name.contains(".sqlite")
-}
-
-#[cfg(unix)]
-fn link_shared_entry(source: &Path, destination: &Path, _kind: &fs::FileType) -> Result<()> {
-    std::os::unix::fs::symlink(source, destination).with_context(|| {
-        format!(
-            "could not share Codex state {} through {}",
-            source.display(),
-            destination.display()
-        )
-    })
-}
-
-#[cfg(windows)]
-fn link_shared_entry(source: &Path, destination: &Path, kind: &fs::FileType) -> Result<()> {
-    let result = if kind.is_dir() {
-        std::os::windows::fs::symlink_dir(source, destination)
-    } else {
-        std::os::windows::fs::symlink_file(source, destination)
-    };
-    result.with_context(|| {
-        format!(
-            "could not share Codex state {} through {}",
-            source.display(),
-            destination.display()
-        )
-    })
 }
 
 fn copy_respect_system_proxy(source: &toml::Table, destination: &mut toml::Table) {
@@ -272,9 +209,8 @@ mod tests {
         assert!(!second_path.exists());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn supervised_home_isolates_auth_while_sharing_session_state() {
+    fn supervised_auth_home_contains_only_private_auth() {
         let root = tempdir().unwrap();
         let paths = RuntimePaths::new(
             root.path().join("credentials"),
@@ -282,14 +218,6 @@ mod tests {
         )
         .unwrap();
         fs::create_dir_all(&paths.credentials_home).unwrap();
-        fs::create_dir_all(paths.codex_home.join("sessions")).unwrap();
-        fs::write(
-            paths.codex_config(),
-            "model = \"gpt-test\"\ncli_auth_credentials_store = \"file\"\n",
-        )
-        .unwrap();
-        fs::write(paths.codex_home.join("sessions/thread.jsonl"), "session").unwrap();
-        fs::write(paths.codex_home.join("state_5.sqlite"), "sqlite").unwrap();
         let credential = Credential::from_bytes(auth_json(
             "alice@example.com",
             "alice-id",
@@ -299,24 +227,29 @@ mod tests {
         ))
         .unwrap();
 
-        let home = SupervisedCodexHome::with_credential(&paths, &credential).unwrap();
+        let home = SupervisedAuthHome::with_credential(&paths, &credential).unwrap();
         let home_path = home.path().to_owned();
-        assert_ne!(home.path(), paths.codex_home);
+        assert!(home.path().starts_with(&paths.credentials_home));
         assert_eq!(
             Credential::read(&home.auth_path()).unwrap().facts.email,
             "alice@example.com"
         );
-        let config = fs::read_to_string(home.path().join("config.toml")).unwrap();
-        assert!(config.contains("model = \"gpt-test\""));
-        assert!(config.contains("cli_auth_credentials_store = \"file\""));
-        assert_eq!(
-            fs::read_to_string(home.path().join("sessions/thread.jsonl")).unwrap(),
-            "session"
-        );
-        assert!(!home.path().join("state_5.sqlite").exists());
+        assert!(!home.path().join("config.toml").exists());
+        assert!(!home.path().join("sessions").exists());
+        assert_eq!(fs::read_dir(home.path()).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                fs::metadata(&home_path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(home.auth_path()).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
 
         drop(home);
         assert!(!home_path.exists());
-        assert!(paths.codex_home.join("sessions/thread.jsonl").exists());
     }
 }

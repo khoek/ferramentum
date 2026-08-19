@@ -451,14 +451,19 @@ impl AgentLauncher {
                     .quota_auto_restart_enabled(options.quota_auto_restart.explicit())?
                 {
                     let mut recovery = credentials::QuotaRecovery::default();
-                    recovery.prepare()?;
+                    recovery.prepare(cwd)?;
                     let codex_home = recovery.codex_home()?.to_owned();
                     let sqlite_home = recovery.sqlite_home()?.to_owned();
+                    let auth_file = recovery.auth_file();
                     let run_result = launcher.run_supervised(
                         args,
                         cwd,
                         service_tier,
-                        codex::SupervisedEnvironment::new(&codex_home, &sqlite_home),
+                        codex::SupervisedEnvironment::new(
+                            &codex_home,
+                            &sqlite_home,
+                            auth_file.as_deref(),
+                        ),
                         || recovery.rotate(),
                     );
                     let finish_result = recovery.finish();
@@ -466,7 +471,7 @@ impl AgentLauncher {
                         (Ok(code), Ok(())) => code,
                         (Err(err), Ok(())) | (Ok(_), Err(err)) => return Err(err),
                         (Err(run_err), Err(finish_err)) => bail!(
-                            "{run_err:#}; additionally could not save the supervised Codex credential: {finish_err:#}"
+                            "{run_err:#}; additionally could not finalize the supervised Codex session: {finish_err:#}"
                         ),
                     }
                 } else {
@@ -1635,6 +1640,7 @@ Rules:
     let status = command
         .arg("exec")
         .args(["--sandbox", "read-only"])
+        .env_remove("CODEX_AUTH_FILE")
         .arg("-c")
         .arg("approval_policy=\"never\"")
         .arg("-c")

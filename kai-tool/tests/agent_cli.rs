@@ -13,6 +13,7 @@ use assert_cmd::Command;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use rusqlite::{Connection, params};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -24,7 +25,8 @@ fn supervised_fast_agent_preserves_invocation_directory() {
     let launch_dir = root.path().join("workspace");
     let cwd_path = root.path().join("cwd");
     let args_path = root.path().join("args");
-    let agent_home_path = root.path().join("agent-home");
+    let observed_codex_home_path = root.path().join("observed-codex-home");
+    let auth_file_path = root.path().join("auth-file");
     let sqlite_home_path = root.path().join("sqlite-home");
     let config_path = root.path().join("agent-config");
     let credentials_home = root.path().join("credentials");
@@ -48,6 +50,10 @@ fn supervised_fast_agent_preserves_invocation_directory() {
             "printf '%s\\n' \"$@\" > \"$KAI_TEST_ARGS\"\n",
             "printf '%s\\n' \"$CODEX_HOME\" > \"$KAI_TEST_AGENT_HOME\"\n",
             "printf '%s\\n' \"$CODEX_SQLITE_HOME\" > \"$KAI_TEST_SQLITE_HOME\"\n",
+            "printf '%s\\n' \"$CODEX_AUTH_FILE\" > \"$KAI_TEST_AUTH_FILE\"\n",
+            "test \"$CODEX_HOME\" = \"$KAI_EXPECTED_CODEX_HOME\"\n",
+            "test \"$CODEX_AUTH_FILE\" != \"$CODEX_HOME/auth.json\"\n",
+            "test -f \"$CODEX_AUTH_FILE\"\n",
             "grep '^model' \"$CODEX_HOME/config.toml\" > \"$KAI_TEST_CONFIG\"\n",
         ),
     )
@@ -64,11 +70,14 @@ fn supervised_fast_agent_preserves_invocation_directory() {
         .env("PATH", path)
         .env("KAI_CREDENTIALS_HOME", &credentials_home)
         .env("CODEX_HOME", &codex_home)
+        .env("CODEX_SQLITE_HOME", &codex_home)
         .env("XDG_RUNTIME_DIR", &runtime_dir)
         .env("KAI_TEST_CWD", &cwd_path)
         .env("KAI_TEST_ARGS", &args_path)
-        .env("KAI_TEST_AGENT_HOME", &agent_home_path)
+        .env("KAI_TEST_AGENT_HOME", &observed_codex_home_path)
         .env("KAI_TEST_SQLITE_HOME", &sqlite_home_path)
+        .env("KAI_TEST_AUTH_FILE", &auth_file_path)
+        .env("KAI_EXPECTED_CODEX_HOME", &codex_home)
         .env("KAI_TEST_CONFIG", &config_path)
         .args(["--quota-auto-restart", "yes", "a", "--fast"])
         .assert()
@@ -87,11 +96,15 @@ fn supervised_fast_agent_preserves_invocation_directory() {
             "--exit-on-quota-exceeded\n",
         )
     );
-    let agent_home = fs::read_to_string(agent_home_path).unwrap();
-    let agent_home = Path::new(agent_home.trim());
-    assert_ne!(agent_home, codex_home);
-    assert!(agent_home.starts_with(&credentials_home));
-    assert!(!agent_home.exists());
+    assert_eq!(
+        fs::read_to_string(observed_codex_home_path).unwrap(),
+        format!("{}\n", codex_home.display())
+    );
+    let auth_file = fs::read_to_string(auth_file_path).unwrap();
+    let auth_file = Path::new(auth_file.trim());
+    assert!(auth_file.starts_with(&credentials_home));
+    assert_ne!(auth_file, codex_home.join("auth.json"));
+    assert!(!auth_file.exists());
     assert_eq!(
         fs::read_to_string(sqlite_home_path).unwrap(),
         format!("{}\n", codex_home.display())
@@ -99,6 +112,82 @@ fn supervised_fast_agent_preserves_invocation_directory() {
     assert_eq!(
         fs::read_to_string(config_path).unwrap(),
         "model = \"gpt-test\"\n"
+    );
+}
+
+#[test]
+fn supervised_agent_repairs_stale_rollout_paths() {
+    let root = tempdir().unwrap();
+    let bin_dir = root.path().join("bin");
+    let launch_dir = root.path().join("workspace");
+    let credentials_home = root.path().join("credentials");
+    let codex_home = root.path().join("codex");
+    let runtime_dir = root.path().join("runtime");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir(&launch_dir).unwrap();
+    seed_account(&credentials_home, &codex_home);
+    fs::create_dir_all(codex_home.join("sessions")).unwrap();
+    fs::write(codex_home.join("sessions/thread.jsonl"), "session\n").unwrap();
+
+    let connection = Connection::open(codex_home.join("state_5.sqlite")).unwrap();
+    connection
+        .execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL);")
+        .unwrap();
+    let stale_path = credentials_home.join(".agent-gone/sessions/thread.jsonl");
+    connection
+        .execute(
+            "INSERT INTO threads VALUES (?1, ?2)",
+            params!["thread-id", stale_path.to_str().unwrap()],
+        )
+        .unwrap();
+    connection.close().unwrap();
+
+    let fake_codex = bin_dir.join("codex");
+    fs::write(
+        &fake_codex,
+        concat!(
+            "#!/bin/sh\n",
+            "set -eu\n",
+            "if [ \"${1-}\" = --version ]; then\n",
+            "  printf 'codex-cli 0.147.0+k\\n'\n",
+            "  exit 0\n",
+            "fi\n",
+            "test -f \"$CODEX_HOME/sessions/thread.jsonl\"\n",
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = env::join_paths(
+        std::iter::once(bin_dir).chain(env::split_paths(&env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+
+    Command::cargo_bin("kai")
+        .unwrap()
+        .current_dir(&launch_dir)
+        .env("PATH", path)
+        .env("KAI_CREDENTIALS_HOME", &credentials_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("CODEX_SQLITE_HOME", &codex_home)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .args(["--quota-auto-restart", "yes", "ar", "thread-id"])
+        .assert()
+        .success();
+
+    let connection = Connection::open(codex_home.join("state_5.sqlite")).unwrap();
+    let rollout_path: String = connection
+        .query_row(
+            "SELECT rollout_path FROM threads WHERE id = 'thread-id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        rollout_path,
+        codex_home
+            .join("sessions/thread.jsonl")
+            .display()
+            .to_string()
     );
 }
 
@@ -157,9 +246,11 @@ fn automatic_recovery_wraps_accounts_and_keeps_global_auth_unchanged() {
             "  count=$(cat \"$KAI_TEST_AGENT_COUNT\" 2>/dev/null || printf 0)\n",
             "  count=$((count + 1))\n",
             "  printf '%s\\n' \"$count\" > \"$KAI_TEST_AGENT_COUNT\"\n",
-            "  account_id=$(sed -n 's/^[[:space:]]*\"account_id\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$CODEX_HOME/auth.json\" | head -n 1)\n",
-            "  printf '%s\\t%s\\n' \"$account_id\" \"$CODEX_HOME\" >> \"$KAI_TEST_AGENT_LOG\"\n",
-            "  if [ \"$count\" -eq 3 ]; then cp \"$KAI_TEST_FINISHED_AUTH\" \"$CODEX_HOME/auth.json\"; fi\n",
+            "  test -n \"${CODEX_AUTH_FILE-}\"\n",
+            "  test \"$CODEX_AUTH_FILE\" != \"$CODEX_HOME/auth.json\"\n",
+            "  account_id=$(sed -n 's/^[[:space:]]*\"account_id\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$CODEX_AUTH_FILE\" | head -n 1)\n",
+            "  printf '%s\\t%s\\t%s\\n' \"$account_id\" \"$CODEX_HOME\" \"$CODEX_AUTH_FILE\" >> \"$KAI_TEST_AGENT_LOG\"\n",
+            "  if [ \"$count\" -eq 3 ]; then cp \"$KAI_TEST_FINISHED_AUTH\" \"$CODEX_AUTH_FILE\"; fi\n",
             "  if [ \"$count\" -lt 3 ]; then\n",
             "    printf '%s\\n' 'codex+k (123e4567-e89b-12d3-a456-426614174000): quota exceeded {\"version\":1,\"resume_args\":[\"-c\",\"service_tier=\\\"default\\\"\"]}'\n",
             "  fi\n",
@@ -180,6 +271,7 @@ fn automatic_recovery_wraps_accounts_and_keeps_global_auth_unchanged() {
         .env("PATH", path)
         .env("KAI_CREDENTIALS_HOME", &credentials_home)
         .env("CODEX_HOME", &codex_home)
+        .env("CODEX_SQLITE_HOME", &codex_home)
         .env("XDG_RUNTIME_DIR", &runtime_dir)
         .env("KAI_TEST_AGENT_LOG", &agent_log)
         .env("KAI_TEST_AGENT_COUNT", &agent_count)
@@ -195,20 +287,34 @@ fn automatic_recovery_wraps_accounts_and_keeps_global_auth_unchanged() {
     let agents = fs::read_to_string(agent_log).unwrap();
     let agents = agents
         .lines()
-        .map(|line| line.split_once('\t').unwrap())
+        .map(|line| {
+            let mut fields = line.split('\t');
+            (
+                fields.next().unwrap(),
+                fields.next().unwrap(),
+                fields.next().unwrap(),
+            )
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         agents
             .iter()
-            .map(|(account, _)| *account)
+            .map(|(account, _, _)| *account)
             .collect::<Vec<_>>(),
         ["alice-id", "bob-id", "alice-id"]
     );
     assert!(agents.windows(2).all(|rows| rows[0].1 == rows[1].1));
-    let supervised_home = Path::new(agents[0].1);
-    assert_ne!(supervised_home, codex_home);
-    assert!(supervised_home.starts_with(&credentials_home));
-    assert!(!supervised_home.exists());
+    let expected_codex_home = codex_home.to_str().unwrap();
+    let global_auth = codex_home.join("auth.json");
+    assert!(
+        agents
+            .iter()
+            .all(|(_, home, _)| *home == expected_codex_home)
+    );
+    assert!(agents.iter().all(|(_, _, auth)| {
+        let auth = Path::new(auth);
+        auth.starts_with(&credentials_home) && auth != global_auth && !auth.exists()
+    }));
     assert_eq!(fs::read_to_string(quota_log).unwrap(), "bob-id\nalice-id\n");
     assert_eq!(
         fs::read(codex_home.join("auth.json")).unwrap(),
@@ -273,7 +379,7 @@ fn automatic_recovery_prompts_and_rechecks_when_no_account_has_quota() {
             "  count=$(cat \"$KAI_TEST_AGENT_COUNT\" 2>/dev/null || printf 0)\n",
             "  count=$((count + 1))\n",
             "  printf '%s\\n' \"$count\" > \"$KAI_TEST_AGENT_COUNT\"\n",
-            "  account_id=$(sed -n 's/^[[:space:]]*\"account_id\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$CODEX_HOME/auth.json\" | head -n 1)\n",
+            "  account_id=$(sed -n 's/^[[:space:]]*\"account_id\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$CODEX_AUTH_FILE\" | head -n 1)\n",
             "  printf '%s\\n' \"$account_id\" >> \"$KAI_TEST_AGENT_LOG\"\n",
             "  if [ \"$count\" -eq 1 ]; then\n",
             "    printf '%s\\n' 'codex+k (123e4567-e89b-12d3-a456-426614174000): quota exceeded {\"version\":1,\"resume_args\":[\"-c\",\"service_tier=\\\"default\\\"\"]}'\n",
@@ -304,6 +410,7 @@ fn automatic_recovery_prompts_and_rechecks_when_no_account_has_quota() {
     command.env("TERM", "xterm-256color");
     command.env("KAI_CREDENTIALS_HOME", &credentials_home);
     command.env("CODEX_HOME", &codex_home);
+    command.env("CODEX_SQLITE_HOME", &codex_home);
     command.env("XDG_RUNTIME_DIR", &runtime_dir);
     command.env("KAI_TEST_AGENT_LOG", &agent_log);
     command.env("KAI_TEST_AGENT_COUNT", &agent_count);

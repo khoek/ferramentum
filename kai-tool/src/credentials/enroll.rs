@@ -73,6 +73,7 @@ fn run_with_binary(
         .arg("-c")
         .arg("cli_auth_credentials_store=\"file\"")
         .env("CODEX_HOME", temporary_home.path())
+        .env_remove("CODEX_AUTH_FILE")
         .current_dir(temporary_home.path())
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
