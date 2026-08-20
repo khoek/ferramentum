@@ -13,6 +13,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use super::auth::Credential;
+use super::auth_lock;
 use super::isolated_home::IsolatedCodexHome;
 use super::paths::RuntimePaths;
 
@@ -141,9 +142,10 @@ impl Client {
         })
     }
 
-    /// Fetch quota through Codex itself. The returned credential is the isolated home's final
-    /// `auth.json`, so callers can durably save an OAuth rotation performed by Codex.
-    pub async fn fetch(&self, credential: Credential) -> Outcome {
+    /// Fetch quota through Codex itself while pointing the downstream app-server at the
+    /// account's canonical credential file. The isolated home contains only configuration;
+    /// authentication is never copied into a second writable file.
+    pub async fn fetch(&self, credential: Credential, auth_file: PathBuf) -> Outcome {
         let source_fingerprint = credential_fingerprint(&credential);
         let source_email = credential.facts.email.clone();
         let source_account_id = credential.facts.account_id.clone();
@@ -151,11 +153,7 @@ impl Client {
         let mut final_snapshot = None;
 
         for attempt in 0..APP_SERVER_ATTEMPTS {
-            let home = match IsolatedCodexHome::with_credential(
-                &self.paths,
-                "quota",
-                &returned_credential,
-            ) {
+            let home = match IsolatedCodexHome::create(&self.paths, "quota") {
                 Ok(home) => home,
                 Err(err) => {
                     final_snapshot = Some(Err(err));
@@ -163,9 +161,11 @@ impl Client {
                 }
             };
 
-            let mut snapshot = run_app_server(&self.codex, home.path()).await;
+            let mut snapshot = run_app_server(&self.codex, home.path(), &auth_file).await;
             let mut retry_allowed = true;
-            match home.credential() {
+            let updated_credential =
+                auth_lock::acquire(&auth_file).and_then(|_lock| Credential::read(&auth_file));
+            match updated_credential {
                 Ok(updated)
                     if updated.facts.account_id == source_account_id
                         && updated.facts.email.eq_ignore_ascii_case(&source_email) =>
@@ -233,7 +233,7 @@ pub fn countdown_has_not_started(snapshot: &Snapshot, now: i64) -> bool {
         .contains(&inferred)
 }
 
-async fn run_app_server(codex: &Path, codex_home: &Path) -> Result<Snapshot> {
+async fn run_app_server(codex: &Path, codex_home: &Path, auth_file: &Path) -> Result<Snapshot> {
     let mut command = Command::new(codex);
     command
         .args([
@@ -248,7 +248,7 @@ async fn run_app_server(codex: &Path, codex_home: &Path) -> Result<Snapshot> {
         .env_remove("CODEX_ACCESS_TOKEN")
         .env_remove("CODEX_API_KEY")
         .env_remove("OPENAI_API_KEY")
-        .env_remove("CODEX_AUTH_FILE")
+        .env("CODEX_AUTH_FILE", auth_file)
         .current_dir(codex_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

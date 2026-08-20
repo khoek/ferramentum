@@ -1,7 +1,7 @@
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use tempfile::{Builder, TempDir};
@@ -16,20 +16,12 @@ const AUTH_CONFIG_KEYS: &[&str] = &[
     "forced_login_method",
 ];
 
-/// A short-lived, file-backed Codex home that cannot affect the user's active account.
+/// A short-lived Codex home that cannot affect the user's active account.
 ///
-/// Each instance has its own `auth.json` and minimal auth/network configuration. `TempDir`
-/// removes the entire home on drop, including a token that Codex may have rotated in place.
+/// The home contains only minimal auth/network configuration by default. Enrollment can seed an
+/// `auth.json` here for a login flow; quota workers instead point `CODEX_AUTH_FILE` at an enrolled
+/// canonical profile and leave this home auth-free. `TempDir` removes the home on drop.
 pub struct IsolatedCodexHome {
-    directory: TempDir,
-}
-
-/// A process-lifetime private credential file for a supervised Codex process.
-///
-/// The supervised process keeps the user's real `CODEX_HOME` so sessions, configuration, plugins,
-/// skills, and SQLite state remain canonical. The downstream `+k` Codex build reads and refreshes
-/// authentication from this separate file through `CODEX_AUTH_FILE`.
-pub struct SupervisedAuthHome {
     directory: TempDir,
 }
 
@@ -46,6 +38,7 @@ impl IsolatedCodexHome {
         Ok(home)
     }
 
+    #[cfg(test)]
     pub fn with_credential(
         paths: &RuntimePaths,
         purpose: &str,
@@ -89,29 +82,6 @@ impl IsolatedCodexHome {
             toml::to_string_pretty(&isolated)?.as_bytes(),
         )
         .context("could not configure isolated Codex home")
-    }
-}
-
-impl SupervisedAuthHome {
-    pub fn with_credential(paths: &RuntimePaths, credential: &Credential) -> Result<Self> {
-        let directory = Builder::new()
-            .prefix(".agent-auth-")
-            .tempdir_in(&paths.credentials_home)
-            .context("could not create supervised Codex auth directory")?;
-        set_private_directory(&directory)?;
-
-        let home = Self { directory };
-        atomic_write(&home.auth_path(), credential.as_bytes())
-            .context("could not seed supervised Codex auth file")?;
-        Ok(home)
-    }
-
-    pub fn path(&self) -> &Path {
-        self.directory.path()
-    }
-
-    pub fn auth_path(&self) -> PathBuf {
-        self.path().join("auth.json")
     }
 }
 
@@ -207,49 +177,5 @@ mod tests {
         assert!(second_path.exists());
         drop(second);
         assert!(!second_path.exists());
-    }
-
-    #[test]
-    fn supervised_auth_home_contains_only_private_auth() {
-        let root = tempdir().unwrap();
-        let paths = RuntimePaths::new(
-            root.path().join("credentials"),
-            root.path().join("real-codex"),
-        )
-        .unwrap();
-        fs::create_dir_all(&paths.credentials_home).unwrap();
-        let credential = Credential::from_bytes(auth_json(
-            "alice@example.com",
-            "alice-id",
-            "pro",
-            2_000_000_000,
-            "alice-refresh",
-        ))
-        .unwrap();
-
-        let home = SupervisedAuthHome::with_credential(&paths, &credential).unwrap();
-        let home_path = home.path().to_owned();
-        assert!(home.path().starts_with(&paths.credentials_home));
-        assert_eq!(
-            Credential::read(&home.auth_path()).unwrap().facts.email,
-            "alice@example.com"
-        );
-        assert!(!home.path().join("config.toml").exists());
-        assert!(!home.path().join("sessions").exists());
-        assert_eq!(fs::read_dir(home.path()).unwrap().count(), 1);
-        #[cfg(unix)]
-        {
-            assert_eq!(
-                fs::metadata(&home_path).unwrap().permissions().mode() & 0o777,
-                0o700
-            );
-            assert_eq!(
-                fs::metadata(home.auth_path()).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
-
-        drop(home);
-        assert!(!home_path.exists());
     }
 }

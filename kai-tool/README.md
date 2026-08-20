@@ -38,12 +38,13 @@ kai cred remove work@example.com
 `kai cred list` fetches every account's current Codex quota concurrently and shows the remaining
 percentage, relative time until reset, and an inline progress bar. Usable rate-limit reset credits
 are shown with their count and latest relative expiry. Every lookup runs `codex app-server` in its
-own temporary `CODEX_HOME`, so accounts are checked in parallel without swapping the live account
-or making quota API calls directly from Kai. Transient failures are retried up to three total
-attempts through this same lookup path for every command that polls quota. Codex can refresh an
-expired access token inside that home; Kai atomically saves the resulting rotated credential back
-to the vault and, when appropriate, the live `auth.json`. On an interactive terminal, each account
-appears immediately with a live loading indicator and is rewritten as its quota arrives. After
+own temporary configuration-only `CODEX_HOME` while `CODEX_AUTH_FILE` points directly at that
+account's canonical vault file, so accounts are checked in parallel without swapping the live
+account or making quota API calls directly from Kai. Transient failures are retried up to three
+total attempts through this same lookup path for every command that polls quota. Codex can refresh
+an expired access token in that canonical file; the downstream `+k` refresh lock serializes the
+reload, provider request, and persistence, so Kai never reconciles a private copy at process exit.
+On an interactive terminal, each account appears immediately with a live loading indicator and is rewritten as its quota arrives. After
 `kai next` or `kai cred next`, Kai
 reports the newly selected account's quota as soon as the in-flight lookup completes. Selecting an
 exhausted account with reset credits prints a notice directing you to Codex's `/usage` flow to
@@ -82,10 +83,10 @@ active, Kai normally leaves it in place; if that account has zero remaining quot
 account activates the new one automatically. A quota lookup failure is non-fatal and leaves the
 current account active. Use `--activate` to switch immediately regardless of its quota.
 
-Before every switch, Kai copies the live `auth.json` back into the active account's vault entry.
-This preserves refresh-token changes made by Codex. It then atomically installs the selected
-credential. Kai never invokes `codex logout`, so switching does not deliberately revoke the
-previous credential.
+Before every switch, Kai validates the live canonical profile and atomically changes the managed
+`CODEX_HOME/auth.json` link to the selected profile. Refresh-token changes therefore stay in their
+canonical account file without any copy/reconcile step. Kai never invokes `codex logout`, so
+switching does not deliberately revoke the previous credential.
 
 `kai cred list --json` emits stable, secret-free output for scripts, including each quota's
 remaining percentage, reset timestamp, window length, and any usable reset-credit count and latest
@@ -102,32 +103,37 @@ The credential vault is stored at:
     └── <email-derived-id>.json
 ```
 
-Override it with `KAI_CREDENTIALS_HOME`. Kai reads and updates Codex's
-`${CODEX_HOME:-~/.codex}/auth.json`.
+Override it with `KAI_CREDENTIALS_HOME`. Each enrolled profile file is the canonical writable
+credential for that account; Kai atomically points `${CODEX_HOME:-~/.codex}/auth.json` at the
+managed active profile.
 
 The vault is not encrypted; like Codex's own `auth.json`, it contains bearer credentials. On Unix,
 Kai enforces mode `0700` on vault directories and `0600` on credential/state files, refuses
 credential symlinks, uses atomic durable writes, and serializes credential operations with an
-invocation lock. Temporary Codex homes and supervised auth directories use the same private
-permissions and are removed as soon as their login, quota worker, or supervised run exits normally.
-A hard-killed process can leave only a private, unreferenced auth directory; it cannot leave
-sessions or SQLite state pointing at a temporary home. Protect backups accordingly.
+invocation lock. Temporary Codex homes are configuration-only for quota workers and are removed
+after each lookup; enrollment login homes may contain a short-lived login credential. Supervised
+agents never receive a private auth copy, so a hard-killed process cannot leave a second bearer
+credential behind or leave sessions or SQLite state pointing at a temporary home. Protect backups
+accordingly.
 
 Kai requires Codex to use file-backed CLI credentials. If `cli_auth_credentials_store` is set to
 `auto` or `keyring`, change it to `file` in the active Codex `config.toml`.
 
 Already-running Codex processes may retain their previous credential in memory. Restart them after
-`kai next`, `kai cred activate`, or repairing the active credential.
+`kai next`, `kai cred activate`, an automatic recovery promotion, or repairing the active credential.
 
-Automatically supervised +k agents avoid that shared-credential race while keeping the user's
-canonical `CODEX_HOME` and SQLite state. Each run receives a private auth file through the custom
-Codex `CODEX_AUTH_FILE` variable; sessions, configuration, plugins, skills, and rollout paths stay
-in the normal `CODEX_HOME`. Quota recovery uses the same cyclic account selection as `kai next`,
-switches only that run's private credential, and saves refreshed credentials back to the vault
-without replacing the global `auth.json`. At startup Kai also repairs stale rollout paths left by
-older temporary-home runs when the persistent rollout exists. If no enrolled account has usable
-quota, an interactive run asks whether to check again (default yes) and repeats that prompt after
-every unsuccessful retry.
+Automatically supervised +k agents keep the user's canonical `CODEX_HOME`, SQLite state, and
+per-account credential files. Each child receives the selected profile's canonical path through the
+custom Codex `CODEX_AUTH_FILE` variable; sessions, configuration, plugins, skills, and rollout
+paths stay in the normal `CODEX_HOME`. Quota recovery switches that canonical path between child
+restarts using the same cyclic account selection as `kai next`. When a different selected account
+has confirmed remaining quota and the systemwide account is separately confirmed exhausted, Kai
+promotes the selected account to the global `auth.json` link while holding the credential lock.
+Because every +k process locks the resolved canonical file across reload → refresh → persist,
+another Codex instance cannot replay a stale rotating refresh token. At startup Kai also repairs
+stale rollout paths left by older temporary-home runs when the persistent rollout exists. If no
+enrolled account has usable quota, an interactive run asks whether to check again (default yes) and
+repeats that prompt after every unsuccessful retry.
 
 ## Other commands
 

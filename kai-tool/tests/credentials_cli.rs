@@ -186,12 +186,12 @@ impl MockQuotaServer {
                     "  printf '%s\\n' '{{\"id\":0,\"result\":{{}}}}'\n",
                     "  IFS= read -r initialized\n",
                     "  IFS= read -r quota_request\n",
-                    "  account_id=$(sed -n 's/^[[:space:]]*\"account_id\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$CODEX_HOME/auth.json\" | head -n 1)\n",
+                    "  account_id=$(sed -n 's/^[[:space:]]*\"account_id\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$CODEX_AUTH_FILE\" | head -n 1)\n",
                     "  printf '%s\\t%s\\n' \"$account_id\" \"$CODEX_HOME\" >> '{}'\n",
                     "  delay=$(cat '{}')\n",
                     "  if [ \"$delay\" != 0 ]; then sleep \"$delay\"; fi\n",
+                    "  if [ -f '{}/'$account_id'.auth.json' ]; then cp '{}/'$account_id'.auth.json' \"$CODEX_AUTH_FILE\"; fi\n",
                     "  if [ \"${{KAI_TEST_CONCURRENT_ACCOUNT-}}\" = \"$account_id\" ]; then cp \"$KAI_TEST_CONCURRENT_AUTH\" \"$KAI_TEST_LIVE_AUTH\"; fi\n",
-                    "  if [ -f '{}/'$account_id'.auth.json' ]; then cp '{}/'$account_id'.auth.json' \"$CODEX_HOME/auth.json\"; fi\n",
                     "  if [ -f '{}/'$account_id'.failures' ] && [ \"$(cat '{}/'$account_id'.failures')\" -gt 0 ]; then\n",
                     "    failures=$(cat '{}/'$account_id'.failures')\n",
                     "    printf '%s\\n' \"$((failures - 1))\" > '{}/'$account_id'.failures'\n",
@@ -670,7 +670,6 @@ fn add_force_rejects_a_different_account_workspace_identity() {
     let profile_path = credentials_home
         .join("profiles")
         .join(format!("{}.json", profile_id("alice@example.com")));
-    let original_profile = fs::read(&profile_path).unwrap();
 
     command(&credentials_home, &codex_home, &runtime_dir)
         .env("PATH", path)
@@ -692,7 +691,7 @@ fn add_force_rejects_a_different_account_workspace_identity() {
         fs::read(codex_home.join("auth.json")).unwrap(),
         original_active
     );
-    assert_eq!(fs::read(profile_path).unwrap(), original_profile);
+    assert_eq!(fs::read(profile_path).unwrap(), original_active);
 }
 
 #[cfg(unix)]

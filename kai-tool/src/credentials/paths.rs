@@ -37,12 +37,6 @@ impl RuntimePaths {
             .unwrap_or_else(|| self.codex_home.join("auth.json"))
     }
 
-    pub fn with_active_auth(&self, active_auth: PathBuf) -> Result<Self> {
-        let mut paths = self.clone();
-        paths.active_auth = Some(absolute(&active_auth).context("could not resolve active auth")?);
-        Ok(paths)
-    }
-
     pub fn codex_config(&self) -> PathBuf {
         self.codex_home.join("config.toml")
     }

@@ -35,7 +35,7 @@ const NO_QUOTA_RETRY_PROMPT: &str =
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AccountRotation {
-    Rotated,
+    Rotated { auth_file: PathBuf },
     NoQuota(String),
 }
 
@@ -169,22 +169,33 @@ impl Launcher {
             prompt_terminal,
         } = io;
         let input = InputRouter::start(input);
+        let mut auth_file = environment.auth_file.map(Path::to_owned);
 
         loop {
+            let child_environment = SupervisedEnvironment::new(
+                environment.codex_home,
+                environment.sqlite_home,
+                auth_file.as_deref(),
+            );
             match run_pty_session(
                 &self.binary,
                 &args,
                 cwd,
-                environment,
+                child_environment,
                 &input,
                 &output,
                 raw_terminal,
             )? {
                 PtyOutcome::Exited(code) => return Ok(code),
                 PtyOutcome::QuotaExceeded(recovery) => {
-                    rotate_account_with_retry(&mut rotate_account, &mut |details| {
-                        prompt_no_quota_retry(&input, prompt_terminal, details)
-                    })?;
+                    let rotation =
+                        rotate_account_with_retry(&mut rotate_account, &mut |details| {
+                            prompt_no_quota_retry(&input, prompt_terminal, details)
+                        })?;
+                    let AccountRotation::Rotated { auth_file: next } = rotation else {
+                        unreachable!("quota retry returned without a rotated account")
+                    };
+                    auth_file = Some(next);
                     args = recovery_args(recovery);
                 }
             }
@@ -195,10 +206,10 @@ impl Launcher {
 fn rotate_account_with_retry(
     rotate_account: &mut impl FnMut() -> Result<AccountRotation>,
     retry: &mut impl FnMut(&str) -> Result<bool>,
-) -> Result<()> {
+) -> Result<AccountRotation> {
     loop {
         match rotate_account()? {
-            AccountRotation::Rotated => return Ok(()),
+            rotation @ AccountRotation::Rotated { .. } => return Ok(rotation),
             AccountRotation::NoQuota(details) => {
                 if !retry(&details)? {
                     bail!(details);
@@ -1070,7 +1081,9 @@ mod tests {
         let mut outcomes = VecDeque::from([
             AccountRotation::NoQuota("first check found no quota".to_owned()),
             AccountRotation::NoQuota("second check found no quota".to_owned()),
-            AccountRotation::Rotated,
+            AccountRotation::Rotated {
+                auth_file: PathBuf::from("/tmp/rotated-auth.json"),
+            },
         ]);
         let mut prompts = Vec::new();
 
@@ -1319,7 +1332,9 @@ fn main() {{
                 SupervisedEnvironment::new(root.path(), root.path(), None),
                 || {
                     rotations += 1;
-                    Ok(AccountRotation::Rotated)
+                    Ok(AccountRotation::Rotated {
+                        auth_file: root.path().join("rotated-auth.json"),
+                    })
                 },
                 SupervisedIo {
                     input: Box::new(io::empty()),

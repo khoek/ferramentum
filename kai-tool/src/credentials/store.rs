@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use super::auth::{Credential, profile_id, validate_email};
+use super::auth_lock;
 use super::paths::RuntimePaths;
 
 const STATE_VERSION: u32 = 1;
@@ -66,10 +67,6 @@ impl Store {
     pub fn open(paths: RuntimePaths) -> Result<Self> {
         let managed_codex_home = paths.codex_home.clone();
         Self::open_for_home(paths, &managed_codex_home, true)
-    }
-
-    pub fn open_session(paths: RuntimePaths, managed_codex_home: &Path) -> Result<Self> {
-        Self::open_for_home(paths, managed_codex_home, false)
     }
 
     fn open_for_home(
@@ -132,7 +129,9 @@ impl Store {
     }
 
     pub fn credential(&self, profile: &Profile) -> Result<Credential> {
-        let credential = Credential::read(&self.profile_path(&profile.id))?;
+        let path = self.profile_path(&profile.id);
+        let _lock = auth_lock::acquire(&path)?;
+        let credential = Credential::read(&path)?;
         if credential.facts.account_id != profile.account_id
             || !credential.facts.email.eq_ignore_ascii_case(&profile.email)
         {
@@ -154,7 +153,10 @@ impl Store {
                 credential.facts.email
             );
         }
-        atomic_write(&self.profile_path(&profile.id), credential.as_bytes())
+        let path = self.profile_path(&profile.id);
+        reject_symlink_if_present(&path)?;
+        let _lock = auth_lock::acquire(&path)?;
+        atomic_write(&path, credential.as_bytes())
             .with_context(|| format!("could not update credential for {}", profile.email))
     }
 
@@ -177,6 +179,7 @@ impl Store {
                 path.display()
             );
         }
+        let _lock = auth_lock::acquire(&path)?;
         atomic_write(&path, credential.as_bytes())?;
 
         self.state.profiles.push(profile.clone());
@@ -203,6 +206,7 @@ impl Store {
             .profiles_dir()
             .join(format!("{DELETE_PREFIX}{profile_id}"));
         reject_symlink_if_present(&path)?;
+        let _lock = auth_lock::acquire(&path)?;
         fs::rename(&path, &pending)
             .with_context(|| format!("could not stage credential removal for {}", profile.email))?;
 
@@ -224,18 +228,138 @@ impl Store {
         Ok(profile)
     }
 
+    #[cfg(test)]
     pub fn write_active(&self, credential: &Credential) -> Result<()> {
         ensure_private_directory(&self.paths.codex_home)?;
-        reject_symlink_if_present(&self.paths.active_auth())?;
-        atomic_write(&self.paths.active_auth(), credential.as_bytes())
+        let active = self.paths.active_auth();
+        let destination = match self.active_profile_path() {
+            Ok(path) => path,
+            Err(_err) if !active.exists() => active.clone(),
+            Err(err) => return Err(err),
+        };
+        reject_symlink_if_present(&destination)?;
+        let _lock = auth_lock::acquire(&destination)?;
+        atomic_write(&destination, credential.as_bytes())
             .context("could not activate Codex credential")
+    }
+
+    /// Point CODEX_HOME/auth.json at an enrolled profile's canonical credential file.
+    ///
+    /// The link is replaced atomically, so a new Codex process observes either the old
+    /// account or the new account, never a partially written credential document.
+    pub fn activate_profile(&self, profile: &Profile) -> Result<()> {
+        let target = self.profile_path(&profile.id);
+        reject_symlink_if_present(&target)?;
+        if !target.is_file() {
+            bail!(
+                "profile credential is not a regular file: {}",
+                target.display()
+            );
+        }
+        let _lock = auth_lock::acquire(&target)?;
+        let active = self.paths.active_auth();
+        ensure_private_directory(
+            active
+                .parent()
+                .context("active credential path has no parent")?,
+        )?;
+        replace_with_profile_link(&active, &target)?;
+        let installed = self.active_profile_path()?;
+        if installed != target {
+            bail!(
+                "credential activation verification failed for {}",
+                profile.email
+            );
+        }
+        Ok(())
+    }
+
+    /// Resolve the active credential path, accepting only links Kai created to enrolled profiles.
+    pub fn active_profile_path(&self) -> Result<PathBuf> {
+        let active = self.paths.active_auth();
+        let metadata = fs::symlink_metadata(&active)
+            .with_context(|| format!("could not inspect active credential {}", active.display()))?;
+        if !metadata.file_type().is_symlink() {
+            if !metadata.is_file() {
+                bail!(
+                    "active credential is not a regular file: {}",
+                    active.display()
+                );
+            }
+            return Ok(active);
+        }
+
+        let raw_target = fs::read_link(&active).with_context(|| {
+            format!("could not read active credential link {}", active.display())
+        })?;
+        let target = if raw_target.is_absolute() {
+            raw_target
+        } else {
+            active
+                .parent()
+                .context("active credential path has no parent")?
+                .join(raw_target)
+        };
+        let target = fs::canonicalize(&target).with_context(|| {
+            format!(
+                "active credential link target does not exist: {}",
+                target.display()
+            )
+        })?;
+        for profile in &self.state.profiles {
+            let profile_path = self.profile_path(&profile.id);
+            if fs::canonicalize(&profile_path).is_ok_and(|path| path == target) {
+                reject_symlink_if_present(&profile_path)?;
+                return Ok(profile_path);
+            }
+        }
+        bail!(
+            "refusing active credential symlink outside the Kai credential vault: {}",
+            active.display()
+        )
+    }
+
+    /// Migrate a legacy regular active auth file into the canonical profile link when possible.
+    pub fn ensure_canonical_active(&self) -> Result<()> {
+        let active = self.paths.active_auth();
+        let metadata = match fs::symlink_metadata(&active) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("could not inspect active credential {}", active.display())
+                });
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            self.active_profile_path()?;
+            return Ok(());
+        }
+        if !metadata.is_file() {
+            bail!(
+                "active credential is not a regular file: {}",
+                active.display()
+            );
+        }
+        let _lock = auth_lock::acquire(&active)?;
+        let live = Credential::read(&active)?;
+        let Some(profile) = self.find_profile_by_account(&live.facts.account_id) else {
+            return Ok(());
+        };
+        self.sync_profile(profile, &live)?;
+        self.activate_profile(profile)
     }
 
     pub fn remove_active(&self) -> Result<()> {
         let path = self.paths.active_auth();
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                bail!("refusing to remove credential symlink {}", path.display())
+                fs::remove_file(&path).with_context(|| {
+                    format!("could not remove active credential {}", path.display())
+                })?;
+                path.parent()
+                    .context("active credential path has no parent")
+                    .and_then(sync_directory)
             }
             Ok(metadata) if metadata.is_file() => {
                 fs::remove_file(&path).with_context(|| {
@@ -253,6 +377,10 @@ impl Store {
             Err(err) => Err(err)
                 .with_context(|| format!("could not inspect active credential {}", path.display())),
         }
+    }
+
+    pub fn profile_auth_path(&self, profile: &Profile) -> PathBuf {
+        self.profile_path(&profile.id)
     }
 
     fn profile_path(&self, profile_id: &str) -> PathBuf {
@@ -442,6 +570,52 @@ fn reject_symlink_if_present(path: &Path) -> Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).with_context(|| format!("could not inspect {}", path.display())),
     }
+}
+
+fn replace_with_profile_link(active: &Path, target: &Path) -> Result<()> {
+    let parent = active
+        .parent()
+        .context("active credential path has no parent")?;
+    let mut temporary = None;
+    for nonce in 0..100_u32 {
+        let candidate = parent.join(format!(".kai-active-link-{}-{nonce}", std::process::id()));
+        match create_file_symlink(target, &candidate) {
+            Ok(()) => {
+                temporary = Some(candidate);
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "could not create temporary active credential link {}",
+                        candidate.display()
+                    )
+                });
+            }
+        }
+    }
+    let temporary = temporary.context("could not allocate a temporary active credential link")?;
+    if let Err(err) = fs::rename(&temporary, active) {
+        let _ = fs::remove_file(&temporary);
+        return Err(err).with_context(|| {
+            format!(
+                "could not install active credential link {}",
+                active.display()
+            )
+        });
+    }
+    sync_directory(parent)
+}
+
+#[cfg(unix)]
+fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
 }
 
 fn set_private_file_permissions(file: &File) -> Result<()> {

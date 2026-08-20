@@ -52,7 +52,6 @@ fn supervised_fast_agent_preserves_invocation_directory() {
             "printf '%s\\n' \"$CODEX_SQLITE_HOME\" > \"$KAI_TEST_SQLITE_HOME\"\n",
             "printf '%s\\n' \"$CODEX_AUTH_FILE\" > \"$KAI_TEST_AUTH_FILE\"\n",
             "test \"$CODEX_HOME\" = \"$KAI_EXPECTED_CODEX_HOME\"\n",
-            "test \"$CODEX_AUTH_FILE\" != \"$CODEX_HOME/auth.json\"\n",
             "test -f \"$CODEX_AUTH_FILE\"\n",
             "grep '^model' \"$CODEX_HOME/config.toml\" > \"$KAI_TEST_CONFIG\"\n",
         ),
@@ -102,9 +101,13 @@ fn supervised_fast_agent_preserves_invocation_directory() {
     );
     let auth_file = fs::read_to_string(auth_file_path).unwrap();
     let auth_file = Path::new(auth_file.trim());
-    assert!(auth_file.starts_with(&credentials_home));
-    assert_ne!(auth_file, codex_home.join("auth.json"));
-    assert!(!auth_file.exists());
+    assert_eq!(
+        auth_file,
+        credentials_home
+            .join("profiles")
+            .join(format!("{}.json", profile_id("alice@example.com")))
+    );
+    assert!(auth_file.exists());
     assert_eq!(
         fs::read_to_string(sqlite_home_path).unwrap(),
         format!("{}\n", codex_home.display())
@@ -192,7 +195,7 @@ fn supervised_agent_repairs_stale_rollout_paths() {
 }
 
 #[test]
-fn automatic_recovery_wraps_accounts_and_keeps_global_auth_unchanged() {
+fn automatic_recovery_keeps_global_auth_when_it_still_has_quota() {
     let root = tempdir().unwrap();
     let bin_dir = root.path().join("bin");
     let workspace = root.path().join("workspace");
@@ -235,7 +238,7 @@ fn automatic_recovery_wraps_accounts_and_keeps_global_auth_unchanged() {
             "  printf '%s\\n' '{\"id\":0,\"result\":{}}'\n",
             "  IFS= read -r initialized\n",
             "  IFS= read -r quota_request\n",
-            "  account_id=$(sed -n 's/^[[:space:]]*\"account_id\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$CODEX_HOME/auth.json\" | head -n 1)\n",
+            "  account_id=$(sed -n 's/^[[:space:]]*\"account_id\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$CODEX_AUTH_FILE\" | head -n 1)\n",
             "  printf '%s\\n' \"$account_id\" >> \"$KAI_TEST_QUOTA_LOG\"\n",
             "  printf '%s\\n' '{\"id\":1,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":25,\"windowDurationMins\":300,\"resetsAt\":2000000000},\"secondary\":null},\"rateLimitsByLimitId\":null,\"rateLimitResetCredits\":null}}'\n",
             "  ;;\n",
@@ -247,7 +250,6 @@ fn automatic_recovery_wraps_accounts_and_keeps_global_auth_unchanged() {
             "  count=$((count + 1))\n",
             "  printf '%s\\n' \"$count\" > \"$KAI_TEST_AGENT_COUNT\"\n",
             "  test -n \"${CODEX_AUTH_FILE-}\"\n",
-            "  test \"$CODEX_AUTH_FILE\" != \"$CODEX_HOME/auth.json\"\n",
             "  account_id=$(sed -n 's/^[[:space:]]*\"account_id\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$CODEX_AUTH_FILE\" | head -n 1)\n",
             "  printf '%s\\t%s\\t%s\\n' \"$account_id\" \"$CODEX_HOME\" \"$CODEX_AUTH_FILE\" >> \"$KAI_TEST_AGENT_LOG\"\n",
             "  if [ \"$count\" -eq 3 ]; then cp \"$KAI_TEST_FINISHED_AUTH\" \"$CODEX_AUTH_FILE\"; fi\n",
@@ -305,20 +307,32 @@ fn automatic_recovery_wraps_accounts_and_keeps_global_auth_unchanged() {
     );
     assert!(agents.windows(2).all(|rows| rows[0].1 == rows[1].1));
     let expected_codex_home = codex_home.to_str().unwrap();
-    let global_auth = codex_home.join("auth.json");
     assert!(
         agents
             .iter()
             .all(|(_, home, _)| *home == expected_codex_home)
     );
-    assert!(agents.iter().all(|(_, _, auth)| {
+    assert!(agents.iter().all(|(account, _, auth)| {
         let auth = Path::new(auth);
-        auth.starts_with(&credentials_home) && auth != global_auth && !auth.exists()
+        let expected = match *account {
+            "alice-id" => credentials_home
+                .join("profiles")
+                .join(format!("{}.json", profile_id("alice@example.com"))),
+            "bob-id" => credentials_home
+                .join("profiles")
+                .join(format!("{}.json", profile_id("bob@example.com"))),
+            _ => return false,
+        };
+        auth == expected && auth.exists()
     }));
-    assert_eq!(fs::read_to_string(quota_log).unwrap(), "bob-id\nalice-id\n");
+    // The final lookup is the systemwide account's exhaustion guard.
+    assert_eq!(
+        fs::read_to_string(quota_log).unwrap(),
+        "bob-id\nalice-id\nalice-id\n"
+    );
     assert_eq!(
         fs::read(codex_home.join("auth.json")).unwrap(),
-        auth_json("alice@example.com", "alice-id", "alice-live")
+        auth_json("alice@example.com", "alice-id", "alice-finished")
     );
     assert_eq!(
         fs::read(
@@ -328,6 +342,129 @@ fn automatic_recovery_wraps_accounts_and_keeps_global_auth_unchanged() {
         )
         .unwrap(),
         auth_json("alice@example.com", "alice-id", "alice-finished")
+    );
+}
+
+#[test]
+fn automatic_recovery_promotes_global_auth_when_it_is_exhausted() {
+    let root = tempdir().unwrap();
+    let bin_dir = root.path().join("bin");
+    let workspace = root.path().join("workspace");
+    let credentials_home = root.path().join("credentials");
+    let codex_home = root.path().join("codex");
+    let runtime_dir = root.path().join("runtime");
+    let agent_log = root.path().join("agent-log");
+    let agent_count = root.path().join("agent-count");
+    let quota_log = root.path().join("quota-log");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir(&workspace).unwrap();
+    seed_account_set(
+        &credentials_home,
+        &codex_home,
+        &[
+            ("alice@example.com", "alice-id", "alice-stored"),
+            ("bob@example.com", "bob-id", "bob-stored"),
+        ],
+        ("alice@example.com", "alice-id", "alice-live"),
+    );
+
+    let fake_codex = bin_dir.join("codex");
+    fs::write(
+        &fake_codex,
+        concat!(
+            "#!/bin/sh\n",
+            "set -eu\n",
+            "case \"${1-}\" in\n",
+            "--version)\n",
+            "  printf 'codex-cli 0.147.0+k\\n'\n",
+            "  ;;\n",
+            "app-server)\n",
+            "  IFS= read -r initialize\n",
+            "  printf '%s\\n' '{\"id\":0,\"result\":{}}'\n",
+            "  IFS= read -r initialized\n",
+            "  IFS= read -r quota_request\n",
+            "  account_id=$(sed -n 's/^[[:space:]]*\"account_id\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$CODEX_AUTH_FILE\" | head -n 1)\n",
+            "  printf '%s\\n' \"$account_id\" >> \"$KAI_TEST_QUOTA_LOG\"\n",
+            "  case \"$account_id\" in\n",
+            "    alice-id) used=100 ;;\n",
+            "    bob-id) used=25 ;;\n",
+            "    *) used=100 ;;\n",
+            "  esac\n",
+            "  printf '%s\\n' \"{\\\"id\\\":1,\\\"result\\\":{\\\"rateLimits\\\":{\\\"primary\\\":{\\\"usedPercent\\\":$used,\\\"windowDurationMins\\\":300,\\\"resetsAt\\\":2000000000},\\\"secondary\\\":null},\\\"rateLimitsByLimitId\\\":null,\\\"rateLimitResetCredits\\\":null}}\"\n",
+            "  ;;\n",
+            "*)\n",
+            "  count=$(cat \"$KAI_TEST_AGENT_COUNT\" 2>/dev/null || printf 0)\n",
+            "  count=$((count + 1))\n",
+            "  printf '%s\\n' \"$count\" > \"$KAI_TEST_AGENT_COUNT\"\n",
+            "  test -n \"${CODEX_AUTH_FILE-}\"\n",
+            "  account_id=$(sed -n 's/^[[:space:]]*\"account_id\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$CODEX_AUTH_FILE\" | head -n 1)\n",
+            "  printf '%s\\t%s\\t%s\\n' \"$account_id\" \"$CODEX_HOME\" \"$CODEX_AUTH_FILE\" >> \"$KAI_TEST_AGENT_LOG\"\n",
+            "  if [ \"$count\" -eq 1 ]; then\n",
+            "    printf '%s\\n' 'codex+k (123e4567-e89b-12d3-a456-426614174000): quota exceeded {\"version\":1,\"resume_args\":[\"-c\",\"service_tier=\\\"default\\\"\"]}'\n",
+            "  fi\n",
+            "  ;;\n",
+            "esac\n",
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = env::join_paths(
+        std::iter::once(bin_dir).chain(env::split_paths(&env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+
+    Command::cargo_bin("kai")
+        .unwrap()
+        .current_dir(&workspace)
+        .env("PATH", path)
+        .env("KAI_CREDENTIALS_HOME", &credentials_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("CODEX_SQLITE_HOME", &codex_home)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("KAI_TEST_AGENT_LOG", &agent_log)
+        .env("KAI_TEST_AGENT_COUNT", &agent_count)
+        .env("KAI_TEST_QUOTA_LOG", &quota_log)
+        .args(["--quota-auto-restart", "yes", "a"])
+        .assert()
+        .success();
+
+    let agents = fs::read_to_string(agent_log).unwrap();
+    let agents = agents
+        .lines()
+        .map(|line| {
+            let mut fields = line.split('\t');
+            (
+                fields.next().unwrap(),
+                fields.next().unwrap(),
+                fields.next().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        agents
+            .iter()
+            .map(|(account, _, _)| *account)
+            .collect::<Vec<_>>(),
+        ["alice-id", "bob-id"]
+    );
+    let global_auth = codex_home.join("auth.json");
+    assert!(agents.iter().all(|(account, _, auth)| {
+        let auth = Path::new(auth);
+        let expected = match *account {
+            "alice-id" => credentials_home
+                .join("profiles")
+                .join(format!("{}.json", profile_id("alice@example.com"))),
+            "bob-id" => credentials_home
+                .join("profiles")
+                .join(format!("{}.json", profile_id("bob@example.com"))),
+            _ => return false,
+        };
+        auth == expected && auth.exists()
+    }));
+    assert_eq!(fs::read_to_string(quota_log).unwrap(), "bob-id\nalice-id\n");
+    assert_eq!(
+        fs::read(global_auth).unwrap(),
+        auth_json("bob@example.com", "bob-id", "bob-stored")
     );
 }
 
@@ -455,7 +592,8 @@ fn automatic_recovery_prompts_and_rechecks_when_no_account_has_quota() {
         String::from_utf8_lossy(&output.lock().unwrap())
     );
     assert_eq!(fs::read_to_string(agent_log).unwrap(), "alice-id\nbob-id\n");
-    assert_eq!(fs::read_to_string(quota_count).unwrap(), "2\n");
+    // The successful retry also checks the still-active systemwide account.
+    assert_eq!(fs::read_to_string(quota_count).unwrap(), "3\n");
 }
 
 fn seed_account(credentials_home: &Path, codex_home: &Path) {

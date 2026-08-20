@@ -11,6 +11,7 @@ use clap::{Args, Subcommand};
 use crate::codex::AccountRotation;
 
 mod auth;
+mod auth_lock;
 mod enroll;
 mod isolated_home;
 mod paths;
@@ -20,7 +21,6 @@ mod store;
 mod ui;
 
 use self::auth::{Credential, CredentialFacts, validate_email};
-use self::isolated_home::SupervisedAuthHome;
 use self::paths::RuntimePaths;
 use self::store::{Profile, Store, ensure_codex_uses_file_credentials};
 use self::ui::{AccountStatus, AccountView, ListView, QuotaStatus};
@@ -183,6 +183,16 @@ impl fmt::Display for NoUsableQuota {
 
 impl std::error::Error for NoUsableQuota {}
 
+/// The account selected by one quota rotation, together with whether its quota was
+/// positively confirmed.  Supervised recovery uses this to decide whether the selected
+/// credential should also become the systemwide credential.
+#[derive(Debug)]
+struct NextSelection {
+    target: Profile,
+    changed: bool,
+    target_has_remaining_quota: bool,
+}
+
 fn resolve_sqlite_home(cwd: &Path, codex_home: &Path, configured: Option<&str>) -> PathBuf {
     configured
         .map(str::trim)
@@ -201,10 +211,8 @@ fn resolve_sqlite_home(cwd: &Path, codex_home: &Path, configured: Option<&str>) 
 #[derive(Default)]
 pub(crate) struct QuotaRecovery {
     source_paths: Option<RuntimePaths>,
-    supervised_auth_home: Option<SupervisedAuthHome>,
-    active_source: Option<Credential>,
+    active_auth_file: Option<PathBuf>,
     sqlite_home: Option<PathBuf>,
-    finished: bool,
 }
 
 impl QuotaRecovery {
@@ -227,27 +235,11 @@ impl QuotaRecovery {
             &source_paths.codex_home,
         )
         .context("could not repair stale supervised Codex rollout paths")?;
-        let (supervised_auth_home, active_source) = match load_live_strict(&store)? {
-            Some(credential) => match managed_profile(&store, &credential).cloned() {
-                Some(profile) => {
-                    store.sync_profile(&profile, &credential)?;
-                    let source = Credential::from_bytes(credential.as_bytes().to_vec())
-                        .context("could not retain the supervised Codex credential baseline")?;
-                    (
-                        Some(SupervisedAuthHome::with_credential(
-                            &source_paths,
-                            &credential,
-                        )?),
-                        Some(source),
-                    )
-                }
-                None => (None, None),
-            },
-            None => (None, None),
-        };
+        let active_auth_file = load_live_strict(&store)?
+            .and_then(|credential| managed_profile(&store, &credential))
+            .map(|profile| store.profile_auth_path(profile));
         self.source_paths = Some(source_paths);
-        self.supervised_auth_home = supervised_auth_home;
-        self.active_source = active_source;
+        self.active_auth_file = active_auth_file;
         self.sqlite_home = Some(sqlite_home);
         Ok(())
     }
@@ -260,12 +252,10 @@ impl QuotaRecovery {
             .codex_home)
     }
 
-    /// The private auth file used by a supervised `+k` child, if there is a managed active
-    /// credential to supervise. All non-auth Codex state remains under [`Self::codex_home`].
+    /// The canonical enrolled auth file used by a supervised downstream child, if there is a
+    /// managed active credential. All non-auth Codex state remains under codex_home.
     pub(crate) fn auth_file(&self) -> Option<PathBuf> {
-        self.supervised_auth_home
-            .as_ref()
-            .map(SupervisedAuthHome::auth_path)
+        self.active_auth_file.clone()
     }
 
     pub(crate) fn sqlite_home(&self) -> Result<&Path> {
@@ -278,24 +268,77 @@ impl QuotaRecovery {
         classify_account_rotation(credential_runtime()?.block_on(self.rotate_async()))
     }
 
-    async fn rotate_async(&mut self) -> Result<()> {
+    async fn rotate_async(&mut self) -> Result<PathBuf> {
         let _invocation_lock = capulus::acquire("kai-cred", true)?;
         let mut store = self.open_store()?;
-        self.reconcile_session_credential(&store)?;
-        cmd_next(&mut store).await?;
-        self.capture_active_source(&store)
+        let current_profile = self.active_auth_file.as_ref().and_then(|auth_file| {
+            store
+                .profiles()
+                .iter()
+                .find(|profile| store.profile_auth_path(profile) == *auth_file)
+                .cloned()
+        });
+        let selection = choose_next_selection_from(&mut store, current_profile.as_ref()).await?;
+        // Keep the systemwide promotion in this same critical section as the canonical path switch.
+        self.promote_systemwide_if_exhausted(&selection).await?;
+        let auth_file = store.profile_auth_path(&selection.target);
+        self.active_auth_file = Some(auth_file.clone());
+        Ok(auth_file)
     }
 
-    pub(crate) fn finish(&mut self) -> Result<()> {
-        if self.finished {
+    /// A supervised run normally changes only the selected canonical auth file. When recovery
+    /// found a confirmed-capacity account, also move the user's systemwide account if that account is
+    /// currently exhausted.  This runs from [`Self::rotate_async`], while the `kai-cred`
+    /// invocation lock is held, so the live credential cannot be switched by another Kai
+    /// credential operation between the quota check and the install.
+    async fn promote_systemwide_if_exhausted(&self, selection: &NextSelection) -> Result<()> {
+        if !selection.changed || !selection.target_has_remaining_quota {
             return Ok(());
         }
-        self.finished = true;
-        let _invocation_lock = capulus::acquire("kai-cred", true)?;
-        if self.supervised_auth_home.is_some() {
-            let store = self.open_store()?;
-            self.reconcile_session_credential(&store)?;
+
+        let mut primary = self.open_primary_store()?;
+        let live = match load_live(&primary) {
+            LiveAuth::Present(credential) => credential,
+            LiveAuth::Absent | LiveAuth::Invalid(_) => return Ok(()),
+        };
+        let active = match managed_profile(&primary, &live).cloned() {
+            Some(profile) => profile,
+            None => return Ok(()),
+        };
+        if active.account_id == selection.target.account_id {
+            return Ok(());
         }
+
+        let active_quota = match fetch_credential_quota(&primary, &live).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                capulus::ui::warn(&format!(
+                    "Could not check whether {} has remaining quota; leaving it active: {err:#}",
+                    active.email
+                ));
+                return Ok(());
+            }
+        };
+        if active_quota.remaining_percent > 0.0 {
+            return Ok(());
+        }
+
+        // Re-read the live credential after the quota worker finishes.  A non-Kai Codex process
+        // may have changed it while the isolated request was in flight; never overwrite that
+        // newer account based on the stale account's quota result.
+        match load_live(&primary) {
+            LiveAuth::Present(credential) if credential.facts.account_id == active.account_id => {}
+            LiveAuth::Absent | LiveAuth::Invalid(_) | LiveAuth::Present(_) => return Ok(()),
+        }
+
+        let target = match primary
+            .find_profile_by_account(&selection.target.account_id)
+            .cloned()
+        {
+            Some(profile) => profile,
+            None => return Ok(()),
+        };
+        activate(&mut primary, &target)?;
         Ok(())
     }
 
@@ -304,67 +347,23 @@ impl QuotaRecovery {
             .source_paths
             .as_ref()
             .context("quota recovery was not prepared")?;
-        let Some(home) = &self.supervised_auth_home else {
-            ensure_codex_uses_file_credentials(source_paths)?;
-            return Store::open(source_paths.clone());
-        };
-        let session_paths = source_paths.with_active_auth(home.auth_path())?;
-        ensure_codex_uses_file_credentials(&session_paths)?;
-        Store::open_session(session_paths, &source_paths.codex_home)
+        ensure_codex_uses_file_credentials(source_paths)?;
+        Store::open(source_paths.clone())
     }
 
-    fn reconcile_session_credential(&mut self, store: &Store) -> Result<()> {
-        if self.supervised_auth_home.is_none() {
-            return Ok(());
-        }
-        let live = match load_live(store) {
-            LiveAuth::Absent => {
-                self.active_source = None;
-                return Ok(());
-            }
-            LiveAuth::Present(credential) => credential,
-            LiveAuth::Invalid(err) => {
-                return Err(err).context("could not save the supervised Codex credential");
-            }
-        };
-        let source = self
-            .active_source
+    fn open_primary_store(&self) -> Result<Store> {
+        let source_paths = self
+            .source_paths
             .as_ref()
-            .context("supervised Codex changed from a signed-out state unexpectedly")?;
-        if source.facts.account_id != live.facts.account_id {
-            bail!(
-                "supervised Codex changed accounts outside Kai; refusing to overwrite either credential"
-            );
-        }
-        let profile = require_managed_profile(store, &live)?.clone();
-        let stored = store.credential(&profile)?;
-        let authoritative = if stored.as_bytes() == live.as_bytes() {
-            live
-        } else if stored.as_bytes() == source.as_bytes() {
-            store.sync_profile(&profile, &live)?;
-            live
-        } else {
-            // Another supervised run saved a newer credential after this run started. Keep that
-            // vault copy and install it into this run before resuming, rather than resurrecting a
-            // refresh token which may already have been consumed.
-            store.write_active(&stored)?;
-            stored
-        };
-        self.active_source = Some(Credential::from_bytes(authoritative.as_bytes().to_vec())?);
-        Ok(())
-    }
-
-    fn capture_active_source(&mut self, store: &Store) -> Result<()> {
-        self.active_source = load_live_strict(store)?
-            .map(|credential| Credential::from_bytes(credential.as_bytes().to_vec()))
-            .transpose()?;
-        Ok(())
+            .context("quota recovery was not prepared")?;
+        ensure_codex_uses_file_credentials(source_paths)?;
+        Store::open(source_paths.clone())
     }
 }
 
-fn classify_account_rotation(result: Result<()>) -> Result<AccountRotation> {
+fn classify_account_rotation(result: Result<PathBuf>) -> Result<AccountRotation> {
     match result {
-        Ok(()) => Ok(AccountRotation::Rotated),
+        Ok(auth_file) => Ok(AccountRotation::Rotated { auth_file }),
         Err(error) if error.downcast_ref::<NoUsableQuota>().is_some() => {
             Ok(AccountRotation::NoQuota(format!("{error:#}")))
         }
@@ -400,7 +399,9 @@ fn credential_runtime() -> Result<tokio::runtime::Runtime> {
 fn open_store() -> Result<Store> {
     let paths = RuntimePaths::from_env()?;
     ensure_codex_uses_file_credentials(&paths)?;
-    Store::open(paths)
+    let store = Store::open(paths)?;
+    store.ensure_canonical_active()?;
+    Ok(store)
 }
 
 async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
@@ -462,8 +463,9 @@ async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
             match &quota_client {
                 Ok(client) => {
                     let client = client.clone();
+                    let auth_file = store.profile_auth_path(profile);
                     quota_tasks
-                        .spawn(async move { (index, active, client.fetch(credential).await) });
+                        .spawn(async move { (index, client.fetch(credential, auth_file).await) });
                 }
                 Err(error) => {
                     account.quota = QuotaStatus::Unavailable {
@@ -487,9 +489,8 @@ async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
         ui::LiveList::start(&view)
     };
     while let Some(result) = quota_tasks.join_next().await {
-        let (index, source_was_active, outcome) =
-            result.context("a quota lookup task stopped unexpectedly")?;
-        persist_quota_credential(store, &store.profiles()[index], source_was_active, &outcome)?;
+        let (index, outcome) = result.context("a quota lookup task stopped unexpectedly")?;
+        persist_quota_credential(store, &store.profiles()[index], &outcome)?;
         view.accounts[index].last_refresh = outcome.credential.facts.last_refresh.clone();
         view.accounts[index].set_quota(outcome.snapshot);
         if let Some(live_list) = &live_list {
@@ -541,7 +542,6 @@ async fn cmd_tickle(store: &mut Store) -> Result<()> {
     let original_active = match &live {
         Some(credential) => {
             let profile = require_managed_profile(store, credential)?.clone();
-            store.sync_profile(&profile, credential)?;
             Some(profile)
         }
         None => None,
@@ -667,24 +667,55 @@ fn ready_account_view(
 }
 
 async fn cmd_next(store: &mut Store) -> Result<()> {
+    let selection = choose_next_selection_from(store, None).await?;
+    let changed = activate(store, &selection.target)?;
+    if changed {
+        capulus::ui::success(&format!("Codex is now using {}.", selection.target.email));
+        if store.uses_primary_codex_home() {
+            warn_running_codex();
+        }
+    }
+    Ok(())
+}
+
+async fn choose_next_selection_from(
+    store: &mut Store,
+    selected_active: Option<&Profile>,
+) -> Result<NextSelection> {
     if store.profiles().is_empty() {
         return Err(NoUsableQuota(
             "no accounts are enrolled; run `kai cred add <email>` first".to_owned(),
         )
         .into());
     }
-    let live = load_live_strict(store)?;
-    let active_index = match &live {
-        None => None,
-        Some(credential) => {
-            let active = require_managed_profile(store, credential)?;
-            Some(
-                store
-                    .profiles()
-                    .iter()
-                    .position(|profile| profile.id == active.id)
-                    .context("active profile disappeared while selecting the next account")?,
-            )
+    let (live, active_index) = match selected_active {
+        Some(active) => {
+            let active_index = store
+                .profiles()
+                .iter()
+                .position(|profile| profile.id == active.id)
+                .context("active profile disappeared while selecting the next account")?;
+            let live = store.credential(active)?;
+            (Some(live), Some(active_index))
+        }
+        None => {
+            let live = load_live_strict(store)?;
+            let active_index = match &live {
+                None => None,
+                Some(credential) => {
+                    let active = require_managed_profile(store, credential)?;
+                    Some(
+                        store
+                            .profiles()
+                            .iter()
+                            .position(|profile| profile.id == active.id)
+                            .context(
+                                "active profile disappeared while selecting the next account",
+                            )?,
+                    )
+                }
+            };
+            (live, active_index)
         }
     };
     let order = rotation_order(store.profiles().len(), active_index);
@@ -711,18 +742,13 @@ async fn cmd_next(store: &mut Store) -> Result<()> {
         .into_iter()
         .find_map(|(index, result)| (index == target_index).then_some(result))
         .context("selected account quota result disappeared")?;
-    let changed = activate(store, &target)?;
-    if changed {
-        capulus::ui::success(&format!("Codex is now using {}.", target.email));
-        if store.uses_primary_codex_home() {
-            warn_running_codex();
-        }
-    } else {
-        capulus::ui::success(&format!("{} is the only enrolled account.", target.email));
-    }
-    match quota {
+    let changed = active_index.is_none_or(|index| store.profiles()[index].id != target.id);
+    let target_has_remaining_quota = quota
+        .as_ref()
+        .is_ok_and(|snapshot| snapshot.remaining_percent > 0.0);
+    match &quota {
         Ok(snapshot) => {
-            ui::print_quota(&snapshot);
+            ui::print_quota(snapshot);
             if snapshot.remaining_percent <= 0.0
                 && let Some(reset_credits) = &snapshot.rate_limit_reset_credits
             {
@@ -734,7 +760,11 @@ async fn cmd_next(store: &mut Store) -> Result<()> {
             target.email
         )),
     }
-    Ok(())
+    Ok(NextSelection {
+        target,
+        changed,
+        target_has_remaining_quota,
+    })
 }
 
 async fn fetch_profile_quotas(
@@ -758,32 +788,20 @@ async fn fetch_profile_quotas(
     let mut tasks = tokio::task::JoinSet::new();
     for (slot, index) in profile_indices.iter().copied().enumerate() {
         let profile = &store.profiles()[index];
-        let (credential, source_was_active) = match live {
+        let credential = match live {
             Some(credential) if credential.facts.account_id == profile.account_id => {
-                (Credential::from_bytes(credential.as_bytes().to_vec()), true)
+                Credential::from_bytes(credential.as_bytes().to_vec())?
             }
-            _ => (store.credential(profile), false),
+            _ => store.credential(profile)?,
         };
-        match credential {
-            Ok(credential) => {
-                let client = client.clone();
-                tasks.spawn(
-                    async move { (slot, source_was_active, client.fetch(credential).await) },
-                );
-            }
-            Err(err) => results[slot] = Some(Err(err)),
-        }
+        let auth_file = store.profile_auth_path(profile);
+        let client = client.clone();
+        tasks.spawn(async move { (slot, client.fetch(credential, auth_file).await) });
     }
     while let Some(result) = tasks.join_next().await {
-        let (slot, source_was_active, outcome) =
-            result.context("a quota lookup task stopped unexpectedly")?;
+        let (slot, outcome) = result.context("a quota lookup task stopped unexpectedly")?;
         let profile_index = profile_indices[slot];
-        persist_quota_credential(
-            store,
-            &store.profiles()[profile_index],
-            source_was_active,
-            &outcome,
-        )?;
+        persist_quota_credential(store, &store.profiles()[profile_index], &outcome)?;
         results[slot] = Some(outcome.snapshot);
     }
     Ok(profile_indices
@@ -795,57 +813,22 @@ async fn fetch_profile_quotas(
         .collect())
 }
 
-/// Save a token rotation from an isolated quota worker without clobbering a newer live token.
-/// The active auth file is replaced only when it still contains the exact worker input.
+/// The quota worker already writes the canonical profile through the downstream auth manager.
+/// Keep this hook as a consistency check, but never copy an outcome back over a newer canonical
+/// credential after the app-server exits.
 fn persist_quota_credential(
     store: &Store,
     profile: &Profile,
-    source_was_active: bool,
     outcome: &quota::Outcome,
 ) -> Result<()> {
-    if !source_was_active {
-        if outcome.credential_changed() {
-            sync_profile_if_changed(store, profile, &outcome.credential)?;
-        }
-        return Ok(());
-    }
-
-    match load_live(store) {
-        LiveAuth::Present(current) if current.facts.account_id == profile.account_id => {
-            if outcome.source_matches(&current) {
-                // Keep the vault copy durable before replacing the live token. If the second
-                // write fails, the newly rotated refresh token is still recoverable by activate.
-                sync_profile_if_changed(store, profile, &outcome.credential)?;
-                if outcome.credential_changed() {
-                    store.write_active(&outcome.credential)?;
-                }
-            } else {
-                // Another Codex process refreshed this account while the isolated request was in
-                // flight. Its live credential wins; overwriting it could resurrect a spent token.
-                sync_profile_if_changed(store, profile, &current)?;
-            }
-        }
-        LiveAuth::Absent | LiveAuth::Invalid(_) | LiveAuth::Present(_) => {
-            // The user switched or removed the active account concurrently. Preserve that choice
-            // while still saving this profile's potentially rotated refresh token.
-            sync_profile_if_changed(store, profile, &outcome.credential)?;
-        }
+    let current = store.credential(profile)?;
+    if outcome.credential_changed() && outcome.source_matches(&current) {
+        bail!(
+            "Codex quota worker changed {} credentials without persisting the canonical profile",
+            profile.email
+        );
     }
     Ok(())
-}
-
-fn sync_profile_if_changed(
-    store: &Store,
-    profile: &Profile,
-    credential: &Credential,
-) -> Result<()> {
-    if store
-        .credential(profile)
-        .is_ok_and(|stored| stored.as_bytes() == credential.as_bytes())
-    {
-        return Ok(());
-    }
-    store.sync_profile(profile, credential)
 }
 
 fn rotation_order(profile_count: usize, active_index: Option<usize>) -> Vec<usize> {
@@ -962,6 +945,7 @@ async fn cmd_add(store: &mut Store, args: AddArgs) -> Result<()> {
         && credential.matches_email(expected)
     {
         let profile = store.insert_profile(credential)?;
+        store.activate_profile(&profile)?;
         capulus::ui::success(&format!(
             "Imported the active Codex account {}.",
             profile.email
@@ -1183,9 +1167,6 @@ fn repair_profile(
         );
     }
 
-    if target_is_active {
-        store.write_active(&credential)?;
-    }
     store.sync_profile(target, &credential)?;
     if target_is_active {
         capulus::ui::success(&format!(
@@ -1260,11 +1241,6 @@ fn cmd_remove(store: &mut Store, args: RemoveArgs) -> Result<()> {
     let target_is_active = active.is_some_and(|profile| profile.id == target.id);
 
     if target_is_active {
-        let credential = match &live {
-            LiveAuth::Present(credential) => credential,
-            _ => unreachable!(),
-        };
-        store.sync_profile(&target, credential)?;
         if let Some(successor) = next_profile_excluding(store, &target) {
             let successor = successor.clone();
             activate(store, &successor)?;
@@ -1277,12 +1253,6 @@ fn cmd_remove(store: &mut Store, args: RemoveArgs) -> Result<()> {
             return Ok(());
         }
         store.remove_active()?;
-    } else if let Some(active) = active {
-        let credential = match &live {
-            LiveAuth::Present(credential) => credential,
-            _ => unreachable!(),
-        };
-        store.sync_profile(active, credential)?;
     }
 
     store.remove_profile(&target.id)?;
@@ -1296,7 +1266,6 @@ fn cmd_remove(store: &mut Store, args: RemoveArgs) -> Result<()> {
 fn activate(store: &mut Store, target: &Profile) -> Result<bool> {
     if let Some(live) = load_live_strict(store)? {
         let active = require_managed_profile(store, &live)?;
-        store.sync_profile(active, &live)?;
         if active.id == target.id {
             return Ok(false);
         }
@@ -1306,9 +1275,8 @@ fn activate(store: &mut Store, target: &Profile) -> Result<bool> {
 }
 
 fn install_profile(store: &Store, target: &Profile) -> Result<()> {
-    let credential = store.credential(target)?;
-    store.write_active(&credential)?;
-    let installed = Credential::read(&store.paths().active_auth())?;
+    store.activate_profile(target)?;
+    let installed = store.credential(target)?;
     if installed.facts.account_id != target.account_id {
         bail!(
             "credential activation verification failed for {}",
@@ -1319,38 +1287,18 @@ fn install_profile(store: &Store, target: &Profile) -> Result<()> {
 }
 
 fn restore_original_active(store: &Store, original: Option<&Profile>) -> Result<()> {
-    let sync_result = match load_live(store) {
-        LiveAuth::Absent => Ok(()),
-        LiveAuth::Present(credential) => match managed_profile(store, &credential).cloned() {
-            Some(profile) => store.sync_profile(&profile, &credential),
-            None => Err(anyhow!(
-                "the temporary Codex credential is no longer an enrolled account; its refreshed token could not be saved"
-            )),
-        },
-        LiveAuth::Invalid(err) => {
-            Err(err).context("the temporary Codex credential became unreadable")
-        }
-    };
-    let restore_result = match original {
+    match original {
         Some(profile) => install_profile(store, profile),
         None => store.remove_active(),
-    };
-
-    match (sync_result, restore_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(sync_err), Ok(())) => Err(sync_err).context(
-            "restored the original credential but could not save the temporary credential",
-        ),
-        (Ok(()), Err(restore_err)) => Err(restore_err),
-        (Err(sync_err), Err(restore_err)) => bail!(
-            "could not save the temporary credential: {sync_err:#}; could not restore the original credential: {restore_err:#}"
-        ),
     }
 }
 
 fn load_live(store: &Store) -> LiveAuth {
     match fs::symlink_metadata(store.paths().active_auth()) {
-        Ok(_) => match Credential::read(&store.paths().active_auth()) {
+        Ok(_) => match store.active_profile_path().and_then(|path| {
+            let _lock = auth_lock::acquire(&path)?;
+            Credential::read(&path)
+        }) {
             Ok(credential) => LiveAuth::Present(credential),
             Err(err) => LiveAuth::Invalid(err),
         },
@@ -1503,7 +1451,7 @@ mod tests {
     }
 
     #[test]
-    fn switching_saves_the_live_rotated_token_before_installing_next() {
+    fn switching_reuses_the_canonical_profile_without_reconciliation() {
         let (_root, mut store) = setup();
         let alice = store
             .insert_profile(&credential("alice@example.com", "alice-id", "alice-old"))
@@ -1511,6 +1459,7 @@ mod tests {
         let bob = store
             .insert_profile(&credential("bob@example.com", "bob-id", "bob-token"))
             .unwrap();
+        store.activate_profile(&alice).unwrap();
         store
             .write_active(&credential("alice@example.com", "alice-id", "alice-new"))
             .unwrap();
@@ -1528,7 +1477,7 @@ mod tests {
         );
         assert!(activate(&mut store, &alice).unwrap());
         assert_eq!(
-            Credential::read(&store.paths().active_auth())
+            Credential::read(&store.active_profile_path().unwrap())
                 .unwrap()
                 .facts
                 .account_id,
@@ -1537,45 +1486,24 @@ mod tests {
     }
 
     #[test]
-    fn supervised_recovery_does_not_overwrite_a_newer_vault_credential() {
-        let (_root, mut source_store) = setup();
-        let source = credential("alice@example.com", "alice-id", "alice-source");
-        let alice = source_store.insert_profile(&source).unwrap();
-        source_store.write_active(&source).unwrap();
-        let source_paths = source_store.paths().clone();
-        let home = SupervisedAuthHome::with_credential(&source_paths, &source).unwrap();
-        let session_paths = source_paths.with_active_auth(home.auth_path()).unwrap();
-        let session_store = Store::open_session(session_paths, &source_paths.codex_home).unwrap();
-        session_store
-            .write_active(&credential(
-                "alice@example.com",
-                "alice-id",
-                "alice-session-refresh",
-            ))
+    fn supervised_recovery_uses_the_profile_as_its_canonical_auth_file() {
+        let (_root, mut store) = setup();
+        let alice = store
+            .insert_profile(&credential("alice@example.com", "alice-id", "alice-source"))
             .unwrap();
-        let newer = credential("alice@example.com", "alice-id", "alice-newer-vault");
-        source_store.sync_profile(&alice, &newer).unwrap();
-        let mut recovery = QuotaRecovery {
-            source_paths: Some(source_paths),
-            supervised_auth_home: Some(home),
-            active_source: Some(source),
-            sqlite_home: None,
-            finished: false,
-        };
-
-        recovery
-            .reconcile_session_credential(&session_store)
-            .unwrap();
+        assert!(activate(&mut store, &alice).unwrap());
 
         assert_eq!(
-            source_store.credential(&alice).unwrap().as_bytes(),
-            newer.as_bytes()
+            store.active_profile_path().unwrap(),
+            store.profile_auth_path(&alice)
         );
+        let refreshed = credential("alice@example.com", "alice-id", "alice-refreshed");
+        store.sync_profile(&alice, &refreshed).unwrap();
         assert_eq!(
-            Credential::read(&session_store.paths().active_auth())
+            Credential::read(&store.active_profile_path().unwrap())
                 .unwrap()
                 .as_bytes(),
-            newer.as_bytes()
+            refreshed.as_bytes()
         );
     }
 
@@ -1597,7 +1525,7 @@ mod tests {
 
         assert!(format!("{error:#}").contains("not enrolled"));
         assert_eq!(
-            Credential::read(&store.paths().active_auth())
+            Credential::read(&store.active_profile_path().unwrap())
                 .unwrap()
                 .facts
                 .account_id,
@@ -1713,7 +1641,7 @@ mod tests {
         assert_eq!(store.profiles().len(), 1);
         assert_eq!(store.profiles()[0].email, "bob@example.com");
         assert_eq!(
-            Credential::read(&store.paths().active_auth())
+            Credential::read(&store.active_profile_path().unwrap())
                 .unwrap()
                 .facts
                 .account_id,
