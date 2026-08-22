@@ -236,6 +236,8 @@ pub fn countdown_has_not_started(snapshot: &Snapshot, now: i64) -> bool {
 async fn run_app_server(codex: &Path, codex_home: &Path, auth_file: &Path) -> Result<Snapshot> {
     let mut command = Command::new(codex);
     command
+        .arg("--auth-file")
+        .arg(auth_file)
         .args([
             "app-server",
             "--stdio",
@@ -248,7 +250,7 @@ async fn run_app_server(codex: &Path, codex_home: &Path, auth_file: &Path) -> Re
         .env_remove("CODEX_ACCESS_TOKEN")
         .env_remove("CODEX_API_KEY")
         .env_remove("OPENAI_API_KEY")
-        .env("CODEX_AUTH_FILE", auth_file)
+        .env_remove("CODEX_AUTH_FILE")
         .current_dir(codex_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

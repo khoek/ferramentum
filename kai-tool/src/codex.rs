@@ -25,7 +25,8 @@ const RESTORE_INPUT_HANDOFF_FLAG: &str = "--restore-input-handoff";
 const INPUT_HANDOFF_FORMAT: &str = "codex+k-input-handoff";
 const INPUT_HANDOFF_VERSION: u8 = 1;
 const MAX_INPUT_HANDOFF_BYTES: u64 = 16 * 1024 * 1024;
-const AUTH_FILE_ENV_VAR: &str = "CODEX_AUTH_FILE";
+const AUTH_FILE_FLAG: &str = "--auth-file";
+const LEGACY_AUTH_FILE_ENV_VAR: &str = "CODEX_AUTH_FILE";
 const EXTERNAL_AUTH_ENV_VARS: &[&str] = &["CODEX_ACCESS_TOKEN", "CODEX_API_KEY", "OPENAI_API_KEY"];
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -89,7 +90,7 @@ impl Launcher {
     fn from_binary(binary: PathBuf) -> Result<Self> {
         let output = Command::new(&binary)
             .arg("--version")
-            .env_remove(AUTH_FILE_ENV_VAR)
+            .env_remove(LEGACY_AUTH_FILE_ENV_VAR)
             .stdin(Stdio::null())
             .stderr(Stdio::piped())
             .output()
@@ -280,7 +281,7 @@ fn run_direct(binary: &Path, args: &[OsString], cwd: &Path) -> Result<u8> {
     command
         .args(args)
         .env(GIT_TERMINAL_PROMPT_ENV, "0")
-        .env_remove(AUTH_FILE_ENV_VAR)
+        .env_remove(LEGACY_AUTH_FILE_ENV_VAR)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -358,14 +359,15 @@ fn run_pty_session(
         .openpty(initial_size)
         .context("could not open a pseudo-terminal for Codex")?;
     let mut command = CommandBuilder::new(binary);
+    if let Some(auth_file) = environment.auth_file {
+        command.arg(AUTH_FILE_FLAG);
+        command.arg(auth_file);
+    }
     command.args(args);
     command.env(GIT_TERMINAL_PROMPT_ENV, "0");
     command.env("CODEX_HOME", environment.codex_home);
     command.env("CODEX_SQLITE_HOME", environment.sqlite_home);
-    command.env_remove(AUTH_FILE_ENV_VAR);
-    if let Some(auth_file) = environment.auth_file {
-        command.env(AUTH_FILE_ENV_VAR, auth_file);
-    }
+    command.env_remove(LEGACY_AUTH_FILE_ENV_VAR);
     for name in EXTERNAL_AUTH_ENV_VARS {
         command.env_remove(name);
     }
@@ -1353,12 +1355,14 @@ fn main() {{
             format!(
                 concat!(
                     "{} {} {} {}\n",
-                    "resume {} {} {} {} --model gpt-5.6 {} model_provider=\"openai\" {} service_tier=\"default\" {} model_reasoning_effort=\"xhigh\"\n"
+                    "{} {} resume {} {} {} {} --model gpt-5.6 {} model_provider=\"openai\" {} service_tier=\"default\" {} model_reasoning_effort=\"xhigh\"\n"
                 ),
                 APPROVAL_BYPASS_FLAG,
                 CONFIG_OVERRIDE_FLAG,
                 FAST_SERVICE_TIER_OVERRIDE,
                 EXIT_ON_QUOTA_FLAG,
+                AUTH_FILE_FLAG,
+                root.path().join("rotated-auth.json").display(),
                 thread_id,
                 START_IMMEDIATELY_FLAG,
                 APPROVAL_BYPASS_FLAG,

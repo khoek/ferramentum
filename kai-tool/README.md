@@ -38,7 +38,7 @@ kai cred remove work@example.com
 `kai cred list` fetches every account's current Codex quota concurrently and shows the remaining
 percentage, relative time until reset, and an inline progress bar. Usable rate-limit reset credits
 are shown with their count and latest relative expiry. Every lookup runs `codex app-server` in its
-own temporary configuration-only `CODEX_HOME` while `CODEX_AUTH_FILE` points directly at that
+own temporary configuration-only `CODEX_HOME` with `--auth-file` pointing directly at that
 account's canonical vault file, so accounts are checked in parallel without swapping the live
 account or making quota API calls directly from Kai. Transient failures are retried up to three
 total attempts through this same lookup path for every command that polls quota. Codex can refresh
@@ -124,10 +124,11 @@ Already-running Codex processes may retain their previous credential in memory. 
 
 Automatically supervised +k agents keep the user's canonical `CODEX_HOME`, SQLite state, and
 per-account credential files. Each child receives the selected profile's canonical path through the
-custom Codex `CODEX_AUTH_FILE` variable; sessions, configuration, plugins, skills, and rollout
-paths stay in the normal `CODEX_HOME`. Quota recovery switches that canonical path between child
-restarts using the same cyclic account selection as `kai next`. When a different selected account
-has confirmed remaining quota and the systemwide account is separately confirmed exhausted, Kai
+custom Codex `--auth-file` option; sessions, configuration, plugins, skills, and rollout paths stay
+in the normal `CODEX_HOME`. Codex keeps the selection process-local, so tool subprocesses cannot
+inherit it. Quota recovery switches that canonical path between child restarts using the same
+cyclic account selection as `kai next`. When a different selected account has confirmed remaining
+quota and the systemwide account is separately confirmed exhausted, Kai
 promotes the selected account to the global `auth.json` link while holding the credential lock.
 Because every +k process locks the resolved canonical file across reload → refresh → persist,
 another Codex instance cannot replay a stale rotating refresh token. At startup Kai also repairs

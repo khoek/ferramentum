@@ -19,8 +19,8 @@ const AUTH_CONFIG_KEYS: &[&str] = &[
 /// A short-lived Codex home that cannot affect the user's active account.
 ///
 /// The home contains only minimal auth/network configuration by default. Enrollment can seed an
-/// `auth.json` here for a login flow; quota workers instead point `CODEX_AUTH_FILE` at an enrolled
-/// canonical profile and leave this home auth-free. `TempDir` removes the home on drop.
+/// `auth.json` here for a login flow; quota workers instead pass an enrolled canonical profile to
+/// Codex with `--auth-file` and leave this home auth-free. `TempDir` removes the home on drop.
 pub struct IsolatedCodexHome {
     directory: TempDir,
 }
