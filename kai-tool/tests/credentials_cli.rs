@@ -340,7 +340,7 @@ fn reset_credit(status: &str, expires_at: Option<&str>) -> serde_json::Value {
     });
     json!({
         "id": id,
-        "resetType": "codex_rate_limits",
+        "resetType": "codexRateLimits",
         "status": status,
         "grantedAt": 1_751_322_400_i64,
         "expiresAt": expires_at

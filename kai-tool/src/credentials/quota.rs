@@ -87,9 +87,25 @@ struct ResetCreditsSummary {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ResetCredit {
-    reset_type: String,
-    status: String,
+    reset_type: ResetType,
+    status: ResetCreditStatus,
     expires_at: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum ResetType {
+    CodexRateLimits,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum ResetCreditStatus {
+    Available,
+    #[serde(other)]
+    Unavailable,
 }
 
 #[derive(Debug, Deserialize)]
@@ -518,7 +534,9 @@ impl ResetCreditsSummary {
 
 impl ResetCredit {
     fn usable_expiry(self, now: i64) -> Option<Option<i64>> {
-        if self.reset_type != "codex_rate_limits" || self.status != "available" {
+        if self.reset_type != ResetType::CodexRateLimits
+            || self.status != ResetCreditStatus::Available
+        {
             return None;
         }
         match self.expires_at {
@@ -552,12 +570,12 @@ mod tests {
                 "availableCount": 2,
                 "credits": [
                     {
-                        "resetType": "codex_rate_limits",
+                        "resetType": "codexRateLimits",
                         "status": "available",
                         "expiresAt": 2_100_000_000_i64
                     },
                     {
-                        "resetType": "codex_rate_limits",
+                        "resetType": "codexRateLimits",
                         "status": "redeemed",
                         "expiresAt": 2_200_000_000_i64
                     }
