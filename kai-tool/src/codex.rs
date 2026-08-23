@@ -20,6 +20,7 @@ const CONFIG_OVERRIDE_FLAG: &str = "-c";
 const DEFAULT_SERVICE_TIER_OVERRIDE: &str = "service_tier=default";
 const FAST_SERVICE_TIER_OVERRIDE: &str = "service_tier=fast";
 const EXIT_ON_QUOTA_FLAG: &str = "--exit-on-quota-exceeded";
+const QUOTA_EXCEEDED_EXIT_CODE: u8 = 75;
 const START_IMMEDIATELY_FLAG: &str = "--start-immediately";
 const RESTORE_INPUT_HANDOFF_FLAG: &str = "--restore-input-handoff";
 const INPUT_HANDOFF_FORMAT: &str = "codex+k-input-handoff";
@@ -316,6 +317,7 @@ fn recovery_args(recovery: QuotaRecovery) -> Vec<OsString> {
     args
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum PtyOutcome {
     Exited(u8),
     QuotaExceeded(QuotaRecovery),
@@ -443,13 +445,7 @@ fn run_pty_session(
     if let Some(error) = observation.error() {
         bail!("could not relay Codex terminal output: {error}");
     }
-    if let Some(recovery) = observation.quota_recovery()? {
-        return Ok(PtyOutcome::QuotaExceeded(recovery));
-    }
-
-    Ok(PtyOutcome::Exited(
-        u8::try_from(status.exit_code()).unwrap_or(1),
-    ))
+    observation.outcome(status.exit_code())
 }
 
 struct SupervisedIo {
@@ -753,46 +749,50 @@ impl OutputObservation {
         self.error.clone()
     }
 
-    fn quota_recovery(&self) -> Result<Option<QuotaRecovery>> {
-        quota_recovery_from_tail(&self.tail)
+    fn outcome(&self, exit_code: u32) -> Result<PtyOutcome> {
+        if exit_code == u32::from(QUOTA_EXCEEDED_EXIT_CODE) {
+            return Ok(PtyOutcome::QuotaExceeded(
+                quota_recovery_from_tail(&self.tail).with_context(|| {
+                    format!(
+                        "+k Codex exited with quota status {QUOTA_EXCEEDED_EXIT_CODE} without usable recovery data"
+                    )
+                })?,
+            ));
+        }
+        Ok(PtyOutcome::Exited(u8::try_from(exit_code).unwrap_or(1)))
     }
 }
 
-fn quota_recovery_from_tail(tail: &[u8]) -> Result<Option<QuotaRecovery>> {
-    let tail = tail
-        .strip_suffix(b"\r\n")
-        .or_else(|| tail.strip_suffix(b"\n"));
-    let Some(tail) = tail else {
-        return Ok(None);
-    };
-    let final_line_start = tail
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
-    let final_line = &tail[final_line_start..];
+fn quota_recovery_from_tail(tail: &[u8]) -> Result<QuotaRecovery> {
     let prefix = b"codex+k (";
-    let Some(start) = final_line
-        .windows(prefix.len())
-        .rposition(|window| window == prefix)
-    else {
-        return Ok(None);
-    };
-    let marker = std::str::from_utf8(&final_line[start..])
-        .context("+k quota recovery marker was not UTF-8")?;
-    let marker = marker
-        .strip_prefix("codex+k (")
-        .expect("marker start was located by its prefix");
-    let Some((thread_id, payload)) = marker.split_once("): quota exceeded ") else {
-        if marker.ends_with("): quota exceeded") {
-            bail!("+k quota recovery marker did not include recovery settings");
-        }
-        return Ok(None);
-    };
+    let marker = tail
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .find_map(|line| {
+            line.windows(prefix.len())
+                .rposition(|window| window == prefix)
+                .map(|start| &line[start + prefix.len()..])
+        })
+        .context("+k quota recovery marker was not found in captured output")?;
+    let delimiter = b"): quota exceeded";
+    let delimiter_start = marker
+        .windows(delimiter.len())
+        .position(|window| window == delimiter)
+        .context("+k quota recovery marker was malformed")?;
+    let thread_id = std::str::from_utf8(&marker[..delimiter_start])
+        .context("+k quota recovery marker thread ID was not UTF-8")?;
     if !valid_uuid(thread_id) {
         bail!("+k quota recovery marker contained invalid thread ID `{thread_id}`");
     }
-    let payload: QuotaRecoveryPayload =
-        serde_json::from_str(payload).context("could not parse +k quota recovery settings")?;
+    let payload = &marker[delimiter_start + delimiter.len()..];
+    let Some(payload) = payload.strip_prefix(b" ") else {
+        bail!("+k quota recovery marker did not include recovery settings");
+    };
+    let payload: QuotaRecoveryPayload = serde_json::Deserializer::from_slice(payload)
+        .into_iter()
+        .next()
+        .context("+k quota recovery marker did not include recovery settings")?
+        .context("could not parse +k quota recovery settings")?;
     let recovery = match payload.version {
         1 => {
             if payload.resume_args.is_empty() {
@@ -841,7 +841,7 @@ fn quota_recovery_from_tail(tail: &[u8]) -> Result<Option<QuotaRecovery>> {
         }
         version => bail!("unsupported +k quota recovery settings version {version}"),
     };
-    Ok(Some(recovery))
+    Ok(recovery)
 }
 
 fn read_input_handoff_header(path: &Path) -> Result<InputHandoffHeader> {
@@ -906,16 +906,25 @@ mod tests {
     }
 
     #[test]
-    fn parses_only_a_terminal_final_quota_marker_with_recovery_arguments() {
+    fn parses_the_latest_quota_marker_before_trailing_terminal_output() {
+        let old_thread_id = "123e4567-e89b-12d3-a456-426614174001";
         let thread_id = "123e4567-e89b-12d3-a456-426614174000";
         let payload =
             r#"{"version":1,"resume_args":["--model","gpt-5.6","-c","service_tier=\"fast\""]}"#;
         let output = format!(
-            "old screen text\x1b[?1049l\x1b[?25hcodex+k ({thread_id}): quota exceeded {payload}\r\n"
+            concat!(
+                "codex+k ({old_thread_id}): quota exceeded {payload}\r",
+                "old screen text\x1b[?1049l\x1b[?25h",
+                "codex+k ({thread_id}): quota exceeded {payload}\x1b[?25h\r\n",
+                "\r\nlate terminal cleanup"
+            ),
+            old_thread_id = old_thread_id,
+            payload = payload,
+            thread_id = thread_id
         );
         assert_eq!(
             quota_recovery_from_tail(output.as_bytes()).unwrap(),
-            Some(QuotaRecovery {
+            QuotaRecovery {
                 thread_id: thread_id.to_string(),
                 resume_args: vec![
                     "--model".to_string(),
@@ -924,15 +933,7 @@ mod tests {
                     "service_tier=\"fast\"".to_string(),
                 ],
                 handoff_path: None,
-            })
-        );
-        assert_eq!(
-            quota_recovery_from_tail(
-                format!("codex+k ({thread_id}): quota exceeded {payload}\r\nmore output")
-                    .as_bytes()
-            )
-            .unwrap(),
-            None
+            }
         );
         assert!(
             quota_recovery_from_tail(
@@ -950,6 +951,41 @@ mod tests {
             .to_string()
             .contains("did not include recovery settings")
         );
+    }
+
+    #[test]
+    fn quota_status_requires_a_valid_recovery_marker() {
+        let mut missing = OutputObservation::new();
+        missing.process(b"ordinary Codex output\r\n");
+        let missing_error = missing
+            .outcome(u32::from(QUOTA_EXCEEDED_EXIT_CODE))
+            .unwrap_err();
+        assert!(
+            format!("{missing_error:#}").contains(
+                "+k Codex exited with quota status 75 without usable recovery data: +k quota recovery marker was not found"
+            )
+        );
+
+        let mut malformed = OutputObservation::new();
+        malformed.process(
+            b"codex+k (123e4567-e89b-12d3-a456-426614174000): quota exceeded not-json\r\n",
+        );
+        let malformed_error = malformed
+            .outcome(u32::from(QUOTA_EXCEEDED_EXIT_CODE))
+            .unwrap_err();
+        assert!(
+            format!("{malformed_error:#}").contains("could not parse +k quota recovery settings")
+        );
+    }
+
+    #[test]
+    fn nonquota_status_ignores_marker_looking_output() {
+        let mut observation = OutputObservation::new();
+        observation.process(
+            b"codex+k (123e4567-e89b-12d3-a456-426614174000): quota exceeded not-json\r\n",
+        );
+
+        assert_eq!(observation.outcome(0).unwrap(), PtyOutcome::Exited(0));
     }
 
     #[test]
@@ -1010,10 +1046,14 @@ mod tests {
             "handoff_path": handoff_path,
         });
         let output = format!("codex+k ({thread_id}): quota exceeded {marker}\r\n");
+        let mut observation = OutputObservation::new();
+        observation.process(output.as_bytes());
 
         assert_eq!(
-            quota_recovery_from_tail(output.as_bytes()).unwrap(),
-            Some(QuotaRecovery {
+            observation
+                .outcome(u32::from(QUOTA_EXCEEDED_EXIT_CODE))
+                .unwrap(),
+            PtyOutcome::QuotaExceeded(QuotaRecovery {
                 thread_id: thread_id.to_string(),
                 resume_args: vec!["--model".to_string(), "gpt-5.6".to_string()],
                 handoff_path: Some(handoff_path),
@@ -1299,6 +1339,9 @@ fn main() {{
 
     if count == 1 {{
         println!("codex+k ({thread_id}): quota exceeded {{}}", {recovery_payload});
+        println!("\x1b[?25h");
+        println!("late terminal cleanup");
+        std::process::exit(75);
     }}
 }}
 "#,

@@ -21,6 +21,7 @@ const APP_SERVER_TIMEOUT: Duration = Duration::from_secs(15);
 const APP_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const APP_SERVER_RETRY_DELAY: Duration = Duration::from_millis(100);
 const APP_SERVER_ATTEMPTS: usize = 3;
+const RATE_LIMIT_READ_ATTEMPTS: usize = 3;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_RPC_MESSAGES: usize = 1_000;
 const UNSTARTED_COUNTDOWN_SECONDS: i64 = 7 * 24 * 60 * 60;
@@ -354,13 +355,22 @@ where
     .await?;
     let _ = read_rpc_response(&mut reader, 0).await?;
     write_rpc(writer, &json!({"method": "initialized"})).await?;
-    write_rpc(
-        writer,
-        &json!({"method": "account/rateLimits/read", "id": 1}),
-    )
-    .await?;
-    let result = read_rpc_response(&mut reader, 1).await?;
-    serde_json::from_value(result).context("Codex app-server returned invalid rate-limit data")
+    for request_id in 1..=RATE_LIMIT_READ_ATTEMPTS {
+        let request_id = request_id as i64;
+        write_rpc(
+            writer,
+            &json!({"method": "account/rateLimits/read", "id": request_id}),
+        )
+        .await?;
+        let response = serde_json::from_value::<RateLimitsResponse>(
+            read_rpc_response(&mut reader, request_id).await?,
+        )
+        .context("Codex app-server returned invalid rate-limit data")?;
+        if !response.reset_credit_details_are_incomplete() {
+            return Ok(response);
+        }
+    }
+    bail!("Codex app-server repeatedly returned reset-credit availability without details")
 }
 
 async fn write_rpc<W>(writer: &mut W, message: &Value) -> Result<()>
@@ -475,6 +485,12 @@ fn process_failure(status: Option<&ExitStatus>, stderr: &[u8]) -> String {
 }
 
 impl RateLimitsResponse {
+    fn reset_credit_details_are_incomplete(&self) -> bool {
+        self.rate_limit_reset_credits
+            .as_ref()
+            .is_some_and(|summary| summary.available_count > 0 && summary.credits.is_none())
+    }
+
     fn into_snapshot(self) -> Result<Snapshot> {
         let window = self
             .rate_limits
@@ -553,7 +569,74 @@ fn credential_fingerprint(credential: &Credential) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
+
+    #[test]
+    fn retries_count_only_reset_credit_responses_until_details_arrive() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let quota_result = |credits: Value| {
+                    json!({
+                        "rateLimits": {
+                            "primary": {
+                                "usedPercent": 100,
+                                "windowDurationMins": 300,
+                                "resetsAt": 2_000_000_000_i64
+                            },
+                            "secondary": null
+                        },
+                        "rateLimitResetCredits": {
+                            "availableCount": 1,
+                            "credits": credits
+                        }
+                    })
+                };
+                let responses = [
+                    json!({"id": 0, "result": {}}),
+                    json!({"id": 1, "result": quota_result(Value::Null)}),
+                    json!({
+                        "id": 2,
+                        "result": quota_result(json!([{
+                            "resetType": "codexRateLimits",
+                            "status": "available",
+                            "expiresAt": 2_100_000_000_i64
+                        }]))
+                    }),
+                ]
+                .into_iter()
+                .map(|response| format!("{response}\n"))
+                .collect::<String>();
+                let mut requests = Vec::new();
+
+                let snapshot =
+                    exchange_messages(&mut requests, BufReader::new(Cursor::new(responses)))
+                        .await
+                        .unwrap()
+                        .into_snapshot()
+                        .unwrap();
+
+                assert_eq!(
+                    snapshot.rate_limit_reset_credits,
+                    Some(ResetCredits {
+                        available_count: 1,
+                        latest_expires_at: Some(2_100_000_000),
+                    })
+                );
+                let requests = String::from_utf8(requests)
+                    .unwrap()
+                    .lines()
+                    .map(|request| serde_json::from_str::<Value>(request).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(requests.len(), 4);
+                assert_eq!(requests[2]["id"], 1);
+                assert_eq!(requests[3]["id"], 2);
+            });
+    }
 
     #[test]
     fn converts_app_server_rate_limits_and_usable_reset_credits() {
