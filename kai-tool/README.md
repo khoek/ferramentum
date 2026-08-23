@@ -16,8 +16,8 @@ Installed command: `kai`
 Enroll each Codex account once, then switch without logging the previous account out:
 
 ```bash
-kai cred add personal@example.com
-kai cred add work@example.com
+kai cred add                    # import the current account or sign in
+kai cred add --device-auth     # enroll another account with device auth
 kai cred list
 kai cred tickle
 kai cred fix
@@ -63,14 +63,15 @@ home directory, waits for and discards the response, and restores the original a
 afterward. Refreshed credentials are saved during each switch, and the original credential is
 restored even when a probe fails.
 
-`kai cred add` runs `codex login` with a temporary, isolated `CODEX_HOME`, verifies that the
-resulting account has the requested email, and then imports its file-backed credential. The
-credential currently used by Codex is not replaced or logged out during enrollment. Kai selects
+`kai cred add` runs `codex login` with a temporary, isolated `CODEX_HOME`, reads the account email
+from the resulting file-backed credential, and imports it. If Codex is already using an
+unenrolled account, Kai imports that credential directly. The credential currently used by Codex
+is not replaced or logged out during enrollment. Kai selects
 Codex's device-code flow automatically for SSH sessions, CI, and Linux sessions without a graphical
 display. A configured `$BROWSER` relay and WSL browser interop retain the browser flow. Use
 `--browser-auth` or `--device-auth` to force either behavior.
 
-Rerun `kai cred add <email> --force` to reauthenticate an already-enrolled account. Kai replaces
+Rerun `kai cred add --force` to reauthenticate the account selected by the completed login. Kai replaces
 the credential only after both its email and account/workspace ID match the enrolled profile, and
 preserves whether it was active unless `--activate` is also supplied. `kai cred fix` checks all
 enrolled credentials concurrently and starts isolated sign-ins only for credentials that are

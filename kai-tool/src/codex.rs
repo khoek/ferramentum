@@ -251,10 +251,12 @@ fn prompt_no_quota_retry(
             return Err(error).context("could not read quota retry confirmation");
         }
     };
-    prompt.finish_with_message(format!(
+    prompt.finish_and_clear();
+    crate::terminal::write_stderr_line(&format!(
         "{NO_QUOTA_RETRY_PROMPT} {}",
         if answer { "yes" } else { "no" }
-    ));
+    ))
+    .context("could not finish quota retry prompt")?;
     Ok(answer)
 }
 
@@ -457,11 +459,28 @@ struct SupervisedIo {
 
 impl SupervisedIo {
     fn terminal() -> Self {
+        let stdin_terminal = io::stdin().is_terminal();
+        let stdout_terminal = io::stdout().is_terminal();
+        let stderr_terminal = io::stderr().is_terminal();
+        // Interactive Codex output and Kai's recovery/status messages must share one terminal
+        // stream.  Keep stdout when it is being piped so callers still receive Codex output
+        // there, even if stdin and stderr are interactive.
+        let use_stderr = stdin_terminal && stdout_terminal && stderr_terminal;
+        let output_terminal = if use_stderr {
+            stderr_terminal
+        } else {
+            stdout_terminal
+        };
+        let output: Box<dyn Write + Send> = if use_stderr {
+            Box::new(io::stderr())
+        } else {
+            Box::new(io::stdout())
+        };
         Self {
             input: Box::new(io::stdin()),
-            output: Arc::new(Mutex::new(Box::new(io::stdout()))),
-            raw_terminal: io::stdin().is_terminal() && io::stdout().is_terminal(),
-            prompt_terminal: io::stdin().is_terminal() && io::stderr().is_terminal(),
+            output: Arc::new(Mutex::new(output)),
+            raw_terminal: stdin_terminal && output_terminal,
+            prompt_terminal: stdin_terminal && stderr_terminal,
         }
     }
 }
@@ -626,9 +645,10 @@ struct RawModeGuard {
 
 impl RawModeGuard {
     fn enter(enabled: bool) -> Result<Self> {
+        // crossterm tracks only mode changes made by this process; inspect the pty itself so an
+        // outer terminal UI's raw mode remains owned by that UI.
         let already_raw = enabled
-            && crossterm::terminal::is_raw_mode_enabled()
-                .context("could not inspect terminal input mode")?;
+            && crate::terminal::stdin_is_raw().context("could not inspect terminal input mode")?;
         if enabled && !already_raw {
             crossterm::terminal::enable_raw_mode()
                 .context("could not enable raw terminal input")?;

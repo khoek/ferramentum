@@ -3,6 +3,7 @@
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
+use std::mem::MaybeUninit;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -553,6 +554,14 @@ fn automatic_recovery_prompts_and_rechecks_when_no_account_has_quota() {
             pixel_height: 0,
         })
         .unwrap();
+    // Reproduce the nested Codex/tmux case: the parent UI has already put its pty in raw mode
+    // before Kai starts, so Kai must detect and preserve that inherited mode.
+    let fd = pair.master.as_raw_fd().unwrap();
+    let mut termios = MaybeUninit::<libc::termios>::uninit();
+    assert_eq!(unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) }, 0);
+    let mut termios = unsafe { termios.assume_init() };
+    unsafe { libc::cfmakeraw(&mut termios) };
+    assert_eq!(unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) }, 0);
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_kai"));
     command.args(["--quota-auto-restart", "yes", "a"]);
     command.cwd(&workspace);
@@ -603,6 +612,15 @@ fn automatic_recovery_prompts_and_rechecks_when_no_account_has_quota() {
         status.success(),
         "kai failed with output: {}",
         String::from_utf8_lossy(&output.lock().unwrap())
+    );
+    let output = String::from_utf8_lossy(&output.lock().unwrap()).into_owned();
+    assert!(
+        output.contains("Checking enrolled account quotas\r\n"),
+        "status stage was not terminated as a line: {output:?}"
+    );
+    assert!(
+        output.contains(&format!("{prompt} yes\r\n")),
+        "finished quota prompt was not terminated as a line: {output:?}"
     );
     assert_eq!(fs::read_to_string(agent_log).unwrap(), "alice-id\nbob-id\n");
     // The successful retry also checks the still-active systemwide account.

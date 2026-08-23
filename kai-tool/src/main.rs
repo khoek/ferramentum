@@ -1,5 +1,6 @@
 mod codex;
 mod credentials;
+mod terminal;
 
 use std::collections::{BTreeSet, HashSet};
 use std::ffi::OsString;
@@ -614,7 +615,10 @@ fn main() -> ExitCode {
     match run() {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("{err:#}");
+            let message = format!("{err:#}");
+            if terminal::write_stderr_line(&message).is_err() {
+                eprintln!("{message}");
+            }
             ExitCode::from(1)
         }
     }

@@ -483,18 +483,19 @@ fn help_orders_commands_logically_and_exposes_the_account_workflow() {
 
     Command::cargo_bin("kai")
         .unwrap()
-        .args([
-            "cred",
-            "add",
-            "person@example.com",
-            "--device-auth",
-            "--browser-auth",
-        ])
+        .args(["cred", "add", "--device-auth", "--browser-auth"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
             "cannot be used with '--browser-auth'",
         ));
+
+    Command::cargo_bin("kai")
+        .unwrap()
+        .args(["cred", "add", "person@example.com"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[cfg(unix)]
@@ -517,7 +518,7 @@ fn add_automatically_uses_device_auth_over_ssh() {
         .env_remove("CI")
         .env_remove("DISPLAY")
         .env_remove("WAYLAND_DISPLAY")
-        .args(["cred", "add", "bob@example.com"])
+        .args(["cred", "add"])
         .assert()
         .success()
         .stderr(predicate::str::contains(
@@ -547,7 +548,7 @@ fn browser_auth_explicitly_overrides_remote_environment_detection() {
         .env_remove("BROWSER")
         .env_remove("DISPLAY")
         .env_remove("WAYLAND_DISPLAY")
-        .args(["cred", "add", "bob@example.com", "--browser-auth"])
+        .args(["cred", "add", "--browser-auth"])
         .assert()
         .success()
         .stderr(predicate::str::contains("Using device-code authentication").not());
@@ -578,7 +579,10 @@ fn add_force_reauthenticates_an_existing_account_without_changing_its_active_sta
     let path = fake_codex_path(root.path(), &enrolled_path);
 
     command(&credentials_home, &codex_home, &runtime_dir)
-        .args(["cred", "add", "bob@example.com"])
+        .env("PATH", &path)
+        .env("KAI_TEST_CREDENTIAL", &enrolled_path)
+        .env("KAI_TEST_ARGS", &args_path)
+        .args(["cred", "add"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("--force"));
@@ -587,13 +591,7 @@ fn add_force_reauthenticates_an_existing_account_without_changing_its_active_sta
         .env("PATH", &path)
         .env("KAI_TEST_CREDENTIAL", &enrolled_path)
         .env("KAI_TEST_ARGS", &args_path)
-        .args([
-            "cred",
-            "add",
-            "bob@example.com",
-            "--force",
-            "--browser-auth",
-        ])
+        .args(["cred", "add", "--force", "--browser-auth"])
         .assert()
         .success()
         .stderr(predicate::str::contains(
@@ -622,13 +620,7 @@ fn add_force_reauthenticates_an_existing_account_without_changing_its_active_sta
         .env("PATH", path)
         .env("KAI_TEST_CREDENTIAL", &enrolled_path)
         .env("KAI_TEST_ARGS", &args_path)
-        .args([
-            "cred",
-            "add",
-            "alice@example.com",
-            "--force",
-            "--browser-auth",
-        ])
+        .args(["cred", "add", "--force", "--browser-auth"])
         .assert()
         .success()
         .stderr(predicate::str::contains(
@@ -649,7 +641,7 @@ fn add_force_reauthenticates_an_existing_account_without_changing_its_active_sta
 
 #[cfg(unix)]
 #[test]
-fn add_force_rejects_a_different_account_workspace_identity() {
+fn add_force_rejects_identity_mismatches() {
     let root = tempdir().unwrap();
     let credentials_home = root.path().join("credentials");
     let codex_home = root.path().join("codex");
@@ -675,16 +667,10 @@ fn add_force_rejects_a_different_account_workspace_identity() {
         .join(format!("{}.json", profile_id("alice@example.com")));
 
     command(&credentials_home, &codex_home, &runtime_dir)
-        .env("PATH", path)
+        .env("PATH", &path)
         .env("KAI_TEST_CREDENTIAL", &enrolled_path)
         .env("KAI_TEST_ARGS", &args_path)
-        .args([
-            "cred",
-            "add",
-            "alice@example.com",
-            "--force",
-            "--browser-auth",
-        ])
+        .args(["cred", "add", "--force", "--browser-auth"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -694,7 +680,28 @@ fn add_force_rejects_a_different_account_workspace_identity() {
         fs::read(codex_home.join("auth.json")).unwrap(),
         original_active
     );
-    assert_eq!(fs::read(profile_path).unwrap(), original_active);
+    assert_eq!(fs::read(&profile_path).unwrap(), original_active);
+
+    fs::write(
+        &enrolled_path,
+        auth_json("other@example.com", "alice-id", "new-refresh"),
+    )
+    .unwrap();
+    command(&credentials_home, &codex_home, &runtime_dir)
+        .env("PATH", &path)
+        .env("KAI_TEST_CREDENTIAL", &enrolled_path)
+        .env("KAI_TEST_ARGS", &args_path)
+        .args(["cred", "add", "--force", "--browser-auth"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "credential email does not match the enrolled profile",
+        ));
+    assert_eq!(
+        fs::read(codex_home.join("auth.json")).unwrap(),
+        original_active
+    );
+    assert_eq!(fs::read(&profile_path).unwrap(), original_active);
 }
 
 #[cfg(unix)]
@@ -1459,7 +1466,7 @@ fn add_activates_the_new_account_when_the_current_quota_is_exhausted() {
         .env("PATH", server.path())
         .env("KAI_TEST_CREDENTIAL", &enrolled_path)
         .env("KAI_TEST_ARGS", &args_path)
-        .args(["cred", "add", "bob@example.com", "--browser-auth"])
+        .args(["cred", "add", "--browser-auth"])
         .assert()
         .success()
         .stderr(predicate::str::contains(concat!(
@@ -1494,7 +1501,7 @@ fn complete_rotation_preserves_a_live_refreshed_credential() {
     fs::write(codex_home.join("auth.json"), &alice_original).unwrap();
 
     command(&credentials_home, &codex_home, &runtime_dir)
-        .args(["cred", "add", "alice@example.com"])
+        .args(["cred", "add"])
         .assert()
         .success()
         .stderr(predicate::str::contains(
@@ -1510,7 +1517,7 @@ fn complete_rotation_preserves_a_live_refreshed_credential() {
         .env("PATH", quota_server.path())
         .env("KAI_TEST_CREDENTIAL", &enrolled_path)
         .env("KAI_TEST_ARGS", &args_path)
-        .args(["cred", "add", "bob@example.com"])
+        .args(["cred", "add"])
         .assert()
         .success()
         .stderr(predicate::str::contains("Enrolled bob@example.com"));

@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 use super::auth::Credential;
 use super::isolated_home::IsolatedCodexHome;
 use super::paths::RuntimePaths;
+use super::ui;
 use anyhow::{Context, Result, bail};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,38 +35,43 @@ struct LoginEnvironment {
     wsl_browser_interop: bool,
 }
 
-pub fn run(
+pub fn run(paths: &RuntimePaths, preference: AuthPreference) -> Result<Credential> {
+    let codex = which::which("codex").context("could not find `codex` on PATH")?;
+    run_with_binary(paths, preference, &codex)
+}
+
+/// Run an isolated login and require that the credential belongs to the requested account.
+///
+/// `kai cred fix` uses this stricter path.  Plain enrollment deliberately trusts the identity
+/// embedded in the credential file produced by Codex; `kai cred add --force` validates it against
+/// the selected profile before replacing that profile.
+pub fn run_for_email(
     paths: &RuntimePaths,
     expected_email: &str,
     preference: AuthPreference,
 ) -> Result<Credential> {
-    let codex = which::which("codex").context("could not find `codex` on PATH")?;
-    run_with_binary(paths, expected_email, preference, &codex)
+    let credential = run(paths, preference)?;
+    ensure_expected_email(credential, expected_email)
 }
 
 fn run_with_binary(
     paths: &RuntimePaths,
-    expected_email: &str,
     preference: AuthPreference,
     codex: &Path,
 ) -> Result<Credential> {
     let auth = resolve_auth(preference, LoginEnvironment::current());
     let temporary_home = IsolatedCodexHome::create(paths, "enroll")?;
 
-    capulus::ui::stage(&format!(
-        "Starting isolated Codex sign-in for {expected_email}"
-    ));
+    ui::stage("Starting isolated Codex sign-in");
     if let ResolvedAuth::Device {
         automatic_reason: Some(reason),
     } = auth
     {
-        capulus::ui::detail(&format!(
+        ui::detail(&format!(
             "Using device-code authentication ({reason}); use `--browser-auth` to override."
         ));
     }
-    capulus::ui::detail(
-        "The account currently active in Codex will not be logged out or replaced.",
-    );
+    ui::detail("The account currently active in Codex will not be logged out or replaced.");
 
     let mut command = Command::new(codex);
     command
@@ -95,6 +101,10 @@ fn run_with_binary(
     let credential = temporary_home
         .credential()
         .context("Codex login completed but did not produce a file-backed ChatGPT credential")?;
+    Ok(credential)
+}
+
+fn ensure_expected_email(credential: Credential, expected_email: &str) -> Result<Credential> {
     if !credential.matches_email(expected_email) {
         bail!(
             concat!(
@@ -235,11 +245,34 @@ mod tests {
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let credential =
-            run_with_binary(&paths, "new@example.com", AuthPreference::Browser, &script).unwrap();
+        let credential = run_with_binary(&paths, AuthPreference::Browser, &script).unwrap();
 
         assert_eq!(credential.facts.email, "new@example.com");
         assert_eq!(fs::read(paths.active_auth()).unwrap(), original);
+    }
+
+    #[test]
+    fn strict_login_matching_rejects_a_credential_for_another_email() {
+        let credential = Credential::from_bytes(auth_json(
+            "actual@example.com",
+            "account",
+            "pro",
+            2_000_000_000,
+            "refresh",
+        ))
+        .unwrap();
+
+        let error = ensure_expected_email(credential, "expected@example.com").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("signed in as actual@example.com")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("expected@example.com was requested")
+        );
     }
 
     #[test]

@@ -28,9 +28,9 @@ use self::ui::{AccountStatus, AccountView, ListView, QuotaStatus};
 #[derive(Debug, Args)]
 #[command(after_help = concat!(
     "Examples:\n",
-    "  kai cred add personal@example.com\n",
-    "  kai cred add work@example.com --device-auth\n",
-    "  kai cred add personal@example.com --force\n",
+    "  kai cred add\n",
+    "  kai cred add --device-auth\n",
+    "  kai cred add --force\n",
     "  kai cred fix\n",
     "  kai cred list\n",
     "  kai cred tickle\n",
@@ -71,8 +71,10 @@ pub enum CredCommand {
     #[command(
         about = "Enroll an account through an isolated Codex login.",
         long_about = concat!(
-            "Enroll an account through an isolated Codex login. If Codex is already using this ",
-            "email, Kai imports the current credential without opening a browser. Kai ",
+            "Enroll an account through an isolated Codex login. Kai reads the account email ",
+            "from the file-backed credential produced by Codex rather than requiring it as a ",
+            "command-line argument. If Codex is already using an unenrolled account, Kai imports ",
+            "the current credential without opening a browser. Kai ",
             "automatically uses device-code authentication in SSH, CI, and headless Linux ",
             "sessions; use --browser-auth or --device-auth to override detection. The new ",
             "account is activated when no account is active or the managed active account has ",
@@ -124,10 +126,6 @@ pub struct AuthFlowArgs {
 
 #[derive(Debug, Args)]
 pub struct AddArgs {
-    /// Email address expected from the completed Codex login.
-    #[arg(value_name = "EMAIL")]
-    pub email: String,
-
     #[command(flatten)]
     pub auth: AuthFlowArgs,
 
@@ -312,7 +310,7 @@ impl QuotaRecovery {
         let active_quota = match fetch_credential_quota(&primary, &live).await {
             Ok(snapshot) => snapshot,
             Err(err) => {
-                capulus::ui::warn(&format!(
+                ui::warn(&format!(
                     "Could not check whether {} has remaining quota; leaving it active: {err:#}",
                     active.email
                 ));
@@ -515,16 +513,14 @@ async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
 
     if !args.json {
         match live {
-            LiveAuth::Present(credential) if active_profile.is_none() => {
-                capulus::ui::warn(&format!(
-                    concat!(
-                        "Codex is signed in as {}, but that account is not enrolled. ",
-                        "Run `kai cred add {}` to preserve it before switching.",
-                    ),
-                    credential.facts.email, credential.facts.email
-                ))
-            }
-            LiveAuth::Invalid(err) => capulus::ui::warn(&format!(
+            LiveAuth::Present(credential) if active_profile.is_none() => ui::warn(&format!(
+                concat!(
+                    "Codex is signed in as {}, but that account is not enrolled. ",
+                    "Run `kai cred add` to preserve it before switching.",
+                ),
+                credential.facts.email
+            )),
+            LiveAuth::Invalid(err) => ui::warn(&format!(
                 "The active Codex credential could not be read: {err:#}"
             )),
             _ => {}
@@ -535,7 +531,7 @@ async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
 
 async fn cmd_tickle(store: &mut Store) -> Result<()> {
     if store.profiles().is_empty() {
-        bail!("no accounts are enrolled; run `kai cred add <email>` first");
+        bail!("no accounts are enrolled; run `kai cred add` first");
     }
 
     let live = load_live_strict(store)?;
@@ -547,7 +543,7 @@ async fn cmd_tickle(store: &mut Store) -> Result<()> {
         None => None,
     };
     let profile_indices = (0..store.profiles().len()).collect::<Vec<_>>();
-    capulus::ui::stage("Checking enrolled account quotas");
+    ui::stage("Checking enrolled account quotas");
     let checks = fetch_profile_quotas(store, &profile_indices, live.as_ref()).await?;
     let now = chrono::Utc::now().timestamp();
     let mut targets = Vec::new();
@@ -557,7 +553,7 @@ async fn cmd_tickle(store: &mut Store) -> Result<()> {
                 targets.push(store.profiles()[index].clone());
             }
             Ok(_) => {}
-            Err(err) => capulus::ui::warn(&format!(
+            Err(err) => ui::warn(&format!(
                 "Could not retrieve quota for {}: {err:#}",
                 store.profiles()[index].email
             )),
@@ -565,7 +561,7 @@ async fn cmd_tickle(store: &mut Store) -> Result<()> {
     }
 
     if targets.is_empty() {
-        capulus::ui::success("No enrolled credentials have an untouched seven-day countdown.");
+        ui::success("No enrolled credentials have an untouched seven-day countdown.");
         return Ok(());
     }
 
@@ -577,7 +573,7 @@ async fn cmd_tickle(store: &mut Store) -> Result<()> {
     } else {
         "credentials"
     };
-    capulus::ui::stage(&format!(
+    ui::stage(&format!(
         "Starting {} untouched seven-day quota {noun}",
         targets.len()
     ));
@@ -586,7 +582,7 @@ async fn cmd_tickle(store: &mut Store) -> Result<()> {
     let restore_result = restore_original_active(store, original_active.as_ref());
     match (tickle_result, restore_result) {
         (Ok(()), Ok(())) => {
-            capulus::ui::success(&format!(
+            ui::success(&format!(
                 "Tickled {} {noun} and restored the original Codex credential.",
                 targets.len()
             ));
@@ -612,9 +608,9 @@ fn tickle_profiles(
     for target in targets {
         activate(store, target)
             .with_context(|| format!("could not temporarily activate {}", target.email))?;
-        capulus::ui::detail(&format!("Tickling {}...", target.email));
+        ui::detail(&format!("Tickling {}...", target.email));
         if let Err(err) = run_codex_tickle(codex, home) {
-            capulus::ui::warn(&format!("Could not tickle {}: {err:#}", target.email));
+            ui::warn(&format!("Could not tickle {}: {err:#}", target.email));
             failures.push(target.email.clone());
         }
     }
@@ -670,7 +666,7 @@ async fn cmd_next(store: &mut Store) -> Result<()> {
     let selection = choose_next_selection_from(store, None).await?;
     let changed = activate(store, &selection.target)?;
     if changed {
-        capulus::ui::success(&format!("Codex is now using {}.", selection.target.email));
+        ui::success(&format!("Codex is now using {}.", selection.target.email));
         if store.uses_primary_codex_home() {
             warn_running_codex();
         }
@@ -683,10 +679,9 @@ async fn choose_next_selection_from(
     selected_active: Option<&Profile>,
 ) -> Result<NextSelection> {
     if store.profiles().is_empty() {
-        return Err(NoUsableQuota(
-            "no accounts are enrolled; run `kai cred add <email>` first".to_owned(),
-        )
-        .into());
+        return Err(
+            NoUsableQuota("no accounts are enrolled; run `kai cred add` first".to_owned()).into(),
+        );
     }
     let (live, active_index) = match selected_active {
         Some(active) => {
@@ -719,7 +714,7 @@ async fn choose_next_selection_from(
         }
     };
     let order = rotation_order(store.profiles().len(), active_index);
-    capulus::ui::stage("Checking enrolled account quotas");
+    ui::stage("Checking enrolled account quotas");
     let checks = fetch_profile_quotas(store, &order, live.as_ref()).await?;
     let candidates = checks
         .iter()
@@ -755,7 +750,7 @@ async fn choose_next_selection_from(
                 ui::print_reset_credit_notice(&target.email, reset_credits);
             }
         }
-        Err(err) => capulus::ui::warn(&format!(
+        Err(err) => ui::warn(&format!(
             "Could not retrieve quota for {}: {err:#}",
             target.email
         )),
@@ -918,35 +913,31 @@ fn cmd_activate(store: &mut Store, email: &str) -> Result<()> {
     validate_email(email)?;
     let target = store
         .find_profile(email)
-        .with_context(|| format!("{email} is not enrolled; run `kai cred add {email}` first"))?
+        .with_context(|| format!("{email} is not enrolled; run `kai cred add` first"))?
         .clone();
     let changed = activate(store, &target)?;
     if changed {
-        capulus::ui::success(&format!("Codex is now using {}.", target.email));
+        ui::success(&format!("Codex is now using {}.", target.email));
         warn_running_codex();
     } else {
-        capulus::ui::success(&format!("{} is already active.", target.email));
+        ui::success(&format!("{} is already active.", target.email));
     }
     Ok(())
 }
 
 async fn cmd_add(store: &mut Store, args: AddArgs) -> Result<()> {
-    let expected = args.email.trim();
-    validate_email(expected)?;
-    if let Some(target) = store.find_profile(expected).cloned() {
-        if !args.force {
-            bail!("{expected} is already enrolled; rerun with `--force` to reauthenticate it");
-        }
-        return repair_profile(store, &target, args.auth.auth_preference(), args.activate);
-    }
-
     let live = load_live(store);
+    // Preserve the existing signed-in account without forcing the user through another browser
+    // login when it is not enrolled yet.  Once an account is already managed, a plain `add`
+    // starts an isolated login so the user can select another account; `--force` then determines
+    // whether a credential returned for an enrolled account may replace it.
     if let LiveAuth::Present(credential) = &live
-        && credential.matches_email(expected)
+        && managed_profile(store, credential).is_none()
+        && store.find_profile(&credential.facts.email).is_none()
     {
         let profile = store.insert_profile(credential)?;
         store.activate_profile(&profile)?;
-        capulus::ui::success(&format!(
+        ui::success(&format!(
             "Imported the active Codex account {}.",
             profile.email
         ));
@@ -966,7 +957,31 @@ async fn cmd_add(store: &mut Store, args: AddArgs) -> Result<()> {
     if args.activate {
         ensure_live_can_be_replaced(store, &live)?;
     }
-    let credential = enroll::run(store.paths(), expected, args.auth.auth_preference())?;
+
+    // Plain enrollment trusts the email embedded in the credential file written by Codex.  The
+    // repair paths used by `cred fix` and `--force` retain strict profile identity checks.
+    let credential = enroll::run(store.paths(), args.auth.auth_preference())?;
+    let enrolled_email = credential.facts.email.clone();
+    if let Some(target) = store.find_profile(&enrolled_email).cloned() {
+        if !args.force {
+            bail!(
+                "{enrolled_email} is already enrolled; rerun with `kai cred add --force` to reauthenticate it"
+            );
+        }
+        return repair_profile_with_credential(store, &target, credential, args.activate);
+    }
+    if let Some(target) = store
+        .find_profile_by_account(&credential.facts.account_id)
+        .cloned()
+    {
+        if !args.force {
+            bail!(
+                "this Codex account is already enrolled as {}; rerun with `kai cred add --force` to reauthenticate it",
+                target.email
+            );
+        }
+        return repair_profile_with_credential(store, &target, credential, args.activate);
+    }
     let profile = store.insert_profile(&credential)?;
     let active_for_quota = if !args.activate {
         match (managed_account_before_add.as_deref(), load_live(store)) {
@@ -985,7 +1000,7 @@ async fn cmd_add(store: &mut Store, args: AddArgs) -> Result<()> {
             Ok(snapshot) if snapshot.remaining_percent <= 0.0 => Some(active.facts.email.clone()),
             Ok(_) => None,
             Err(err) => {
-                capulus::ui::warn(&format!(
+                ui::warn(&format!(
                     "Could not check whether {} has remaining quota; leaving it active: {err:#}",
                     active.facts.email
                 ));
@@ -1000,31 +1015,31 @@ async fn cmd_add(store: &mut Store, args: AddArgs) -> Result<()> {
     if activate_after_add {
         activate(store, &profile)?;
         if let Some(active_email) = exhausted_active {
-            capulus::ui::success(&format!(
+            ui::success(&format!(
                 "Enrolled and activated {} because {} has no remaining quota.",
                 profile.email, active_email
             ));
         } else {
-            capulus::ui::success(&format!("Enrolled and activated {}.", profile.email));
+            ui::success(&format!("Enrolled and activated {}.", profile.email));
         }
         warn_running_codex();
     } else {
-        capulus::ui::success(&format!("Enrolled {}.", profile.email));
+        ui::success(&format!("Enrolled {}.", profile.email));
         match live {
             LiveAuth::Present(active) if managed_profile(store, &active).is_some() => {
-                capulus::ui::detail(&format!(
+                ui::detail(&format!(
                     "{} remains active. Run `kai cred activate {}` when ready.",
                     active.facts.email, profile.email
                 ))
             }
-            LiveAuth::Present(active) => capulus::ui::detail(&format!(
+            LiveAuth::Present(active) => ui::detail(&format!(
                 concat!(
-                    "{} remains active but is not enrolled. Run `kai cred add {}` before switching ",
+                    "{} remains active but is not enrolled. Run `kai cred add` before switching ",
                     "so its latest refresh token is preserved.",
                 ),
-                active.facts.email, active.facts.email
+                active.facts.email
             )),
-            LiveAuth::Invalid(_) => capulus::ui::detail(&format!(
+            LiveAuth::Invalid(_) => ui::detail(&format!(
                 "Run `kai cred activate {}` after resolving the unreadable active Codex credential.",
                 profile.email
             )),
@@ -1036,13 +1051,13 @@ async fn cmd_add(store: &mut Store, args: AddArgs) -> Result<()> {
 
 async fn cmd_fix(store: &mut Store, args: FixArgs) -> Result<()> {
     if store.profiles().is_empty() {
-        bail!("no accounts are enrolled; run `kai cred add <email>` first");
+        bail!("no accounts are enrolled; run `kai cred add` first");
     }
 
-    capulus::ui::stage("Checking enrolled account credentials");
+    ui::stage("Checking enrolled account credentials");
     let live = load_live(store);
     let unreadable_active = if let LiveAuth::Invalid(err) = &live {
-        capulus::ui::warn(&format!(
+        ui::warn(&format!(
             "The active Codex credential is unreadable and cannot be matched to an enrolled account: {err:#}"
         ));
         Some(format!("{err:#}"))
@@ -1052,11 +1067,22 @@ async fn cmd_fix(store: &mut Store, args: FixArgs) -> Result<()> {
     let mut needs_repair = vec![false; store.profiles().len()];
     let mut indeterminate = 0;
     let mut check_indices = Vec::new();
+    let active_profile = match &live {
+        LiveAuth::Present(credential) => managed_profile(store, credential),
+        LiveAuth::Absent | LiveAuth::Invalid(_) => None,
+    };
     for (index, profile) in store.profiles().iter().enumerate() {
-        let structurally_valid = matches!(
-            &live,
-            LiveAuth::Present(credential) if credential.facts.account_id == profile.account_id
-        ) || store.credential(profile).is_ok();
+        let is_active_profile = active_profile.is_some_and(|active| active.id == profile.id);
+        let structurally_valid = if is_active_profile {
+            matches!(
+                &live,
+                LiveAuth::Present(credential)
+                    if credential.facts.account_id == profile.account_id
+                        && credential.matches_email(&profile.email)
+            )
+        } else {
+            store.credential(profile).is_ok()
+        };
         if structurally_valid {
             check_indices.push(index);
         } else {
@@ -1074,7 +1100,7 @@ async fn cmd_fix(store: &mut Store, args: FixArgs) -> Result<()> {
                 needs_repair[index] = true;
             } else {
                 indeterminate += 1;
-                capulus::ui::warn(&format!(
+                ui::warn(&format!(
                     "Could not determine whether {} needs authentication repair: {err:#}",
                     store.profiles()[index].email
                 ));
@@ -1091,9 +1117,9 @@ async fn cmd_fix(store: &mut Store, args: FixArgs) -> Result<()> {
         .collect::<Vec<_>>();
     if targets.is_empty() {
         if indeterminate == 0 && unreadable_active.is_none() {
-            capulus::ui::success("All enrolled account credentials appear usable.");
+            ui::success("All enrolled account credentials appear usable.");
         } else {
-            capulus::ui::detail("No credentials were repaired.");
+            ui::detail("No credentials were repaired.");
         }
     } else {
         let noun = if targets.len() == 1 {
@@ -1101,7 +1127,7 @@ async fn cmd_fix(store: &mut Store, args: FixArgs) -> Result<()> {
         } else {
             "credentials"
         };
-        capulus::ui::detail(&format!("Repairing {} broken {noun}.", targets.len()));
+        ui::detail(&format!("Repairing {} broken {noun}.", targets.len()));
         let preference = args.auth.auth_preference();
         for target in targets {
             confirm_fix_account(&target.email)?;
@@ -1112,7 +1138,7 @@ async fn cmd_fix(store: &mut Store, args: FixArgs) -> Result<()> {
         bail!(
             concat!(
                 "the active Codex credential remains unreadable and cannot be repaired ",
-                "automatically ({}); run `kai cred add <email> --force --activate` for the ",
+                "automatically ({}); run `kai cred add --force --activate` for the ",
                 "intended active account",
             ),
             err
@@ -1156,7 +1182,16 @@ fn repair_profile(
     if activate_target && !target_is_active {
         ensure_live_can_be_replaced(store, &live)?;
     }
-    let credential = enroll::run(store.paths(), &target.email, auth_preference)?;
+    let credential = enroll::run_for_email(store.paths(), &target.email, auth_preference)?;
+    repair_profile_with_credential(store, target, credential, activate_target)
+}
+
+fn repair_profile_with_credential(
+    store: &mut Store,
+    target: &Profile,
+    credential: Credential,
+    activate_target: bool,
+) -> Result<()> {
     if credential.facts.account_id != target.account_id {
         bail!(
             concat!(
@@ -1167,22 +1202,39 @@ fn repair_profile(
         );
     }
 
+    if !credential.matches_email(&target.email) {
+        bail!(
+            concat!(
+                "signed in as {}, but the credential email does not match the enrolled profile ",
+                "{}; the new credential was discarded and no credentials were changed",
+            ),
+            credential.facts.email,
+            target.email
+        );
+    }
+
+    let live = load_live(store);
     store.sync_profile(target, &credential)?;
+    let target_is_active = matches!(
+        &live,
+        LiveAuth::Present(active)
+            if active.facts.account_id == target.account_id
+    );
     if target_is_active {
-        capulus::ui::success(&format!(
+        ui::success(&format!(
             "Updated credentials for {} and refreshed the active Codex credential.",
             target.email
         ));
         warn_running_codex();
     } else if activate_target {
         activate(store, target)?;
-        capulus::ui::success(&format!(
+        ui::success(&format!(
             "Updated credentials for {} and activated it.",
             target.email
         ));
         warn_running_codex();
     } else {
-        capulus::ui::success(&format!("Updated credentials for {}.", target.email));
+        ui::success(&format!("Updated credentials for {}.", target.email));
     }
     Ok(())
 }
@@ -1224,7 +1276,7 @@ fn cmd_remove(store: &mut Store, args: RemoveArgs) -> Result<()> {
             false,
         )?
     {
-        capulus::ui::detail("No changes made.");
+        ui::detail("No changes made.");
         return Ok(());
     }
 
@@ -1245,7 +1297,7 @@ fn cmd_remove(store: &mut Store, args: RemoveArgs) -> Result<()> {
             let successor = successor.clone();
             activate(store, &successor)?;
             store.remove_profile(&target.id)?;
-            capulus::ui::success(&format!(
+            ui::success(&format!(
                 "Removed {}. Codex is now using {}.",
                 target.email, successor.email
             ));
@@ -1256,9 +1308,9 @@ fn cmd_remove(store: &mut Store, args: RemoveArgs) -> Result<()> {
     }
 
     store.remove_profile(&target.id)?;
-    capulus::ui::success(&format!("Removed {}.", target.email));
+    ui::success(&format!("Removed {}.", target.email));
     if target_is_active {
-        capulus::ui::detail("No accounts remain; Codex is locally signed out.");
+        ui::detail("No accounts remain; Codex is locally signed out.");
     }
     Ok(())
 }
@@ -1336,11 +1388,10 @@ fn require_managed_profile<'a>(store: &'a Store, credential: &Credential) -> Res
     }
     bail!(
         concat!(
-            "Codex is using {}, which is not enrolled. Run `kai cred add {}` before switching ",
+            "Codex is using {}, which is not enrolled. Run `kai cred add` before switching ",
             "so its latest refresh token is preserved",
         ),
         credential.facts.email,
-        credential.facts.email
     )
 }
 
@@ -1373,7 +1424,7 @@ fn warn_running_codex() {
         && count > 0
     {
         let noun = if count == 1 { "process" } else { "processes" };
-        capulus::ui::warn(&format!(
+        ui::warn(&format!(
             concat!(
                 "{} running Codex {} may still hold the previous credential in memory; ",
                 "restart them before continuing work.",

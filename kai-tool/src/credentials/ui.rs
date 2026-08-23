@@ -14,6 +14,10 @@ const ACTIVE_LABEL: &str = "active";
 const QUOTA_BAR_SEGMENTS: usize = 16;
 const USAGE_BAR_HALF_SEGMENTS: usize = 8;
 const USAGE_NEUTRAL_THRESHOLD: f64 = 0.2;
+const ANSI_BOLD_CYAN: &str = "\x1b[1;36m";
+const ANSI_BOLD_GREEN: &str = "\x1b[1;32m";
+const ANSI_BOLD_YELLOW: &str = "\x1b[1;33m";
+const ANSI_RESET: &str = "\x1b[0m";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum DurationUnit {
@@ -144,6 +148,41 @@ pub fn print_list(view: &ListView, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Print a credential status line without relying on the parent pty to translate `\n` to
+/// `\r\n`.  This matters when Kai is nested inside another terminal UI that has already enabled
+/// raw mode.
+fn print_raw_line(message: &str) -> bool {
+    if !crate::terminal::stderr_needs_crlf() {
+        return false;
+    }
+    let _ = crate::terminal::write_stderr_line(message);
+    true
+}
+
+pub fn stage(message: &str) {
+    if !print_raw_line(&format!("{ANSI_BOLD_CYAN}==>{ANSI_RESET} {message}")) {
+        capulus::ui::stage(message);
+    }
+}
+
+pub fn warn(message: &str) {
+    if !print_raw_line(&format!("{ANSI_BOLD_YELLOW}warning:{ANSI_RESET} {message}")) {
+        capulus::ui::warn(message);
+    }
+}
+
+pub fn detail(message: &str) {
+    if !print_raw_line(&format!("    {message}")) {
+        capulus::ui::detail(message);
+    }
+}
+
+pub fn success(message: &str) {
+    if !print_raw_line(&format!("{ANSI_BOLD_GREEN}ok:{ANSI_RESET} {message}")) {
+        capulus::ui::success(message);
+    }
+}
+
 fn render_list(view: &ListView, json: bool) -> Result<String> {
     if json {
         return Ok(format!("{}\n", serde_json::to_string_pretty(view)?));
@@ -151,7 +190,7 @@ fn render_list(view: &ListView, json: bool) -> Result<String> {
     if view.accounts.is_empty() {
         return Ok(concat!(
             "No Codex accounts enrolled.\n",
-            "Run `kai cred add <email>` to import the current account or enroll a new one.\n",
+            "Run `kai cred add` to import the current account or enroll a new one.\n",
         )
         .to_owned());
     }
@@ -176,7 +215,7 @@ fn render_list(view: &ListView, json: bool) -> Result<String> {
 }
 
 pub fn print_quota(snapshot: &quota::Snapshot) {
-    capulus::ui::detail(&format!(
+    detail(&format!(
         "Quota: {}",
         render_quota(snapshot, &stderr_render_target())
     ));
@@ -197,12 +236,15 @@ pub fn print_reset_credit_notice(email: &str, reset_credits: &quota::ResetCredit
             )
         })
         .unwrap_or_default();
-    eprintln!(
+    let message = format!(
         "{} {email} has no remaining quota, but {} usable rate-limit reset {noun} available{expiry}. \
          Run `/usage` in Codex to redeem one.",
         stderr_render_target().paint("notice:", Color::Cyan),
         reset_credits.available_count,
     );
+    if !print_raw_line(&message) {
+        eprintln!("{message}");
+    }
 }
 
 fn render_live_account(bar: &ProgressBar, account: &AccountView, email_width: usize) {
