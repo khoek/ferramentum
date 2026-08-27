@@ -416,6 +416,24 @@ fn seed_account_set(
     .unwrap();
 }
 
+fn account_enabled_states(credentials_home: &Path) -> Vec<(String, bool)> {
+    let state: serde_json::Value = serde_json::from_slice(
+        &fs::read(credentials_home.join("state.json")).expect("credential state should exist"),
+    )
+    .unwrap();
+    state["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|profile| {
+            (
+                profile["email"].as_str().unwrap().to_owned(),
+                profile["enabled"].as_bool().unwrap_or(true),
+            )
+        })
+        .collect()
+}
+
 #[cfg(unix)]
 fn fake_codex_path(root: &Path, credential: &Path) -> std::ffi::OsString {
     let fake_bin = root.join("bin");
@@ -479,7 +497,9 @@ fn help_orders_commands_logically_and_exposes_the_account_workflow() {
         .stdout(predicate::str::contains("fix"))
         .stdout(predicate::str::contains("tickle"))
         .stdout(predicate::str::contains("next"))
-        .stdout(predicate::str::contains("activate"));
+        .stdout(predicate::str::contains("activate"))
+        .stdout(predicate::str::contains("enable"))
+        .stdout(predicate::str::contains("disable"));
 
     Command::cargo_bin("kai")
         .unwrap()
@@ -496,6 +516,85 @@ fn help_orders_commands_logically_and_exposes_the_account_workflow() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("unexpected argument"));
+}
+
+#[test]
+fn enable_and_disable_persist_plain_and_exclusive_states() {
+    let root = tempdir().unwrap();
+    let credentials_home = root.path().join("credentials");
+    let codex_home = root.path().join("codex");
+    let runtime_dir = root.path().join("runtime");
+    seed_account_set(
+        &credentials_home,
+        &codex_home,
+        "https://example.test/backend-api",
+        &[
+            ("alice@example.com", "alice-id", "alice-refresh"),
+            ("bob@example.com", "bob-id", "bob-refresh"),
+            ("carol@example.com", "carol-id", "carol-refresh"),
+        ],
+        Some(("alice@example.com", "alice-id", "alice-live")),
+    );
+
+    command(&credentials_home, &codex_home, &runtime_dir)
+        .args(["cred", "disable", "alice@example.com"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Disabled alice@example.com"));
+    assert_eq!(
+        account_enabled_states(&credentials_home),
+        vec![
+            ("alice@example.com".to_owned(), false),
+            ("bob@example.com".to_owned(), true),
+            ("carol@example.com".to_owned(), true),
+        ]
+    );
+
+    command(&credentials_home, &codex_home, &runtime_dir)
+        .args(["cred", "enable", "alice@example.com"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Enabled alice@example.com"));
+    assert_eq!(
+        account_enabled_states(&credentials_home),
+        vec![
+            ("alice@example.com".to_owned(), true),
+            ("bob@example.com".to_owned(), true),
+            ("carol@example.com".to_owned(), true),
+        ]
+    );
+
+    command(&credentials_home, &codex_home, &runtime_dir)
+        .args(["cred", "enable", "bob@example.com", "--exclusive"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Enabled bob@example.com exclusively",
+        ));
+    assert_eq!(
+        account_enabled_states(&credentials_home),
+        vec![
+            ("alice@example.com".to_owned(), false),
+            ("bob@example.com".to_owned(), true),
+            ("carol@example.com".to_owned(), false),
+        ]
+    );
+
+    command(&credentials_home, &codex_home, &runtime_dir)
+        .args(["cred", "disable", "--exclusive", "bob@example.com"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Disabled bob@example.com exclusively",
+        ));
+    assert_eq!(
+        account_enabled_states(&credentials_home),
+        vec![
+            ("alice@example.com".to_owned(), true),
+            ("bob@example.com".to_owned(), false),
+            ("carol@example.com".to_owned(), true),
+        ]
+    );
 }
 
 #[cfg(unix)]
@@ -1278,6 +1377,57 @@ fn tickle_restores_the_active_credential_after_a_codex_failure() {
         auth_json("bob@example.com", "bob-id", "bob-live")
     );
     assert_eq!(server.finish().len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn disabled_accounts_cannot_be_activated_or_selected_by_next() {
+    let root = tempdir().unwrap();
+    let credentials_home = root.path().join("credentials");
+    let codex_home = root.path().join("codex");
+    let runtime_dir = root.path().join("runtime");
+    let server = MockQuotaServer::start_with_quotas(
+        1,
+        Duration::ZERO,
+        &[("bob-id", 10.0), ("carol-id", 40.0)],
+    );
+    seed_account_set(
+        &credentials_home,
+        &codex_home,
+        &server.base_url,
+        &[
+            ("alice@example.com", "alice-id", "alice-refresh"),
+            ("bob@example.com", "bob-id", "bob-refresh"),
+            ("carol@example.com", "carol-id", "carol-refresh"),
+        ],
+        Some(("alice@example.com", "alice-id", "alice-live")),
+    );
+
+    command(&credentials_home, &codex_home, &runtime_dir)
+        .args(["cred", "disable", "bob@example.com"])
+        .assert()
+        .success();
+
+    command(&credentials_home, &codex_home, &runtime_dir)
+        .args(["cred", "activate", "bob@example.com"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bob@example.com is disabled"))
+        .stderr(predicate::str::contains("kai cred enable bob@example.com"));
+
+    command(&credentials_home, &codex_home, &runtime_dir)
+        .env("PATH", server.path())
+        .arg("next")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Codex is now using carol@example.com",
+        ));
+    assert_eq!(server.finish().len(), 1);
+    assert_eq!(
+        fs::read(codex_home.join("auth.json")).unwrap(),
+        auth_json("carol@example.com", "carol-id", "carol-refresh")
+    );
 }
 
 #[cfg(unix)]

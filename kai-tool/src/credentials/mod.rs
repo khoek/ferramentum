@@ -37,6 +37,8 @@ use self::ui::{AccountStatus, AccountView, ListView, QuotaStatus};
     "  kai cred tickle\n",
     "  kai next\n",
     "  kai cred activate personal@example.com\n",
+    "  kai cred enable personal@example.com\n",
+    "  kai cred disable --exclusive work@example.com\n",
     "  kai cred remove work@example.com",
 ))]
 pub struct CredArgs {
@@ -68,6 +70,12 @@ pub enum CredCommand {
 
     #[command(about = "Activate an enrolled account.")]
     Activate(AccountArgs),
+
+    #[command(about = "Enable an enrolled account for credential rotation.")]
+    Enable(EnableDisableArgs),
+
+    #[command(about = "Disable an enrolled account from credential rotation.")]
+    Disable(EnableDisableArgs),
 
     #[command(
         about = "Enroll an account through an isolated Codex login.",
@@ -112,6 +120,17 @@ pub struct AccountArgs {
     /// Email address of the enrolled Codex account.
     #[arg(value_name = "EMAIL")]
     pub email: String,
+}
+
+#[derive(Debug, Args)]
+pub struct EnableDisableArgs {
+    /// Email address of the enrolled Codex account.
+    #[arg(value_name = "EMAIL")]
+    pub email: String,
+
+    /// Set every other enrolled account to the opposite state.
+    #[arg(long)]
+    pub exclusive: bool,
 }
 
 #[derive(Debug, Args)]
@@ -382,6 +401,8 @@ async fn run_async(command: CredCommand) -> Result<()> {
         CredCommand::Tickle => cmd_tickle(&mut store).await,
         CredCommand::Next => cmd_next(&mut store).await,
         CredCommand::Activate(args) => cmd_activate(&mut store, &args.email),
+        CredCommand::Enable(args) => cmd_set_enabled(&mut store, args, true),
+        CredCommand::Disable(args) => cmd_set_enabled(&mut store, args, false),
         CredCommand::Add(args) => cmd_add(&mut store, args).await,
         CredCommand::Fix(args) => cmd_fix(&mut store, args).await,
         CredCommand::Remove(args) => cmd_remove(&mut store, args),
@@ -444,6 +465,7 @@ async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
                 AccountView {
                     email: profile.email.clone(),
                     active,
+                    enabled: profile.enabled,
                     plan: None,
                     last_refresh: None,
                     status: AccountStatus::Invalid {
@@ -497,7 +519,7 @@ async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
         }
     }
     if can_select_next {
-        let order = rotation_order(store.profiles().len(), active_index);
+        let order = enabled_rotation_order(store.profiles(), active_index);
         view.next = random_preferred_rotation_index(order.iter().copied().map(|index| {
             (
                 index,
@@ -543,7 +565,12 @@ async fn cmd_tickle(store: &mut Store) -> Result<()> {
         }
         None => None,
     };
-    let profile_indices = (0..store.profiles().len()).collect::<Vec<_>>();
+    let profile_indices = store
+        .profiles()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, profile)| profile.enabled.then_some(index))
+        .collect::<Vec<_>>();
     ui::stage("Checking enrolled account quotas");
     let checks = fetch_profile_quotas(store, &profile_indices, live.as_ref()).await?;
     let now = chrono::Utc::now().timestamp();
@@ -656,6 +683,7 @@ fn ready_account_view(
     AccountView {
         email: profile.email.clone(),
         active,
+        enabled: profile.enabled,
         plan: facts.plan,
         last_refresh: facts.last_refresh,
         status: AccountStatus::Ready,
@@ -714,7 +742,15 @@ async fn choose_next_selection_from(
             (live, active_index)
         }
     };
-    let order = rotation_order(store.profiles().len(), active_index);
+    let order = enabled_rotation_order(store.profiles(), active_index);
+    if order.is_empty() {
+        let scope = if active_index.is_some() && store.profiles().len() > 1 {
+            "no other enrolled account is enabled"
+        } else {
+            "no enrolled account is enabled"
+        };
+        return Err(NoUsableQuota(format!("{scope}; run `kai cred enable EMAIL` first")).into());
+    }
     ui::stage("Checking enrolled account quotas");
     let checks = fetch_profile_quotas(store, &order, live.as_ref()).await?;
     let candidates = checks
@@ -840,6 +876,13 @@ fn rotation_order(profile_count: usize, active_index: Option<usize>) -> Vec<usiz
     }
 }
 
+fn enabled_rotation_order(profiles: &[Profile], active_index: Option<usize>) -> Vec<usize> {
+    rotation_order(profiles.len(), active_index)
+        .into_iter()
+        .filter(|index| profiles[*index].enabled)
+        .collect()
+}
+
 fn random_preferred_rotation_index(
     candidates: impl IntoIterator<Item = (usize, QuotaAvailability)>,
 ) -> Option<usize> {
@@ -933,6 +976,31 @@ fn cmd_activate(store: &mut Store, email: &str) -> Result<()> {
         warn_running_codex();
     } else {
         ui::success(&format!("{} is already active.", target.email));
+    }
+    Ok(())
+}
+
+fn cmd_set_enabled(store: &mut Store, args: EnableDisableArgs, enabled: bool) -> Result<()> {
+    validate_email(&args.email)?;
+    let target = store
+        .find_profile(&args.email)
+        .with_context(|| format!("{} is not enrolled; run `kai cred add` first", args.email))?
+        .clone();
+    let changed = store.set_profile_enabled(&target.id, enabled, args.exclusive)?;
+
+    if args.exclusive {
+        let target_state = if enabled { "Enabled" } else { "Disabled" };
+        let other_state = if enabled { "disabled" } else { "enabled" };
+        ui::success(&format!(
+            "{target_state} {} exclusively; all other enrolled accounts are {other_state}.",
+            target.email
+        ));
+    } else if changed {
+        let state = if enabled { "Enabled" } else { "Disabled" };
+        ui::success(&format!("{state} {}.", target.email));
+    } else {
+        let state = if enabled { "enabled" } else { "disabled" };
+        ui::success(&format!("{} is already {state}.", target.email));
     }
     Ok(())
 }
@@ -1322,12 +1390,23 @@ fn cmd_remove(store: &mut Store, args: RemoveArgs) -> Result<()> {
     store.remove_profile(&target.id)?;
     ui::success(&format!("Removed {}.", target.email));
     if target_is_active {
-        ui::detail("No accounts remain; Codex is locally signed out.");
+        if store.profiles().is_empty() {
+            ui::detail("No accounts remain; Codex is locally signed out.");
+        } else {
+            ui::detail("No enabled accounts remain; Codex is locally signed out.");
+        }
     }
     Ok(())
 }
 
 fn activate(store: &mut Store, target: &Profile) -> Result<bool> {
+    if !target.enabled {
+        bail!(
+            "{} is disabled; run `kai cred enable {}` before activating it",
+            target.email,
+            target.email
+        );
+    }
     if let Some(live) = load_live_strict(store)? {
         let active = require_managed_profile(store, &live)?;
         if active.id == target.id {
@@ -1428,7 +1507,9 @@ fn next_profile_excluding<'a>(store: &'a Store, removed: &Profile) -> Option<&'a
         .profiles()
         .iter()
         .position(|profile| profile.id == removed.id)?;
-    store.profiles().get((index + 1) % store.profiles().len())
+    (1..store.profiles().len())
+        .map(|offset| &store.profiles()[(index + offset) % store.profiles().len()])
+        .find(|profile| profile.enabled)
 }
 
 fn warn_running_codex() {
@@ -1605,6 +1686,28 @@ mod tests {
     }
 
     #[test]
+    fn rotation_and_activation_ignore_disabled_accounts() {
+        let (_root, mut store) = setup();
+        let alice = store
+            .insert_profile(&credential("alice@example.com", "alice-id", "alice-token"))
+            .unwrap();
+        let bob = store
+            .insert_profile(&credential("bob@example.com", "bob-id", "bob-token"))
+            .unwrap();
+        store
+            .insert_profile(&credential("carol@example.com", "carol-id", "carol-token"))
+            .unwrap();
+        store.set_profile_enabled(&bob.id, false, false).unwrap();
+        let bob = store.find_profile(&bob.email).unwrap().clone();
+
+        assert_eq!(enabled_rotation_order(store.profiles(), Some(0)), vec![2]);
+        let error = activate(&mut store, &bob).unwrap_err();
+        assert!(format!("{error:#}").contains("bob@example.com is disabled"));
+        assert!(!store.paths().active_auth().exists());
+        assert!(alice.enabled);
+    }
+
+    #[test]
     fn supervised_rotation_classifies_only_no_usable_quota() {
         assert_eq!(
             classify_account_rotation(Err(NoUsableQuota("none available".to_owned()).into()))
@@ -1704,14 +1807,18 @@ mod tests {
     }
 
     #[test]
-    fn removing_the_active_profile_activates_its_successor() {
+    fn removing_the_active_profile_activates_its_next_enabled_successor() {
         let (_root, mut store) = setup();
         let alice = store
             .insert_profile(&credential("alice@example.com", "alice-id", "alice-token"))
             .unwrap();
-        store
+        let bob = store
             .insert_profile(&credential("bob@example.com", "bob-id", "bob-token"))
             .unwrap();
+        store
+            .insert_profile(&credential("carol@example.com", "carol-id", "carol-token"))
+            .unwrap();
+        store.set_profile_enabled(&bob.id, false, false).unwrap();
         store
             .write_active(&credential("alice@example.com", "alice-id", "alice-live"))
             .unwrap();
@@ -1725,14 +1832,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(store.profiles().len(), 1);
-        assert_eq!(store.profiles()[0].email, "bob@example.com");
+        assert_eq!(store.profiles().len(), 2);
         assert_eq!(
             Credential::read(&store.active_profile_path().unwrap())
                 .unwrap()
                 .facts
                 .account_id,
-            "bob-id"
+            "carol-id"
         );
     }
 }

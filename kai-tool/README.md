@@ -21,19 +21,28 @@ kai cred add --device-auth     # enroll another account with device auth
 kai cred list
 kai cred tickle
 kai cred fix
+kai cred disable work@example.com
+kai cred enable work@example.com
 kai next
 ```
 
-`kai next` is shorthand for `kai cred next`. It checks candidate accounts concurrently in cyclic
-enrollment order and activates the first account with confirmed remaining quota. If none has
-remaining quota, accounts with usable rate-limit reset credits are eligible before accounts whose
-quota could not be checked. Exhausted accounts without reset credits and credentials rejected by
-the service are skipped. You can also select or remove an account explicitly:
+`kai next` is shorthand for `kai cred next`. It checks enabled candidate accounts concurrently and
+randomly activates one of the accounts with confirmed remaining quota. If none has remaining
+quota, accounts with usable rate-limit reset credits are eligible before accounts whose quota
+could not be checked. Exhausted accounts without reset credits, disabled accounts, and credentials
+rejected by the service are skipped. You can also select or remove an account explicitly:
 
 ```bash
 kai cred activate personal@example.com
 kai cred remove work@example.com
 ```
+
+`kai cred disable EMAIL` excludes an account from manual and automatic rotation, and
+`kai cred activate` refuses to select it until `kai cred enable EMAIL` is run. Disabled accounts
+remain enrolled and appear struck through in an interactive `kai cred list`. Disabling the active
+account does not switch it immediately. Pass `--exclusive` to either command to apply the requested
+state to the named account and the opposite state to every other enrolled account; for example,
+`kai cred enable --exclusive personal@example.com` leaves only that account enabled.
 
 `kai cred list` fetches every account's current Codex quota concurrently and shows the remaining
 percentage, relative time until reset, and an inline progress bar. Usable rate-limit reset credits
@@ -57,7 +66,8 @@ behind the clock, while negative values mean it is ahead of the clock. Values wi
 yellow, lower values are red, and higher values are green.
 
 `kai cred tickle` starts those untouched seven-day countdowns. It temporarily activates each
-matching credential in enrollment order, runs an ephemeral Codex request whose complete prompt is
+matching enabled credential in enrollment order, runs an ephemeral Codex request whose complete
+prompt is
 ``What is the current system `gcc` version? (Reply with only the version number.)`` from the user's
 home directory, waits for and discards the response, and restores the original active credential
 afterward. Refreshed credentials are saved during each switch, and the original credential is
@@ -89,9 +99,9 @@ Before every switch, Kai validates the live canonical profile and atomically cha
 canonical account file without any copy/reconcile step. Kai never invokes `codex logout`, so
 switching does not deliberately revoke the previous credential.
 
-`kai cred list --json` emits stable, secret-free output for scripts, including each quota's
-remaining percentage, reset timestamp, window length, and any usable reset-credit count and latest
-expiry.
+`kai cred list --json` emits stable, secret-free output for scripts, including each account's
+enabled state, quota remaining percentage, reset timestamp, window length, and any usable
+reset-credit count and latest expiry.
 
 ### Vault location and security
 
@@ -128,8 +138,8 @@ per-account credential files. Each child receives the selected profile's canonic
 custom Codex `--auth-file` option; sessions, configuration, plugins, skills, and rollout paths stay
 in the normal `CODEX_HOME`. Codex keeps the selection process-local, so tool subprocesses cannot
 inherit it. Quota recovery switches that canonical path between child restarts using the same
-cyclic account selection as `kai next`. When a different selected account has confirmed remaining
-quota and the systemwide account is separately confirmed exhausted, Kai
+random enabled-account selection as `kai next`. When a different selected account has confirmed
+remaining quota and the systemwide account is separately confirmed exhausted, Kai
 promotes the selected account to the global `auth.json` link while holding the credential lock.
 Because every +k process locks the resolved canonical file across reload → refresh → persist,
 another Codex instance cannot replay a stale rotating refresh token. At startup Kai also repairs

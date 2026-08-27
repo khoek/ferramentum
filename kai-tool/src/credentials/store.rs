@@ -24,6 +24,12 @@ pub struct Profile {
     pub email: String,
     pub account_id: String,
     pub enrolled_at: u64,
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 impl Profile {
@@ -36,6 +42,7 @@ impl Profile {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            enabled: true,
         }
     }
 }
@@ -126,6 +133,52 @@ impl Store {
             .profiles
             .iter()
             .find(|profile| profile.account_id == account_id)
+    }
+
+    pub fn set_profile_enabled(
+        &mut self,
+        profile_id: &str,
+        enabled: bool,
+        exclusive: bool,
+    ) -> Result<bool> {
+        if !self
+            .state
+            .profiles
+            .iter()
+            .any(|profile| profile.id == profile_id)
+        {
+            bail!("profile disappeared while updating its enabled state");
+        }
+
+        let previous = self
+            .state
+            .profiles
+            .iter()
+            .map(|profile| profile.enabled)
+            .collect::<Vec<_>>();
+        for profile in &mut self.state.profiles {
+            if profile.id == profile_id {
+                profile.enabled = enabled;
+            } else if exclusive {
+                profile.enabled = !enabled;
+            }
+        }
+        let changed = self
+            .state
+            .profiles
+            .iter()
+            .zip(&previous)
+            .any(|(profile, previous)| profile.enabled != *previous);
+        if !changed {
+            return Ok(false);
+        }
+        if let Err(err) = self.save_state() {
+            for (profile, enabled) in self.state.profiles.iter_mut().zip(previous) {
+                profile.enabled = enabled;
+            }
+            return Err(err);
+        }
+        Ok(true)
     }
 
     pub fn credential(&self, profile: &Profile) -> Result<Credential> {

@@ -2,7 +2,7 @@ use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
 
 use anyhow::Result;
-use capulus::ui::{Color, RenderTarget, stderr_render_target, stdout_render_target};
+use capulus::ui::{Color, RenderTarget, TextEffect, stderr_render_target, stdout_render_target};
 use chrono::Utc;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::Serialize;
@@ -45,6 +45,7 @@ pub struct ListView {
 pub struct AccountView {
     pub email: String,
     pub active: bool,
+    pub enabled: bool,
     pub plan: Option<String>,
     pub last_refresh: Option<String>,
     pub status: AccountStatus,
@@ -354,11 +355,13 @@ fn render_account_base(
         }
     }
     let padded_email = format!("{:email_width$}", account.email);
-    let rendered_email = if highlight_countdown {
-        target.paint(&padded_email, Color::Yellow)
+    let email_color = highlight_countdown.then_some(Color::Yellow);
+    let email_effect = if account.enabled {
+        TextEffect::None
     } else {
-        padded_email
+        TextEffect::Strikethrough
     };
+    let rendered_email = target.style(&padded_email, email_color, email_effect);
     format!(
         "{} {}{}{}",
         target.paint(bullet, color),
@@ -744,13 +747,36 @@ mod tests {
     struct TaggedTarget;
 
     impl RenderTarget for TaggedTarget {
-        fn style(&self, text: &str, color: Option<Color>, _effect: TextEffect) -> String {
-            if color == Some(Color::Yellow) {
+        fn style(&self, text: &str, color: Option<Color>, effect: TextEffect) -> String {
+            let rendered = if color == Some(Color::Yellow) {
                 format!("<yellow>{text}</yellow>")
             } else {
                 text.to_owned()
+            };
+            if effect == TextEffect::Strikethrough {
+                format!("<strike>{rendered}</strike>")
+            } else {
+                rendered
             }
         }
+    }
+
+    #[test]
+    fn disabled_accounts_strike_through_their_email() {
+        let account = AccountView {
+            email: "disabled@example.com".to_owned(),
+            active: false,
+            enabled: false,
+            plan: Some("pro".to_owned()),
+            last_refresh: None,
+            status: AccountStatus::Ready,
+            quota: QuotaStatus::Loading,
+        };
+
+        assert!(
+            render_account_base(&account, account.email.len(), &TaggedTarget, false)
+                .contains("<strike>disabled@example.com</strike>")
+        );
     }
 
     #[test]
@@ -787,6 +813,7 @@ mod tests {
         let account = |reset_after_seconds| AccountView {
             email: "idle@example.com".to_owned(),
             active: false,
+            enabled: true,
             plan: Some("pro".to_owned()),
             last_refresh: None,
             status: AccountStatus::Ready,
@@ -841,6 +868,7 @@ mod tests {
                 AccountView {
                     email: "days@example.com".to_owned(),
                     active: false,
+                    enabled: true,
                     plan: None,
                     last_refresh: None,
                     status: AccountStatus::Ready,
@@ -849,6 +877,7 @@ mod tests {
                 AccountView {
                     email: "hours@example.com".to_owned(),
                     active: false,
+                    enabled: true,
                     plan: None,
                     last_refresh: None,
                     status: AccountStatus::Ready,
@@ -930,6 +959,7 @@ mod tests {
         let available = |email: &str, remaining_percent| AccountView {
             email: email.to_owned(),
             active: false,
+            enabled: true,
             plan: Some("pro".to_owned()),
             last_refresh: None,
             status: AccountStatus::Ready,
@@ -952,6 +982,7 @@ mod tests {
                 AccountView {
                     email: "offline@example.com".to_owned(),
                     active: false,
+                    enabled: true,
                     plan: Some("pro".to_owned()),
                     last_refresh: None,
                     status: AccountStatus::Ready,
@@ -987,6 +1018,7 @@ mod tests {
                 .map(|email| AccountView {
                     email: email.to_owned(),
                     active: false,
+                    enabled: true,
                     plan: None,
                     last_refresh: None,
                     status: AccountStatus::Ready,
@@ -1012,6 +1044,7 @@ mod tests {
         let account = |email: &str, active| AccountView {
             email: email.to_owned(),
             active,
+            enabled: true,
             plan: Some("pro".to_owned()),
             last_refresh: None,
             status: AccountStatus::Ready,
@@ -1038,6 +1071,7 @@ mod tests {
             accounts: vec![AccountView {
                 email: "alice@example.com".to_owned(),
                 active: true,
+                enabled: true,
                 plan: Some("pro".to_owned()),
                 last_refresh: None,
                 status: AccountStatus::Ready,
