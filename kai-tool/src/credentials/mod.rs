@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
+use rand::prelude::IndexedRandom;
 
 use crate::codex::AccountRotation;
 
@@ -62,7 +63,7 @@ pub enum CredCommand {
     )]
     Tickle,
 
-    #[command(about = "Activate the next usable enrolled account.")]
+    #[command(about = "Activate a random usable enrolled account.")]
     Next,
 
     #[command(about = "Activate an enrolled account.")]
@@ -497,7 +498,7 @@ async fn cmd_list(store: &Store, args: ListArgs) -> Result<()> {
     }
     if can_select_next {
         let order = rotation_order(store.profiles().len(), active_index);
-        view.next = preferred_rotation_index(order.iter().copied().map(|index| {
+        view.next = random_preferred_rotation_index(order.iter().copied().map(|index| {
             (
                 index,
                 quota_status_availability(&view.accounts[index].quota),
@@ -719,7 +720,7 @@ async fn choose_next_selection_from(
     let candidates = checks
         .iter()
         .map(|(index, result)| (*index, quota_result_availability(result)));
-    let target_index = preferred_rotation_index(candidates);
+    let target_index = random_preferred_rotation_index(candidates);
     let Some(target_index) = target_index else {
         let scope = if active_index.is_some() && store.profiles().len() > 1 {
             "no other enrolled account has remaining Codex quota or usable reset credits"
@@ -839,24 +840,35 @@ fn rotation_order(profile_count: usize, active_index: Option<usize>) -> Vec<usiz
     }
 }
 
-fn preferred_rotation_index(
+fn random_preferred_rotation_index(
     candidates: impl IntoIterator<Item = (usize, QuotaAvailability)>,
 ) -> Option<usize> {
-    let mut first_resettable = None;
-    let mut first_unknown = None;
+    random_preferred_rotation_index_with_rng(candidates, &mut rand::rng())
+}
+
+fn random_preferred_rotation_index_with_rng<R: rand::Rng + ?Sized>(
+    candidates: impl IntoIterator<Item = (usize, QuotaAvailability)>,
+    rng: &mut R,
+) -> Option<usize> {
+    let mut remaining = Vec::new();
+    let mut resettable = Vec::new();
+    let mut unknown = Vec::new();
     for (index, availability) in candidates {
         match availability {
-            QuotaAvailability::Remaining => return Some(index),
-            QuotaAvailability::Resettable => {
-                first_resettable.get_or_insert(index);
-            }
-            QuotaAvailability::Unknown => {
-                first_unknown.get_or_insert(index);
-            }
+            QuotaAvailability::Remaining => remaining.push(index),
+            QuotaAvailability::Resettable => resettable.push(index),
+            QuotaAvailability::Unknown => unknown.push(index),
             QuotaAvailability::Exhausted | QuotaAvailability::Unusable => {}
         }
     }
-    first_resettable.or(first_unknown)
+    let preferred = if !remaining.is_empty() {
+        &remaining
+    } else if !resettable.is_empty() {
+        &resettable
+    } else {
+        &unknown
+    };
+    preferred.choose(rng).copied()
 }
 
 fn quota_result_availability(result: &Result<quota::Snapshot>) -> QuotaAvailability {
@@ -1608,14 +1620,14 @@ mod tests {
     #[test]
     fn rotation_skips_exhausted_accounts_and_prefers_confirmed_capacity() {
         assert_eq!(
-            preferred_rotation_index([
+            random_preferred_rotation_index([
                 (1, QuotaAvailability::Exhausted),
                 (2, QuotaAvailability::Remaining),
             ]),
             Some(2)
         );
         assert_eq!(
-            preferred_rotation_index([
+            random_preferred_rotation_index([
                 (1, QuotaAvailability::Unknown),
                 (2, QuotaAvailability::Remaining),
             ]),
@@ -1626,21 +1638,21 @@ mod tests {
     #[test]
     fn rotation_uses_reset_credits_after_remaining_quota_but_before_unknown_quota() {
         assert_eq!(
-            preferred_rotation_index([
+            random_preferred_rotation_index([
                 (1, QuotaAvailability::Resettable),
                 (2, QuotaAvailability::Remaining),
             ]),
             Some(2)
         );
         assert_eq!(
-            preferred_rotation_index([
+            random_preferred_rotation_index([
                 (1, QuotaAvailability::Unknown),
                 (2, QuotaAvailability::Resettable),
             ]),
             Some(2)
         );
         assert_eq!(
-            preferred_rotation_index([
+            random_preferred_rotation_index([
                 (1, QuotaAvailability::Unusable),
                 (2, QuotaAvailability::Exhausted),
             ]),
@@ -1650,21 +1662,45 @@ mod tests {
 
     #[test]
     fn rotation_falls_back_to_unknown_quota_but_never_to_known_exhaustion() {
-        assert_eq!(
-            preferred_rotation_index([
+        assert!(matches!(
+            random_preferred_rotation_index([
                 (1, QuotaAvailability::Exhausted),
                 (2, QuotaAvailability::Unknown),
                 (3, QuotaAvailability::Unknown),
             ]),
-            Some(2)
-        );
+            Some(2 | 3)
+        ));
         assert_eq!(
-            preferred_rotation_index([
+            random_preferred_rotation_index([
                 (1, QuotaAvailability::Exhausted),
                 (2, QuotaAvailability::Exhausted),
             ]),
             None
         );
+    }
+
+    #[test]
+    fn rotation_randomizes_equally_preferred_accounts() {
+        use std::collections::BTreeSet;
+
+        use rand::SeedableRng;
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let selected = (0..128)
+            .map(|_| {
+                random_preferred_rotation_index_with_rng(
+                    [
+                        (1, QuotaAvailability::Remaining),
+                        (2, QuotaAvailability::Remaining),
+                        (3, QuotaAvailability::Remaining),
+                    ],
+                    &mut rng,
+                )
+                .unwrap()
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(selected, BTreeSet::from([1, 2, 3]));
     }
 
     #[test]

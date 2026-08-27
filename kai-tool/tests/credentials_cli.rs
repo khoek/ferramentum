@@ -1310,7 +1310,7 @@ fn next_alias_reports_the_activated_accounts_quota() {
 
 #[cfg(unix)]
 #[test]
-fn next_skips_exhausted_accounts_in_cyclic_order() {
+fn next_skips_exhausted_accounts_when_choosing_randomly() {
     let root = tempdir().unwrap();
     let credentials_home = root.path().join("credentials");
     let codex_home = root.path().join("codex");

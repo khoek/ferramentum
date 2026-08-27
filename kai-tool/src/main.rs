@@ -124,7 +124,7 @@ enum Commands {
 
     #[command(
         name = "next",
-        about = "Activate the next usable enrolled Codex account.",
+        about = "Activate a random usable enrolled Codex account.",
         after_help = "Shorthand for `kai cred next`."
     )]
     Next,
