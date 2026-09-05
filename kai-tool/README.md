@@ -1,162 +1,84 @@
 # kai-tool
 
-`kai` is a focused CLI for AI-assisted coding workflows: launching agents, managing git worktrees,
-assembling source listings, and rotating between enrolled Codex CLI accounts.
+Kai launches Codex and resumes conversations with configurable credential rotation.
 
-## Install
-
-```bash
-cargo install kai-tool
-```
-
-Installed command: `kai`
-
-## Codex credentials
-
-Enroll each Codex account once, then switch without logging the previous account out:
-
-```bash
-kai cred add                    # import the current account or sign in
-kai cred add --device-auth     # enroll another account with device auth
-kai cred list
-kai cred tickle
-kai cred fix
-kai cred disable work@example.com
-kai cred enable work@example.com
-kai next
-```
-
-`kai next` is shorthand for `kai cred next`. It checks enabled candidate accounts concurrently and
-randomly activates one of the accounts with confirmed remaining quota. If none has remaining
-quota, accounts with usable rate-limit reset credits are eligible before accounts whose quota
-could not be checked. Exhausted accounts without reset credits, disabled accounts, and credentials
-rejected by the service are skipped. You can also select or remove an account explicitly:
-
-```bash
-kai cred activate personal@example.com
-kai cred remove work@example.com
-```
-
-`kai cred disable EMAIL` excludes an account from manual and automatic rotation, and
-`kai cred activate` refuses to select it until `kai cred enable EMAIL` is run. Disabled accounts
-remain enrolled and appear struck through in an interactive `kai cred list`. Disabling the active
-account does not switch it immediately. Pass `--exclusive` to either command to apply the requested
-state to the named account and the opposite state to every other enrolled account; for example,
-`kai cred enable --exclusive personal@example.com` leaves only that account enabled.
-
-`kai cred list` fetches every account's current Codex quota concurrently and shows the remaining
-percentage, relative time until reset, and an inline progress bar. Usable rate-limit reset credits
-are shown with their count and latest relative expiry. Every lookup runs `codex app-server` in its
-own temporary configuration-only `CODEX_HOME` with `--auth-file` pointing directly at that
-account's canonical vault file, so accounts are checked in parallel without swapping the live
-account or making quota API calls directly from Kai. Transient failures are retried up to three
-total attempts through this same lookup path for every command that polls quota. Codex can refresh
-an expired access token in that canonical file; the downstream `+k` refresh lock serializes the
-reload, provider request, and persistence, so Kai never reconciles a private copy at process exit.
-On an interactive terminal, each account appears immediately with a live loading indicator and is rewritten as its quota arrives. After
-`kai next` or `kai cred next`, Kai
-reports the newly selected account's quota as soon as the in-flight lookup completes. Selecting an
-exhausted account with reset credits prints a notice directing you to Codex's `/usage` flow to
-redeem one. A credential name and its reset time are yellow when the backend reports a fresh
-seven-day window, indicating that quota countdown has not started. Once all quota lookups finish,
-lists with multiple accounts end with a blank-line-separated total bar averaging the accounts whose
-quota is available. A centered signed usage bar on the same line shows the average quota pace
-balance: elapsed window fraction minus consumed quota fraction. Positive values mean consumption is
-behind the clock, while negative values mean it is ahead of the clock. Values within ±0.20 are
-yellow, lower values are red, and higher values are green.
-
-`kai cred tickle` starts those untouched seven-day countdowns. It temporarily activates each
-matching enabled credential in enrollment order, runs an ephemeral Codex request whose complete
-prompt is
-``What is the current system `gcc` version? (Reply with only the version number.)`` from the user's
-home directory, waits for and discards the response, and restores the original active credential
-afterward. Refreshed credentials are saved during each switch, and the original credential is
-restored even when a probe fails.
-
-`kai cred add` runs `codex login` with a temporary, isolated `CODEX_HOME`, reads the account email
-from the resulting file-backed credential, and imports it. If Codex is already using an
-unenrolled account, Kai imports that credential directly. The credential currently used by Codex
-is not replaced or logged out during enrollment. Kai selects
-Codex's device-code flow automatically for SSH sessions, CI, and Linux sessions without a graphical
-display. A configured `$BROWSER` relay and WSL browser interop retain the browser flow. Use
-`--browser-auth` or `--device-auth` to force either behavior.
-
-Rerun `kai cred add --force` to reauthenticate the account selected by the completed login. Kai replaces
-the credential only after both its email and account/workspace ID match the enrolled profile, and
-preserves whether it was active unless `--activate` is also supplied. `kai cred fix` checks all
-enrolled credentials concurrently and starts isolated sign-ins only for credentials that are
-invalid or rejected as unauthorized. Both commands accept the same browser/device authentication
-overrides. Repairs run one at a time; before each sign-in, Kai shows the email to select and waits
-for Enter before opening the browser.
-
-The first enrolled account is activated automatically. When another managed account is already
-active, Kai normally leaves it in place; if that account has zero remaining quota, adding a new
-account activates the new one automatically. A quota lookup failure is non-fatal and leaves the
-current account active. Use `--activate` to switch immediately regardless of its quota.
-
-Before every switch, Kai validates the live canonical profile and atomically changes the managed
-`CODEX_HOME/auth.json` link to the selected profile. Refresh-token changes therefore stay in their
-canonical account file without any copy/reconcile step. Kai never invokes `codex logout`, so
-switching does not deliberately revoke the previous credential.
-
-`kai cred list --json` emits stable, secret-free output for scripts, including each account's
-enabled state, quota remaining percentage, reset timestamp, window length, and any usable
-reset-credit count and latest expiry.
-
-### Vault location and security
-
-The credential vault is stored at:
+## Usage
 
 ```text
-~/.kai/credentials/
-├── state.json
-└── profiles/
-    └── <email-derived-id>.json
+kai                         Launch Codex
+kai resume                  Open the all-sessions picker
+kai resume ID               Resume a specific conversation
+kai llm-get PATH...          Assemble a source listing
 ```
 
-Override it with `KAI_CREDENTIALS_HOME`. Each enrolled profile file is the canonical writable
-credential for that account; Kai atomically points `${CODEX_HOME:-~/.codex}/auth.json` at the
-managed active profile.
+Unambiguous command prefixes work, such as `kai r` and `kai llm`.
 
-The vault is not encrypted; like Codex's own `auth.json`, it contains bearer credentials. On Unix,
-Kai enforces mode `0700` on vault directories and `0600` on credential/state files, refuses
-credential symlinks, uses atomic durable writes, and serializes credential operations with an
-invocation lock. Temporary Codex homes are configuration-only for quota workers and are removed
-after each lookup; enrollment login homes may contain a short-lived login credential. Supervised
-agents never receive a private auth copy, so a hard-killed process cannot leave a second bearer
-credential behind or leave sessions or SQLite state pointing at a temporary home. Protect backups
-accordingly.
+`--fast` selects the Fast service tier. Compatible `+k` builds are supervised automatically;
+`--no-auto-restart` disables supervision. Kai runs Codex with its approval/sandbox bypass flag.
 
-Kai requires Codex to use file-backed CLI credentials. If `cli_auth_credentials_store` is set to
-`auto` or `keyring`, change it to `file` in the active Codex `config.toml`.
+Install with `cargo install --path kai-tool --locked --force`.
 
-Already-running Codex processes may retain their previous credential in memory. Restart them after
-`kai next`, `kai cred activate`, an automatic recovery promotion, or repairing the active credential.
+## Credential provider
 
-Automatically supervised +k agents keep the user's canonical `CODEX_HOME`, SQLite state, and
-per-account credential files. Each child receives the selected profile's canonical path through the
-custom Codex `--auth-file` option; sessions, configuration, plugins, skills, and rollout paths stay
-in the normal `CODEX_HOME`. Codex keeps the selection process-local, so tool subprocesses cannot
-inherit it. Quota recovery switches that canonical path between child restarts using the same
-random enabled-account selection as `kai next`. When a different selected account has confirmed
-remaining quota and the systemwide account is separately confirmed exhausted, Kai
-promotes the selected account to the global `auth.json` link while holding the credential lock.
-Because every +k process locks the resolved canonical file across reload → refresh → persist,
-another Codex instance cannot replay a stale rotating refresh token. At startup Kai also repairs
-stale rollout paths left by older temporary-home runs when the persistent rollout exists. If no
-enrolled account has usable quota, an interactive run asks whether to check again (default yes) and
-repeats that prompt after every unsuccessful retry.
+Set `${XDG_CONFIG_HOME:-~/.config}/kai/config.toml`:
 
-## Other commands
+```toml
+credential_provider = "/path/to/provider.sh"
+```
 
-- `kai agent` (`a`; `ar` opens the all-sessions picker, and `ar SESSION_ID` resumes directly)
-  launches Codex or Claude. Pass `--fast` to start Codex using its Fast service tier.
-- `kai worktree` (`wc`, `wa`, `wo`, `wd`) manages git worktrees.
-- `kai llm-get` (`lg`) produces LLM-friendly file listings.
-- `kai init` writes `.kai/config.toml`.
-- `kai bump` commits and pushes changed submodule pointers.
+`--credential-provider SCRIPT` overrides that setting. Configuration-relative paths resolve
+from the configuration directory; CLI paths resolve from the current directory.
 
-Run `kai help` or `kai <command> --help` for the complete command surface.
+The script has two operations:
+
+```text
+bash SCRIPT acquire --codex-home PATH --sqlite-home PATH
+
+bash SCRIPT next --codex-home PATH --sqlite-home PATH \
+  --auth-file PATH --credential-use-lock PATH \
+  --credential-use-lock-mode shared|exclusive \
+  --credential-mutation-lock PATH --available-file PATH \
+  --cause quota-exhausted|credential-invalid [--unavailable-until UNIX_SECONDS]
+```
+
+Each returns exactly one JSON object:
+
+```json
+{
+  "auth_file": "/pool/credential/auth.json",
+  "credential_use_lock": "/pool/credential/use.lock",
+  "credential_use_lock_mode": "shared",
+  "credential_mutation_lock": "/pool/credential/mutation.lock",
+  "available_file": "/pool/credential/available"
+}
+```
+
+The provider chooses the credential and its shared/exclusive use-lock mode. Kai locks the returned
+file accordingly, verifies availability, and transfers the held descriptor to Codex. Consumers
+retain that lock while using the credential and serialize token changes with the mutation lock,
+reloading the shared auth file after locking it.
+
+Paths must be distinct and absolute, with private regular files owned by the user and mode 0600.
+The provider owns the files. Removing the availability marker prevents new selections. The two
+home arguments are opaque launch context.
+
+Only quota exhaustion or permanent credential failure invokes `next`. Kai forwards the reported
+reset timestamp, then restores Codex's input handoff and resumes the conversation. Normal exit and
+crashes invoke no hook; the operating system releases held locks.
+
+Script stdin is closed, stdout carries the JSON response, and stderr remains visible. Ambient
+Codex/OpenAI auth variables are removed. Responses are limited to 64 KiB; selection has a
+30-second timeout. Managed Codex uses credential protocol version 2 and transfers its descriptor
+through `SCM_RIGHTS` with the private, nonce-authenticated READY/GO startup handshake.
+
+Hooks run only during compatible `+k` supervision. Otherwise Codex uses ordinary authentication.
+With supervision enabled and no provider, Kai aborts if credential rotation becomes necessary.
+
+## Source listings
+
+`kai llm-get` recursively selects source files, prepends local `AGENTS.md` and `DESIGN.md`,
+and copies the listing to the clipboard. Use `--out -` for stdout, `--out PATH` for a file,
+or `--slim` to omit instruction files. Run `kai llm-get --help` for filtering options.
 
 ## License
 

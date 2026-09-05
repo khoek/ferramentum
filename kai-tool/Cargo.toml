@@ -1,13 +1,13 @@
 [package]
 name = "kai-tool"
-version = "0.1.31"
+version = "0.2.0"
 edition = "2024"
 publish.workspace = true
-description = "CLI helpers for AI coding, Codex credentials, and git worktree management."
+description = "Codex launcher with configurable credential rotation."
 repository = "https://github.com/khoek/ferramentum/tree/master/kai-tool"
 license = "AGPL-3.0-only"
 readme = "README.md"
-keywords = ["cli", "git", "worktree", "codex", "llm"]
+keywords = ["cli", "codex", "llm"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
@@ -18,29 +18,22 @@ path = "src/main.rs"
 capulus = { workspace = true }
 
 anyhow = { workspace = true }
-base64 = "0.23"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { workspace = true }
 crossterm = "0.29"
 fs2 = "0.4"
-indicatif = { workspace = true }
+hex = { workspace = true }
 libc = { workspace = true }
 pathdiff = "0.2"
 portable-pty = "0.9"
 rand = { workspace = true }
-rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 tempfile = { workspace = true }
-tokio = { version = "1", features = ["io-util", "net", "process", "rt-multi-thread", "time"] }
 walkdir = "2"
 which = { workspace = true }
 toml = "1"
-zeroize = "1"
 
 [dev-dependencies]
 assert_cmd = "2"
-indicatif = { workspace = true, features = ["in_memory"] }
 predicates = "3"
