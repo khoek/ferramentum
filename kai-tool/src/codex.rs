@@ -241,6 +241,7 @@ impl Launcher {
         service_tier: ServiceTier,
     ) -> Result<u8> {
         force_service_tier(&mut args, service_tier);
+        apply_launch_preferences(&mut args);
         run_direct(&self.binary, &args, cwd)
     }
 
@@ -286,6 +287,7 @@ impl Launcher {
         let input = InputRouter::start(input);
         let mut selected = select_credential(None)?;
         loop {
+            apply_launch_preferences(&mut args);
             let (credential, use_guard) = match selected.take() {
                 Some(SelectedCredential { paths, guard }) => {
                     validate_managed_launch_args(&args)?;
@@ -320,6 +322,22 @@ impl Launcher {
                 }
             }
         }
+    }
+}
+
+fn apply_launch_preferences(args: &mut Vec<OsString>) {
+    for value in [
+        "agents.max_concurrent_threads_per_session=16",
+        "tui.theme=\"monokai-extended\"",
+        "tui.status_line_use_colors=true",
+        "tui.resume_cwd=\"session\"",
+        "notice.hide_rate_limit_model_nudge=true",
+        concat!(
+            "tui.status_line=[\"model-with-reasoning\",\"run-state\",\"context-remaining\",",
+            "\"weekly-limit\",\"total-input-tokens\",\"total-output-tokens\",\"fast-mode\"]",
+        ),
+    ] {
+        args.extend([CONFIG_OVERRIDE_FLAG.into(), value.into()]);
     }
 }
 

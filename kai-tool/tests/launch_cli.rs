@@ -40,7 +40,8 @@ impl Fixture {
             root.path().join("handoff.json"),
             json!({
                 "format": "codex+k-input-handoff", "version": 1,
-                "thread_id": THREAD_ID, "resume_args": ["--model", "gpt-test"],
+                "thread_id": THREAD_ID,
+                "resume_args": ["--model", "gpt-test", "-c", "tui.theme=\"other\""],
             })
             .to_string(),
         )
@@ -152,6 +153,40 @@ PY
 
 fn argument<'a>(args: &'a [Value], name: &str) -> &'a Value {
     &args[args.iter().position(|value| value == name).unwrap() + 1]
+}
+
+fn assert_launch_preferences(call: &Value) {
+    let preferences = call["args"]
+        .as_array()
+        .unwrap()
+        .windows(2)
+        .filter(|pair| pair[0] == "-c")
+        .filter_map(|pair| {
+            let (key, value) = pair[1].as_str().unwrap().split_once('=').unwrap();
+            if key == "service_tier" {
+                return None;
+            }
+            let parsed: toml::Table = toml::from_str(&format!("value={value}")).unwrap();
+            Some((
+                key.to_owned(),
+                serde_json::to_value(&parsed["value"]).unwrap(),
+            ))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    assert_eq!(
+        Value::Object(preferences),
+        json!({
+            "agents.max_concurrent_threads_per_session": 16,
+            "tui.theme": "monokai-extended",
+            "tui.status_line_use_colors": true,
+            "tui.resume_cwd": "session",
+            "notice.hide_rate_limit_model_nudge": true,
+            "tui.status_line": [
+                "model-with-reasoning", "run-state", "context-remaining", "weekly-limit",
+                "total-input-tokens", "total-output-tokens", "fast-mode",
+            ],
+        })
+    );
 }
 
 #[test]
@@ -276,6 +311,7 @@ fn unavailable_credential_calls_next_with_the_cause_and_resumes_the_thread() {
         let codex = fixture.calls("codex-calls");
         assert_eq!(codex.len(), 2);
         for call in &codex {
+            assert_launch_preferences(call);
             assert_eq!(
                 argument(
                     call["args"].as_array().unwrap(),
@@ -340,6 +376,7 @@ fn stock_codex_and_disabled_supervision_do_not_invoke_a_provider() {
         command.assert().success();
         assert!(!fixture.root.path().join("provider-calls").exists());
         let calls = fixture.calls("codex-calls");
+        assert_launch_preferences(&calls[0]);
         assert_eq!(
             argument(calls[0]["args"].as_array().unwrap(), "-c"),
             if disabled {
@@ -424,6 +461,9 @@ fn resume_uses_all_sessions_or_the_supplied_id() {
             .assert()
             .success();
         let calls = fixture.calls("codex-calls");
+        for call in &calls {
+            assert_launch_preferences(call);
+        }
         assert_eq!(
             &calls[0]["args"].as_array().unwrap()[..2],
             &[json!("resume"), json!("--all")]

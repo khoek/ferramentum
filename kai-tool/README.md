@@ -16,6 +16,11 @@ Unambiguous command prefixes work, such as `kai r` and `kai llm`.
 `--fast` selects the Fast service tier. Compatible `+k` builds are supervised automatically;
 `--no-auto-restart` disables supervision. Kai runs Codex with its approval/sandbox bypass flag.
 
+Every launch and automatic recovery passes Codex config overrides for 16 concurrent spawned agents,
+the `monokai-extended` theme, colored status indicators, the saved session's working directory on
+resume, and hidden rate-limit model-switch reminders. The status line shows model/reasoning, run
+state, remaining context, weekly limit, total input/output tokens, and Fast-mode status, in that order.
+
 Install with `cargo install --path kai-tool --locked --force`.
 
 ## Credential provider
