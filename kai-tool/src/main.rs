@@ -20,7 +20,7 @@ const GIT_TERMINAL_PROMPT_ENV: &str = "GIT_TERMINAL_PROMPT";
     infer_subcommands = true
 )]
 struct Cli {
-    /// Bash script that supplies credentials to compatible +k Codex builds.
+    /// Bash script that supplies credentials to compatible custom Codex builds.
     #[arg(long, value_name = "SCRIPT", global = true)]
     credential_provider: Option<PathBuf>,
 

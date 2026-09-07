@@ -195,7 +195,7 @@ impl ServiceTier {
 
 pub struct Launcher {
     binary: PathBuf,
-    plus_k: bool,
+    custom: bool,
 }
 
 impl Launcher {
@@ -226,12 +226,12 @@ impl Launcher {
         }
         Ok(Self {
             binary,
-            plus_k: version_is_plus_k(&output.stdout)?,
+            custom: version_is_custom(&output.stdout)?,
         })
     }
 
     pub fn supervision_enabled(&self, disabled: bool) -> bool {
-        self.plus_k && !disabled
+        self.custom && !disabled
     }
 
     pub fn run_direct(
@@ -348,7 +348,7 @@ fn force_service_tier(args: &mut Vec<OsString>, service_tier: ServiceTier) {
     ]);
 }
 
-fn version_is_plus_k(stdout: &[u8]) -> Result<bool> {
+fn version_is_custom(stdout: &[u8]) -> Result<bool> {
     let output =
         std::str::from_utf8(stdout).context("`codex --version` returned non-UTF-8 output")?;
     let raw_version = output
@@ -357,7 +357,14 @@ fn version_is_plus_k(stdout: &[u8]) -> Result<bool> {
         .context("`codex --version` returned no version")?;
     let version = Version::parse(raw_version.trim_start_matches('v'))
         .with_context(|| format!("could not parse Codex version `{raw_version}`"))?;
-    Ok(version.build.as_str().split('.').any(|part| part == "k"))
+    Ok(version.build.is_empty()
+        && version
+            .pre
+            .as_str()
+            .strip_prefix("k.")
+            .is_some_and(|commit| {
+                commit.len() == 8 && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }))
 }
 
 fn run_direct(binary: &Path, args: &[OsString], cwd: &Path) -> Result<u8> {
@@ -1238,11 +1245,24 @@ mod tests {
     }
 
     #[test]
-    fn detects_only_k_build_metadata() {
-        assert!(version_is_plus_k(b"codex-cli 0.147.0+k\n").unwrap());
-        assert!(version_is_plus_k(b"codex-cli 0.147.0+release.k\n").unwrap());
-        assert!(!version_is_plus_k(b"codex-cli 0.147.0\n").unwrap());
-        assert!(!version_is_plus_k(b"codex-cli 0.147.0+kestrel\n").unwrap());
+    fn detects_custom_commit_versions() {
+        for version in ["0.154.0-k.ac192cd7", "0.154.0-k.12345678"] {
+            assert!(version_is_custom(format!("codex-cli {version}\n").as_bytes()).unwrap());
+        }
+        for version in [
+            "0.153.4+k",
+            "0.153.4+release.k",
+            "0.154.0",
+            "0.154.0-alpha.3",
+            "0.154.0-kestrel.ac192cd7",
+            "0.154.0-k.ac192cd",
+            "0.154.0-k.ac192cd79",
+            "0.154.0-k.ac192cdz",
+            "0.154.0-k.ac192cd7.extra",
+            "0.154.0-k.ac192cd7+metadata",
+        ] {
+            assert!(!version_is_custom(format!("codex-cli {version}\n").as_bytes()).unwrap());
+        }
     }
 
     #[cfg(unix)]
@@ -1615,7 +1635,7 @@ mod tests {
 import array, fcntl, json, os, pathlib, socket, sys
 args = sys.argv[1:]
 if args == ["--version"]:
-    print("codex-cli 0.154.0+k")
+    print("codex-cli 0.154.0-k.ac192cd7")
     sys.exit(0)
 def value(flag):
     return args[args.index(flag) + 1]

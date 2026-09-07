@@ -50,7 +50,7 @@ impl Fixture {
 import array, fcntl, json, os, pathlib, socket, sys
 args = sys.argv[1:]
 if args == ["--version"]:
-    print("codex-cli " + os.environ.get("KAI_TEST_VERSION", "0.154.0+k"))
+    print("codex-cli " + os.environ.get("KAI_TEST_VERSION", "0.154.0-k.ac192cd7"))
     sys.exit(0)
 def value(flag):
     return args[args.index(flag) + 1]

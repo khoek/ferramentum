@@ -13,8 +13,9 @@ kai llm-get PATH...          Assemble a source listing
 
 Unambiguous command prefixes work, such as `kai r` and `kai llm`.
 
-`--fast` selects the Fast service tier. Compatible `+k` builds are supervised automatically;
-`--no-auto-restart` disables supervision. Kai runs Codex with its approval/sandbox bypass flag.
+`--fast` selects the Fast service tier. Custom builds with a `-k.` prerelease suffix followed
+by exactly eight hexadecimal commit characters (for example, `0.154.0-k.ac192cd7`) are supervised
+automatically. `--no-auto-restart` disables supervision. Kai runs Codex with its approval/sandbox bypass flag.
 
 Every launch and automatic recovery passes Codex config overrides for 16 concurrent spawned agents,
 the `monokai-extended` theme, colored status indicators, the saved session's working directory on
@@ -76,7 +77,7 @@ Codex/OpenAI auth variables are removed. Responses are limited to 64 KiB; select
 30-second timeout. Managed Codex uses credential protocol version 2 and transfers its descriptor
 through `SCM_RIGHTS` with the private, nonce-authenticated READY/GO startup handshake.
 
-Hooks run only during compatible `+k` supervision. Otherwise Codex uses ordinary authentication.
+Hooks run only during supervision of these custom builds. Otherwise Codex uses ordinary authentication.
 With supervision enabled and no provider, Kai aborts if credential rotation becomes necessary.
 
 ## Source listings
