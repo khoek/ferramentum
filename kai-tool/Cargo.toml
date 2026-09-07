@@ -1,6 +1,6 @@
 [package]
 name = "kai-tool"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 publish.workspace = true
 description = "Codex launcher with configurable credential rotation."
