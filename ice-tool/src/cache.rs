@@ -158,7 +158,7 @@ where
 
 fn try_acquire_cloud_cache_lock(cloud: Cloud) -> Option<capulus::InvocationLock> {
     let name = format!("ice.instance-cache.{}", cloud_cache_slug(cloud));
-    capulus::acquire_named(&name, false).ok()
+    capulus::acquire_named_in(crate::config_store::lock_root(), &name, false).ok()
 }
 
 fn save_cloud_cache_best_effort<T>(cloud: Cloud, value: &T)

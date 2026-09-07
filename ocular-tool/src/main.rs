@@ -49,7 +49,15 @@ fn init_tracing(level: LogLevel) {
 }
 
 fn run(args: Args) -> Result<i32, AppError> {
-    let _instance_lock = capulus::acquire("ocular", true)?;
+    let _instance_lock = capulus::acquire_in(
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .map(|path| path.join("capulus"))
+            .or_else(|| dirs::home_dir().map(|home| home.join(".capulus").join("locks")))
+            .unwrap_or_else(|| std::env::temp_dir().join("capulus")),
+        "ocular",
+        true,
+    )?;
     let mut args = args;
 
     if let Some(payload_path) = args.internal_openconnect_payload.clone() {

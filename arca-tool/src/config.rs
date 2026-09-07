@@ -3,7 +3,6 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use capulus::paths::app_dir;
 use capulus::store::{
     ensure_directory, load_toml_or_default, write_toml_file as write_shared_toml_file,
 };
@@ -54,7 +53,26 @@ pub struct RustProjectConfig {
 }
 
 pub fn global_config_path() -> Result<PathBuf> {
-    Ok(app_dir("arca")?.join(CONFIG_FILE_NAME))
+    Ok(capulus::paths::app_dir(config_root()?, "arca").join(CONFIG_FILE_NAME))
+}
+
+fn config_root() -> Result<PathBuf> {
+    dirs::config_dir()
+        .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
+        .context("Failed to determine the configuration directory")
+}
+
+fn lock_root() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .map(|path| path.join("capulus"))
+        .or_else(|| dirs::home_dir().map(|home| home.join(".capulus").join("locks")))
+        .unwrap_or_else(|| std::env::temp_dir().join("capulus"))
+}
+
+fn acquire_named(name: &str, wait: bool) -> Result<capulus::InvocationLock> {
+    Ok(capulus::acquire_named_in(lock_root(), name, wait)?)
 }
 
 pub fn load_global_config() -> Result<ArcaConfig> {
@@ -62,7 +80,7 @@ pub fn load_global_config() -> Result<ArcaConfig> {
 }
 
 pub fn acquire_global_config_lock(wait: bool) -> Result<capulus::InvocationLock> {
-    Ok(capulus::acquire_named("arca.config", wait)?)
+    acquire_named("arca.config", wait)
 }
 
 pub fn save_global_config(config: &ArcaConfig) -> Result<PathBuf> {
@@ -72,7 +90,7 @@ pub fn save_global_config(config: &ArcaConfig) -> Result<PathBuf> {
 }
 
 pub fn cache_root() -> Result<PathBuf> {
-    Ok(app_dir("arca")?.join(CACHE_DIR_NAME))
+    Ok(capulus::paths::app_dir(config_root()?, "arca").join(CACHE_DIR_NAME))
 }
 
 pub fn ensure_cache_root() -> Result<PathBuf> {
@@ -90,10 +108,7 @@ pub fn acquire_project_config_lock(
     wait: bool,
 ) -> Result<capulus::InvocationLock> {
     let lock_id = hash_path_component(crate_dir);
-    Ok(capulus::acquire_named(
-        &format!("arca.project-config.{lock_id}"),
-        wait,
-    )?)
+    acquire_named(&format!("arca.project-config.{lock_id}"), wait)
 }
 
 pub fn save_project_config(crate_dir: &Path, config: &ProjectConfig) -> Result<PathBuf> {
@@ -112,14 +127,11 @@ fn write_toml_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 pub fn acquire_gcp_token_lock(wait: bool) -> Result<capulus::InvocationLock> {
-    Ok(capulus::acquire_named("arca.gcp-token", wait)?)
+    acquire_named("arca.gcp-token", wait)
 }
 
 pub fn acquire_artifact_lock(artifact_id: &str, wait: bool) -> Result<capulus::InvocationLock> {
-    Ok(capulus::acquire_named(
-        &format!("arca.artifact.{artifact_id}"),
-        wait,
-    )?)
+    acquire_named(&format!("arca.artifact.{artifact_id}"), wait)
 }
 
 fn hash_path_component(path: &Path) -> String {

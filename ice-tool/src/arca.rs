@@ -28,7 +28,13 @@ pub(crate) fn parse_arca_source(value: &str) -> Option<Option<&str>> {
 }
 
 pub(crate) fn resolve_local_arca_artifact(selector: Option<&str>) -> Result<LocalArcaArtifact> {
-    let artifact = capulus::arca_store::resolve_artifact(selector)?;
+    let artifact = capulus::artifact_store::resolve_artifact(
+        dirs::data_local_dir()
+            .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("share")))
+            .ok_or_else(|| anyhow::anyhow!("Failed to determine the local data directory"))?,
+        "arca",
+        selector,
+    )?;
     Ok(LocalArcaArtifact {
         local_tag: artifact.metadata.local_tag,
     })

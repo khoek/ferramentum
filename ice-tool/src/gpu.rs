@@ -69,7 +69,11 @@ static VAST_GPU_ALIASES: LazyLock<ProviderGpuAliasStore> =
     LazyLock::new(|| load_provider_gpu_aliases(Cloud::VastAi, BUNDLED_VAST_GPU_ALIASES));
 
 pub(crate) fn ensure_runtime_gpu_data_files() -> Result<()> {
-    let _migration_lock = capulus::acquire_named("ice.gpu-data-migration", true)?;
+    let _migration_lock = capulus::acquire_named_in(
+        crate::config_store::lock_root(),
+        "ice.gpu-data-migration",
+        true,
+    )?;
     ensure_gpu_catalog_file()?;
     ensure_provider_alias_file(Cloud::Aws, BUNDLED_AWS_GPU_ALIASES)?;
     ensure_gcp_machine_pricing_map_file()?;

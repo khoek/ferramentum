@@ -522,7 +522,19 @@ fn config_path() -> Result<PathBuf> {
 }
 
 pub(crate) fn ice_root_dir() -> Result<PathBuf> {
-    capulus::paths::app_dir("ice")
+    let root = dirs::config_dir()
+        .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
+        .context("Failed to determine the configuration directory")?;
+    Ok(capulus::paths::app_dir(root, "ice"))
+}
+
+pub(crate) fn lock_root() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .map(|path| path.join("capulus"))
+        .or_else(|| dirs::home_dir().map(|home| home.join(".capulus").join("locks")))
+        .unwrap_or_else(|| std::env::temp_dir().join("capulus"))
 }
 
 pub(crate) fn load_config() -> Result<IceConfig> {
@@ -530,7 +542,7 @@ pub(crate) fn load_config() -> Result<IceConfig> {
 }
 
 pub(crate) fn acquire_config_lock(wait: bool) -> Result<capulus::InvocationLock> {
-    Ok(capulus::acquire_named("ice.config", wait)?)
+    Ok(capulus::acquire_named_in(lock_root(), "ice.config", wait)?)
 }
 
 pub(crate) fn save_config(config: &IceConfig) -> Result<PathBuf> {

@@ -219,7 +219,10 @@ pub fn now_epoch() -> i64 {
 }
 
 pub fn app_dir() -> Result<PathBuf, AppError> {
-    paths::app_dir("ocular").map_err(|_| AppError::HomeNotFound)
+    let root = dirs::config_dir()
+        .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
+        .ok_or(AppError::HomeNotFound)?;
+    Ok(paths::app_dir(root, "ocular"))
 }
 
 fn config_path() -> Result<PathBuf, AppError> {

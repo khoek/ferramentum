@@ -13,19 +13,19 @@ members = [
 publish = true
 
 [workspace.dependencies]
-capulus = "0.2"
+capulus = "0.6"
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 ciborium = "0.2"
 dialoguer = "0.12"
-dirs = "6"
+dirs = "7"
 indicatif = "0.18"
 libc = "0.2"
 ed25519-dalek = { version = "3", features = ["zeroize"] }
 hex = "0.4"
-passless-uhid = "0.15"
+passless-uhid = "0.19"
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false }
 rustix = { version = "1", features = ["fs", "mm", "net", "param", "process"] }

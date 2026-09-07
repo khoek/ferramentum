@@ -306,8 +306,8 @@ fn xml_escape(input: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn local_name(name: &[u8]) -> &[u8] {
-    name.rsplit(|&b| b == b':').next().unwrap_or(name)
+fn local_name(name: &str) -> &str {
+    name.rsplit(':').next().unwrap_or(name)
 }
 
 fn parse_auth_request_response(xml: &[u8]) -> Result<AuthRequest, AppError> {
@@ -327,7 +327,7 @@ fn parse_auth_request_response(xml: &[u8]) -> Result<AuthRequest, AppError> {
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Start(e) => {
-                let name = local_name(e.name().as_ref()).to_vec();
+                let name = local_name(e.name().as_ref()).as_bytes().to_vec();
                 if name.as_slice() == b"opaque" {
                     opaque_xml = Some(capture_subtree(&mut reader, Event::Start(e.into_owned()))?);
                     buf.clear();
@@ -337,7 +337,7 @@ fn parse_auth_request_response(xml: &[u8]) -> Result<AuthRequest, AppError> {
                 if name.as_slice() == b"auth" {
                     for attr in e.attributes() {
                         let attr = attr?;
-                        if local_name(attr.key.as_ref()) == b"id" {
+                        if local_name(attr.key.as_ref()) == "id" {
                             auth_id =
                                 Some(attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned());
                         }
@@ -347,7 +347,7 @@ fn parse_auth_request_response(xml: &[u8]) -> Result<AuthRequest, AppError> {
                 stack.push(name);
             }
             Event::Empty(e) => {
-                let name = local_name(e.name().as_ref()).to_vec();
+                let name = local_name(e.name().as_ref()).as_bytes().to_vec();
                 if name.as_slice() == b"opaque" {
                     opaque_xml = Some(capture_subtree(&mut reader, Event::Empty(e.into_owned()))?);
                     buf.clear();
@@ -445,11 +445,11 @@ fn parse_auth_complete_response(xml: &[u8]) -> Result<AuthComplete, AppError> {
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Start(e) => {
-                let name = local_name(e.name().as_ref()).to_vec();
+                let name = local_name(e.name().as_ref()).as_bytes().to_vec();
                 if name.as_slice() == b"auth" {
                     for attr in e.attributes() {
                         let attr = attr?;
-                        if local_name(attr.key.as_ref()) == b"id" {
+                        if local_name(attr.key.as_ref()) == "id" {
                             auth_id =
                                 Some(attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned());
                         }
@@ -586,15 +586,14 @@ fn capture_subtree(reader: &mut Reader<&[u8]>, start: Event<'static>) -> Result<
 }
 
 fn unescape_text(text: &quick_xml::events::BytesText<'_>) -> Result<String, AppError> {
-    let raw = std::str::from_utf8(text)?;
-    Ok(quick_xml::escape::unescape(raw)?.into_owned())
+    Ok(quick_xml::escape::unescape(text.as_ref())?.into_owned())
 }
 
 fn unescape_general_ref(general_ref: &quick_xml::events::BytesRef<'_>) -> Result<String, AppError> {
     if let Some(ch) = general_ref.resolve_char_ref()? {
         return Ok(ch.to_string());
     }
-    let entity = std::str::from_utf8(general_ref)?;
+    let entity = general_ref.as_ref();
     if let Some(value) = quick_xml::escape::resolve_xml_entity(entity) {
         return Ok(value.to_string());
     }
