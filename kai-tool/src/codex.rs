@@ -329,6 +329,7 @@ fn apply_launch_preferences(args: &mut Vec<OsString>) {
     for value in [
         "agents.max_concurrent_threads_per_session=16",
         "tui.theme=\"monokai-extended\"",
+        "tui.whimsy=false",
         "tui.status_line_use_colors=true",
         "tui.resume_cwd=\"session\"",
         "notice.hide_rate_limit_model_nudge=true",
