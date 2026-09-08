@@ -45,7 +45,7 @@ bash SCRIPT next --codex-home PATH --sqlite-home PATH \
   --auth-file PATH --credential-use-lock PATH \
   --credential-use-lock-mode shared|exclusive \
   --credential-mutation-lock PATH --available-file PATH \
-  --cause quota-exhausted|credential-invalid [--unavailable-until UNIX_SECONDS]
+  --cause quota-exhausted|credential-invalid|model-capacity [--unavailable-until UNIX_SECONDS]
 ```
 
 Each returns exactly one JSON object:
@@ -69,7 +69,7 @@ Paths must be distinct and absolute, with private regular files owned by the use
 The provider owns the files. Removing the availability marker prevents new selections. The two
 home arguments are opaque launch context.
 
-Only quota exhaustion or permanent credential failure invokes `next`. Kai forwards the reported
+Quota exhaustion, permanent credential failure, or model capacity invokes `next`. Kai forwards the reported
 reset timestamp, then restores Codex's input handoff and resumes the conversation. Normal exit and
 crashes invoke no hook; the operating system releases held locks.
 

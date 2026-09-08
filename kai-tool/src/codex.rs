@@ -72,6 +72,7 @@ pub(crate) struct SupervisedEnvironment<'a> {
 pub(crate) enum CredentialFailureCause {
     QuotaExhausted,
     CredentialInvalid,
+    ModelCapacity,
 }
 
 impl CredentialFailureCause {
@@ -79,6 +80,7 @@ impl CredentialFailureCause {
         match self {
             Self::QuotaExhausted => "quota-exhausted",
             Self::CredentialInvalid => "credential-invalid",
+            Self::ModelCapacity => "model-capacity",
         }
     }
 }

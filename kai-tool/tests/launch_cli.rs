@@ -279,7 +279,7 @@ fn provider_must_supply_a_valid_lock_mode() {
 
 #[test]
 fn unavailable_credential_calls_next_with_the_cause_and_resumes_the_thread() {
-    for cause in ["quota-exhausted", "credential-invalid"] {
+    for cause in ["quota-exhausted", "credential-invalid", "model-capacity"] {
         let mut fixture = Fixture::new();
         fixture.paths["credential_use_lock_mode"] = json!("exclusive");
         fs::write(
