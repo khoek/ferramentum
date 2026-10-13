@@ -16,6 +16,7 @@ Unambiguous command prefixes work, such as `kai r` and `kai llm`.
 `--fast` selects the Fast service tier. Custom builds with a `-k.` prerelease suffix followed
 by exactly eight hexadecimal commit characters (for example, `0.154.0-k.ac192cd7`) are supervised
 automatically. `--no-auto-restart` disables supervision. Kai runs Codex with its approval/sandbox bypass flag.
+On Linux, Kai best-effort sets each Codex process's `oom_score_adj` to `+800` when procfs permits it.
 
 Every launch and automatic recovery passes Codex config overrides for 16 concurrent spawned agents,
 the `monokai-extended` theme, disabled decorative whimsy, colored status indicators, the saved

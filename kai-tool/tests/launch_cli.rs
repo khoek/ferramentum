@@ -47,11 +47,19 @@ impl Fixture {
         )
         .unwrap();
         fs::write(bin.join("codex"), r#"#!/usr/bin/env python3
-import array, fcntl, json, os, pathlib, socket, sys
+import array, fcntl, json, os, pathlib, socket, sys, time
 args = sys.argv[1:]
 if args == ["--version"]:
     print("codex-cli " + os.environ.get("KAI_TEST_VERSION", "0.154.0-k.ac192cd7"))
     sys.exit(0)
+if os.environ.get("KAI_TEST_CHECK_OOM"):
+    adjustment = None
+    for _ in range(100):
+        adjustment = pathlib.Path("/proc/self/oom_score_adj").read_text().strip()
+        if adjustment == "800":
+            break
+        time.sleep(0.01)
+    assert adjustment == "800", adjustment
 def value(flag):
     return args[args.index(flag) + 1]
 if "--credential-startup-socket" in args:
@@ -225,6 +233,21 @@ fn ordinary_exit_keeps_the_selected_credential_without_calling_a_hook() {
             ),
             "shared"
         );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn codex_processes_receive_the_oom_score_adjustment() {
+    for no_auto_restart in [false, true] {
+        let fixture = Fixture::new();
+        let mut command = fixture.command();
+        command.env("KAI_TEST_CHECK_OOM", "1");
+        if no_auto_restart {
+            command.arg("--no-auto-restart");
+        }
+        command.assert().success();
+        assert_eq!(fixture.calls("codex-calls").len(), 1);
     }
 }
 

@@ -209,11 +209,13 @@ impl Launcher {
     fn from_binary(binary: PathBuf) -> Result<Self> {
         let mut version_command = Command::new(&binary);
         version_command.arg("--version");
-        let output = version_command
-            .stdin(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| format!("could not run `{} --version`", binary.display()))?;
+        let output = command_output_with_oom_score_adj(
+            version_command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .with_context(|| format!("could not run `{} --version`", binary.display()))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!(
@@ -379,14 +381,35 @@ fn run_direct(binary: &Path, args: &[OsString], cwd: &Path) -> Result<u8> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     command.current_dir(cwd);
-    let status = command
-        .status()
+    let mut child = command
+        .spawn()
         .with_context(|| format!("Failed to run `{}`", binary.display()))?;
+    apply_oom_score_adj(child.id());
+    let status = child
+        .wait()
+        .with_context(|| format!("Failed waiting for `{}`", binary.display()))?;
     Ok(status
         .code()
         .and_then(|code| u8::try_from(code).ok())
         .unwrap_or(1))
 }
+
+fn command_output_with_oom_score_adj(command: &mut Command) -> io::Result<std::process::Output> {
+    let child = command.spawn()?;
+    apply_oom_score_adj(child.id());
+    child.wait_with_output()
+}
+
+#[cfg(target_os = "linux")]
+const CODEX_OOM_SCORE_ADJ: &str = "800";
+
+#[cfg(target_os = "linux")]
+fn apply_oom_score_adj(pid: u32) {
+    let _ = std::fs::write(format!("/proc/{pid}/oom_score_adj"), CODEX_OOM_SCORE_ADJ);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_oom_score_adj(_pid: u32) {}
 
 fn recovery_args(recovery: ResumeHandoff) -> Vec<OsString> {
     let ResumeHandoff {
@@ -714,6 +737,9 @@ fn run_pty_session(
         .spawn_command(command)
         .with_context(|| format!("Failed to run `{}`", binary.display()))?;
     drop(pair.slave);
+    if let Some(pid) = child.process_id() {
+        apply_oom_score_adj(pid);
+    }
     #[cfg(unix)]
     if let Some(startup) = startup.as_mut()
         && let Err(error) = startup.complete(&mut *child)
@@ -1266,6 +1292,17 @@ mod tests {
         ] {
             assert!(!version_is_custom(format!("codex-cli {version}\n").as_bytes()).unwrap());
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn applies_oom_score_adjustment_to_child() {
+        let mut child = Command::new("sleep").arg("10").spawn().unwrap();
+        apply_oom_score_adj(child.id());
+        let adjustment = fs::read_to_string(format!("/proc/{}/oom_score_adj", child.id()));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(adjustment.unwrap().trim(), CODEX_OOM_SCORE_ADJ);
     }
 
     #[cfg(unix)]
