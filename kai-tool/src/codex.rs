@@ -314,6 +314,10 @@ impl Launcher {
             )?;
             match outcome {
                 PtyOutcome::Exited(code) => return Ok(code),
+                PtyOutcome::StreamDisconnected(recovery) => {
+                    selected = select_credential(None)?;
+                    args = recovery_args(recovery);
+                }
                 PtyOutcome::CredentialUnavailable(recovery, failure) => {
                     let paths = credential.as_ref().context(
                         "automatic credential rotation requires a configured credential provider",
@@ -625,6 +629,7 @@ fn read_exact_startup_frame(stream: &mut UnixStream, expected: &str) -> Result<(
 #[derive(Debug, PartialEq, Eq)]
 enum PtyOutcome {
     Exited(u8),
+    StreamDisconnected(ResumeHandoff),
     CredentialUnavailable(ResumeHandoff, CredentialFailure),
 }
 
@@ -639,9 +644,18 @@ struct ResumeHandoff {
 #[serde(deny_unknown_fields)]
 struct SupervisedExitPayload {
     version: u8,
-    outcome: CredentialFailureCause,
+    outcome: SupervisedExitOutcome,
     unavailable_until: Option<i64>,
     handoff_path: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum SupervisedExitOutcome {
+    QuotaExhausted,
+    CredentialInvalid,
+    ModelCapacity,
+    StreamDisconnected,
 }
 
 #[derive(Deserialize)]
@@ -1073,18 +1087,17 @@ impl OutputObservation {
 
     fn outcome(&self, exit_code: u32) -> Result<PtyOutcome> {
         if exit_code == u32::from(SUPERVISED_EXIT_CODE) {
-            let (recovery, failure) = supervised_exit_from_tail(&self.tail).with_context(|| {
-                    format!(
-                        "+k Codex exited with status {SUPERVISED_EXIT_CODE} without usable recovery data"
-                    )
-                })?;
-            return Ok(PtyOutcome::CredentialUnavailable(recovery, failure));
+            return supervised_exit_from_tail(&self.tail).with_context(|| {
+                format!(
+                    "+k Codex exited with status {SUPERVISED_EXIT_CODE} without usable recovery data"
+                )
+            });
         }
         Ok(PtyOutcome::Exited(u8::try_from(exit_code).unwrap_or(1)))
     }
 }
 
-fn supervised_exit_from_tail(tail: &[u8]) -> Result<(ResumeHandoff, CredentialFailure)> {
+fn supervised_exit_from_tail(tail: &[u8]) -> Result<PtyOutcome> {
     let prefix = b"codex+k (";
     let marker = tail
         .split(|byte| *byte == b'\n')
@@ -1149,10 +1162,18 @@ fn supervised_exit_from_tail(tail: &[u8]) -> Result<(ResumeHandoff, CredentialFa
         handoff_path,
     };
     validate_recovery_args(&recovery.resume_args)?;
-    Ok((
+    let cause = match payload.outcome {
+        SupervisedExitOutcome::QuotaExhausted => CredentialFailureCause::QuotaExhausted,
+        SupervisedExitOutcome::CredentialInvalid => CredentialFailureCause::CredentialInvalid,
+        SupervisedExitOutcome::ModelCapacity => CredentialFailureCause::ModelCapacity,
+        SupervisedExitOutcome::StreamDisconnected => {
+            return Ok(PtyOutcome::StreamDisconnected(recovery));
+        }
+    };
+    Ok(PtyOutcome::CredentialUnavailable(
         recovery,
         CredentialFailure {
-            cause: payload.outcome,
+            cause,
             unavailable_until: payload.unavailable_until,
         },
     ))
@@ -1418,7 +1439,7 @@ mod tests {
         );
         assert_eq!(
             supervised_exit_from_tail(output.as_bytes()).unwrap(),
-            (
+            PtyOutcome::CredentialUnavailable(
                 ResumeHandoff {
                     thread_id: thread_id.to_string(),
                     resume_args: vec![
@@ -1482,13 +1503,26 @@ mod tests {
     }
 
     #[test]
-    fn normal_status_ignores_marker_looking_output() {
+    fn ordinary_status_ignores_restart_looking_output() {
         let mut observation = OutputObservation::new();
         observation.process(
             b"codex+k (123e4567-e89b-12d3-a456-426614174000): supervised exit not-json\r\n",
         );
 
-        assert_eq!(observation.outcome(0).unwrap(), PtyOutcome::Exited(0));
+        observation.process(
+            concat!(
+                "stream disconnected before completion: ",
+                "An error occurred while processing your request.\r\n"
+            )
+            .as_bytes(),
+        );
+
+        for code in [0, 1] {
+            assert_eq!(
+                observation.outcome(code.into()).unwrap(),
+                PtyOutcome::Exited(code)
+            );
+        }
     }
 
     #[test]
@@ -1571,6 +1605,40 @@ mod tests {
                 }
             )
         );
+    }
+
+    #[test]
+    fn stream_disconnected_exit_restarts_without_rotating_credentials() {
+        let directory = tempdir().unwrap();
+        let handoff_path = directory.path().join("session.codex+k-handoff.json");
+        let thread_id = "123e4567-e89b-12d3-a456-426614174000";
+        fs::write(
+            &handoff_path,
+            serde_json::to_vec(&serde_json::json!({
+                "format": INPUT_HANDOFF_FORMAT,
+                "version": INPUT_HANDOFF_VERSION,
+                "thread_id": thread_id,
+                "resume_args": ["--model", "gpt-5.6"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let marker = serde_json::json!({
+            "version": 3,
+            "outcome": "stream-disconnected",
+            "handoff_path": handoff_path,
+        });
+        let output = format!("codex+k ({thread_id}): supervised exit {marker}\r\n");
+        let mut observation = OutputObservation::new();
+        observation.process(output.as_bytes());
+
+        assert!(matches!(
+            observation.outcome(u32::from(SUPERVISED_EXIT_CODE)).unwrap(),
+            PtyOutcome::StreamDisconnected(ResumeHandoff {
+                thread_id: ref id,
+                ..
+            }) if id == thread_id
+        ));
     }
 
     #[test]

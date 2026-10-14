@@ -270,6 +270,45 @@ fn provider_progress_passes_through_stderr_without_contaminating_json() {
 }
 
 #[test]
+fn cred_is_forwarded_to_each_credential_provider_call() {
+    let fixture = Fixture::new();
+    fixture
+        .managed()
+        .args(["--cred", "reuse"])
+        .env("KAI_TEST_CAUSE", "quota-exhausted")
+        .assert()
+        .success();
+    let calls = fixture.calls("provider-calls");
+    assert_eq!(calls.len(), 2);
+    for call in calls {
+        assert_eq!(argument(call.as_array().unwrap(), "--cred"), "reuse");
+    }
+}
+
+#[test]
+fn cred_requires_a_credential_provider() {
+    let fixture = Fixture::new();
+    fixture
+        .command()
+        .args(["--cred", "unique"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--cred requires a configured credential provider",
+        ));
+    assert!(!fixture.root.path().join("codex-calls").exists());
+
+    fixture
+        .managed()
+        .args(["--no-auto-restart", "--cred", "unique"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--cred requires automatic restart with a configured credential provider",
+        ));
+}
+
+#[test]
 fn provider_must_supply_a_valid_lock_mode() {
     for mode in [None, Some("random")] {
         let mut fixture = Fixture::new();
@@ -354,6 +393,63 @@ fn unavailable_credential_calls_next_with_the_cause_and_resumes_the_thread() {
             fixture.root.path().join("handoff.json").to_str().unwrap()
         );
     }
+}
+
+#[test]
+fn disconnected_stream_resumes_with_or_without_a_credential_provider() {
+    for lock_mode in [None, Some("shared"), Some("exclusive")] {
+        let mut fixture = Fixture::new();
+        let mut command = if let Some(mode) = lock_mode {
+            fixture.paths["credential_use_lock_mode"] = json!(mode);
+            fs::write(
+                fixture.root.path().join("paths.json"),
+                fixture.paths.to_string(),
+            )
+            .unwrap();
+            fixture.managed()
+        } else {
+            fixture.command()
+        };
+        command
+            .env("KAI_TEST_CAUSE", "stream-disconnected")
+            .assert()
+            .success();
+
+        let codex = fixture.calls("codex-calls");
+        assert_eq!(codex.len(), 2);
+        for call in &codex {
+            assert_launch_preferences(call);
+        }
+        let resumed = codex[1]["args"].as_array().unwrap();
+        assert_eq!(&resumed[..2], &[json!("resume"), json!(THREAD_ID)]);
+        assert!(resumed.iter().any(|arg| arg == "--start-immediately"));
+        assert_eq!(argument(resumed, "--model"), "gpt-test");
+        assert_eq!(
+            argument(resumed, "--restore-input-handoff"),
+            fixture.root.path().join("handoff.json").to_str().unwrap()
+        );
+        if let Some(mode) = lock_mode {
+            let calls = fixture.calls("provider-calls");
+            assert_eq!(calls.len(), 2);
+            assert!(calls.iter().all(|call| call[0] == "acquire"));
+            assert_eq!(argument(resumed, "--credential-use-lock-mode"), mode);
+        } else {
+            assert!(!fixture.root.path().join("provider-calls").exists());
+        }
+    }
+}
+
+#[test]
+fn disabled_supervision_does_not_restart_a_disconnected_stream() {
+    let fixture = Fixture::new();
+    fixture
+        .managed()
+        .arg("--no-auto-restart")
+        .env("KAI_TEST_CAUSE", "stream-disconnected")
+        .assert()
+        .code(75);
+    assert_eq!(fixture.calls("codex-calls").len(), 1);
+    assert!(!fixture.root.path().join("provider-calls").exists());
 }
 
 #[test]

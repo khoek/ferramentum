@@ -181,9 +181,10 @@ impl CredentialProvider {
         &self,
         environment: &CodexEnvironment,
         previous: Option<(&CredentialPaths, &CredentialFailure)>,
+        cred: Option<&str>,
     ) -> Result<SelectedCredential> {
         let deadline = Instant::now() + PROVIDER_TIMEOUT;
-        let mut paths = self.invoke(environment, previous, deadline)?;
+        let mut paths = self.invoke(environment, previous, cred, deadline)?;
         loop {
             if let Some(guard) = CredentialUseGuard::try_acquire(
                 &paths.credential_use_lock,
@@ -192,7 +193,7 @@ impl CredentialProvider {
             {
                 return Ok(SelectedCredential { paths, guard });
             }
-            paths = self.invoke(environment, None, deadline)?;
+            paths = self.invoke(environment, None, cred, deadline)?;
         }
     }
 
@@ -200,6 +201,7 @@ impl CredentialProvider {
         &self,
         environment: &CodexEnvironment,
         previous: Option<(&CredentialPaths, &CredentialFailure)>,
+        cred: Option<&str>,
         deadline: Instant,
     ) -> Result<CredentialPaths> {
         if Instant::now() >= deadline {
@@ -220,6 +222,9 @@ impl CredentialProvider {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        if let Some(cred) = cred {
+            command.arg("--cred").arg(cred);
+        }
         if let Some((paths, failure)) = previous {
             command
                 .arg("--auth-file")
@@ -410,6 +415,7 @@ mod tests {
                     codex_home: root.path().join("codex"),
                     sqlite_home: root.path().join("sqlite"),
                 },
+                None,
                 None,
             )
             .unwrap();

@@ -16,6 +16,10 @@ Unambiguous command prefixes work, such as `kai r` and `kai llm`.
 `--fast` selects the Fast service tier. Custom builds with a `-k.` prerelease suffix followed
 by exactly eight hexadecimal commit characters (for example, `0.154.0-k.ac192cd7`) are supervised
 automatically. `--no-auto-restart` disables supervision. Kai runs Codex with its approval/sandbox bypass flag.
+With a custom Codex build that reports `stream-disconnected` recovery, the terminal error
+`stream disconnected before completion: An error occurred while processing your request.`
+also resumes the conversation after Codex finishes retrying, restoring pending input. If a
+credential provider is configured, recovery calls `acquire` without reporting a credential failure.
 On Linux, Kai best-effort sets each Codex process's `oom_score_adj` to `+800` when procfs permits it.
 
 Every launch and automatic recovery passes Codex config overrides for 16 concurrent spawned agents,

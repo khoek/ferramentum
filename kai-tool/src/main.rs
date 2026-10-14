@@ -24,6 +24,10 @@ struct Cli {
     #[arg(long, value_name = "SCRIPT", global = true)]
     credential_provider: Option<PathBuf>,
 
+    /// Argument passed to the credential provider when selecting a credential.
+    #[arg(long, value_name = "ARG", global = true)]
+    cred: Option<String>,
+
     /// Start Codex using the Fast service tier.
     #[arg(long, global = true)]
     fast: bool,
@@ -63,7 +67,11 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<ExitCode> {
     let args = match cli.command {
         Some(Commands::LlmGet(args)) => {
-            if cli.fast || cli.no_auto_restart || cli.credential_provider.is_some() {
+            if cli.fast
+                || cli.no_auto_restart
+                || cli.credential_provider.is_some()
+                || cli.cred.is_some()
+            {
                 bail!("Codex launch options cannot be used with llm-get");
             }
             llm_get::run(args)?;
@@ -84,6 +92,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
         codex::ServiceTier::Default
     };
     if !launcher.supervision_enabled(cli.no_auto_restart) {
+        if cli.cred.is_some() {
+            bail!("--cred requires automatic restart with a configured credential provider");
+        }
         return Ok(ExitCode::from(launcher.run_direct(
             args,
             &cwd,
@@ -92,6 +103,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
     let provider =
         credential_provider::CredentialProvider::load(cli.credential_provider.as_deref())?;
+    if cli.cred.is_some() && provider.is_none() {
+        bail!("--cred requires a configured credential provider");
+    }
     let environment = credential_provider::CodexEnvironment::from_env(&cwd)?;
     Ok(ExitCode::from(launcher.run_supervised(
         args,
@@ -101,7 +115,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         |previous| {
             provider
                 .as_ref()
-                .map(|provider| provider.select(&environment, previous))
+                .map(|provider| provider.select(&environment, previous, cli.cred.as_deref()))
                 .transpose()
         },
     )?))
@@ -135,10 +149,13 @@ mod tests {
             "--no-auto-restart",
             "--credential-provider",
             "/provider",
+            "--cred",
+            "reuse",
         ])
         .unwrap();
         assert!(cli.fast && cli.no_auto_restart);
         assert_eq!(cli.credential_provider, Some(PathBuf::from("/provider")));
+        assert_eq!(cli.cred.as_deref(), Some("reuse"));
     }
 
     #[test]
