@@ -20,6 +20,8 @@ With a custom Codex build that reports `stream-disconnected` recovery, the termi
 `stream disconnected before completion: An error occurred while processing your request.`
 also resumes the conversation after Codex finishes retrying, restoring pending input. If a
 credential provider is configured, recovery calls `acquire` without reporting a credential failure.
+Supervised restart conditions apply to the primary conversation; errors from spawned agents do not
+restart the instance. The custom Codex build enforces this before requesting shutdown.
 On Linux, Kai best-effort sets each Codex process's `oom_score_adj` to `+800` when procfs permits it.
 
 Every launch and automatic recovery passes Codex config overrides for 16 concurrent spawned agents,
