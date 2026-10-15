@@ -25,10 +25,12 @@ restart the instance. The custom Codex build enforces this before requesting shu
 On Linux, Kai best-effort sets each Codex process's `oom_score_adj` to `+800` when procfs permits it.
 
 Every launch and automatic recovery passes Codex config overrides for 16 concurrent spawned agents,
-the `monokai-extended` theme, disabled decorative whimsy, colored status indicators, the saved
+disabled decorative whimsy, colored status indicators, the saved
 session's working directory on resume, and hidden rate-limit model-switch reminders. The status
 line shows model/reasoning, run
 state, remaining context, weekly limit, total input/output tokens, and Fast-mode status, in that order.
+The theme follows Codex's configuration or `/theme` selection, including across automatic recovery.
+For colours that follow a terminal's light/dark palette, select Codex's `ansi` theme.
 
 Install with `cargo install --path kai-tool --locked --force`.
 

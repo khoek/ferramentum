@@ -171,7 +171,7 @@ fn assert_launch_preferences(call: &Value) {
         .filter(|pair| pair[0] == "-c")
         .filter_map(|pair| {
             let (key, value) = pair[1].as_str().unwrap().split_once('=').unwrap();
-            if key == "service_tier" {
+            if key == "service_tier" || key == "tui.theme" {
                 return None;
             }
             let parsed: toml::Table = toml::from_str(&format!("value={value}")).unwrap();
@@ -185,7 +185,6 @@ fn assert_launch_preferences(call: &Value) {
         Value::Object(preferences),
         json!({
             "agents.max_concurrent_threads_per_session": 16,
-            "tui.theme": "monokai-extended",
             "tui.whimsy": false,
             "tui.status_line_use_colors": true,
             "tui.resume_cwd": "session",
@@ -222,6 +221,10 @@ fn ordinary_exit_keeps_the_selected_credential_without_calling_a_hook() {
         );
         assert!(std::path::Path::new(fixture.paths["auth_file"].as_str().unwrap()).exists());
         let codex = fixture.calls("codex-calls");
+        assert!(!codex[0]["args"].as_array().unwrap().iter().any(|arg| {
+            arg.as_str()
+                .is_some_and(|arg| arg.starts_with("tui.theme="))
+        }));
         assert_eq!(
             argument(codex[0]["args"].as_array().unwrap(), "--auth-file"),
             &fixture.paths["auth_file"]
@@ -373,6 +376,13 @@ fn unavailable_credential_calls_next_with_the_cause_and_resumes_the_thread() {
         }
         let codex = fixture.calls("codex-calls");
         assert_eq!(codex.len(), 2);
+        let themes = codex[1]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|arg| arg.as_str().filter(|arg| arg.starts_with("tui.theme=")))
+            .collect::<Vec<_>>();
+        assert_eq!(themes, ["tui.theme=\"other\""]);
         for call in &codex {
             assert_launch_preferences(call);
             assert_eq!(
