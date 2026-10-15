@@ -26,6 +26,7 @@ libc = { workspace = true }
 pathdiff = "0.2"
 portable-pty = "0.9"
 rand = { workspace = true }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -33,7 +34,10 @@ tempfile = { workspace = true }
 walkdir = "2"
 which = { workspace = true }
 toml = "1"
+time = { version = "0.3", features = ["parsing"] }
+unicode-width = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+vt100 = "0.16"

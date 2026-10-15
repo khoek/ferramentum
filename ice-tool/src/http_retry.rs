@@ -62,7 +62,7 @@ where
     unreachable!("send_with_429_backoff loop must return before exhaustion")
 }
 
-fn retry_after_delay(response: &Response) -> Option<Duration> {
+pub(crate) fn retry_after_delay(response: &Response) -> Option<Duration> {
     let raw = response.headers().get(RETRY_AFTER)?.to_str().ok()?.trim();
     if raw.is_empty() {
         return None;

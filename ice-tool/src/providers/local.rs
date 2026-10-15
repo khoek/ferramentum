@@ -26,6 +26,15 @@ pub(crate) struct Provider;
 impl CloudInstance for LocalInstance {
     type ListContext = LocalContext;
 
+    fn json_summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id, "name": self.name, "state": self.state,
+            "image": self.image, "created_at": self.created_at,
+            "started_at": self.started_at, "runtime_seconds": self.runtime_seconds,
+            "workload": crate::output::workload(self.workload.as_ref()),
+        })
+    }
+
     fn cache_key(&self) -> String {
         self.name.clone()
     }
@@ -143,6 +152,13 @@ impl CloudProvider for Provider {
         )
     }
 
+    fn observe_instance(
+        context: &Self::ProviderContext<'_>,
+        instance: &Self::Instance,
+    ) -> Result<Option<Self::Instance>> {
+        crate::local::local_observe_instance(context, instance)
+    }
+
     fn delete_instance(
         context: &Self::ProviderContext<'_>,
         instance: &Self::Instance,
@@ -232,6 +248,35 @@ impl CreateProvider for Provider {
         }
         let context = local_context();
 
+        if crate::output::is_json() && args.dry_run {
+            if matches!(workload, InstanceWorkload::Container(_)) {
+                context.require_runtime()?;
+            }
+            return crate::output::emit(
+                "create",
+                Cloud::Local,
+                serde_json::json!({
+                    "status": "preview", "dry_run": true,
+                    "workload": crate::output::workload(Some(&workload)),
+                    "requested_hours": hours,
+                    "container_runtime": context.runtime.map(|runtime| runtime.shell_prefix()),
+                    "cost": null,
+                }),
+            );
+        }
+
+        if crate::output::is_json() {
+            let instance = crate::local::local_create_instance(config, &context, hours, &workload)?;
+            return crate::output::emit(
+                "create",
+                Cloud::Local,
+                serde_json::json!({
+                    "status": "created", "instance": instance.json_summary(),
+                    "requested_hours": hours, "cost": null,
+                }),
+            );
+        }
+
         println!();
         println!("Local workload:");
         match &workload {
@@ -273,7 +318,10 @@ impl CreateProvider for Provider {
             return Ok(());
         }
 
-        if prompt_confirm("Open shell in the new instance now?", true)? {
+        if !crate::automation::non_interactive()
+            && !args.yes
+            && prompt_confirm("Open shell in the new instance now?", true)?
+        {
             local_open_shell(&context, &instance)?;
         }
 

@@ -4,9 +4,8 @@ use std::collections::{BTreeSet, HashSet};
 use anyhow::{Context, Result, anyhow, bail};
 use dialoguer::console::{Key, Term};
 use dialoguer::{Input, Select};
-use serde_json::json;
+use serde_json::{Value, json};
 
-use crate::config_store::save_config;
 use crate::gpu::{
     canonicalize_gpu_name, canonicalize_gpu_name_for_cloud, gpu_fp32_tflops, gpu_quality_score,
     gpu_reference_model, gpu_selector_label, provider_gpu_options,
@@ -17,51 +16,17 @@ use crate::model::{
 };
 use crate::providers::{aws, gcp, vast::VastClient, vast::VastOffer};
 use crate::support::{
-    now_unix_secs, prompt_f64, prompt_theme, prompt_u32, require_interactive,
-    required_runtime_seconds, spinner,
+    prompt_f64, prompt_theme, prompt_u32, require_interactive, required_runtime_seconds, spinner,
 };
-use crate::ui::print_notice;
 
-const VAST_DEFAULT_DISK_GB: f64 = 32.0;
 const VAST_DEFAULT_SEARCH_LIMIT: u64 = 200;
 
 fn cloud_search_key_prefix(cloud: Cloud) -> &'static str {
     match cloud {
+        Cloud::Verda => "default.verda",
         Cloud::VastAi => "default.vast_ai",
         Cloud::Gcp => "default.gcp",
         Cloud::Aws => "default.aws",
-        Cloud::Local => unreachable!("local does not use marketplace search defaults"),
-    }
-}
-
-fn cloud_search_defaults_mut(
-    config: &mut IceConfig,
-    cloud: Cloud,
-) -> (
-    &mut Option<u32>,
-    &mut Option<f64>,
-    &mut Option<Vec<String>>,
-    &mut Option<f64>,
-) {
-    match cloud {
-        Cloud::VastAi => (
-            &mut config.default.vast_ai.min_cpus,
-            &mut config.default.vast_ai.min_ram_gb,
-            &mut config.default.vast_ai.allowed_gpus,
-            &mut config.default.vast_ai.max_price_per_hr,
-        ),
-        Cloud::Gcp => (
-            &mut config.default.gcp.min_cpus,
-            &mut config.default.gcp.min_ram_gb,
-            &mut config.default.gcp.allowed_gpus,
-            &mut config.default.gcp.max_price_per_hr,
-        ),
-        Cloud::Aws => (
-            &mut config.default.aws.min_cpus,
-            &mut config.default.aws.min_ram_gb,
-            &mut config.default.aws.allowed_gpus,
-            &mut config.default.aws.max_price_per_hr,
-        ),
         Cloud::Local => unreachable!("local does not use marketplace search defaults"),
     }
 }
@@ -76,6 +41,12 @@ fn cloud_search_defaults(
     &Option<f64>,
 ) {
     match cloud {
+        Cloud::Verda => (
+            &config.default.verda.min_cpus,
+            &config.default.verda.min_ram_gb,
+            &config.default.verda.allowed_gpus,
+            &config.default.verda.max_price_per_hr,
+        ),
         Cloud::VastAi => (
             &config.default.vast_ai.min_cpus,
             &config.default.vast_ai.min_ram_gb,
@@ -98,96 +69,33 @@ fn cloud_search_defaults(
     }
 }
 
-pub(crate) fn ensure_default_create_config(
-    config: &mut IceConfig,
-    cloud: Cloud,
-    gpu_options: &[String],
-) -> Result<()> {
-    let mut changed = false;
-    let key_prefix = cloud_search_key_prefix(cloud);
-
-    {
-        let (min_cpus, min_ram_gb, allowed_gpus, max_price_per_hr) =
-            cloud_search_defaults_mut(config, cloud);
-
-        if min_cpus.is_none() {
-            let value = prompt_u32(&format!("Minimum vCPUs ({cloud})"), Some(8), 1)?;
-            *min_cpus = Some(value);
-            changed = true;
-        }
-
-        if min_ram_gb.is_none() {
-            let value = prompt_f64(&format!("Minimum RAM (GB) ({cloud})"), Some(32.0), 0.001)?;
-            *min_ram_gb = Some(value);
-            changed = true;
-        }
-
-        if cloud == Cloud::VastAi
-            && allowed_gpus
-                .as_ref()
-                .map(|items| items.is_empty())
-                .unwrap_or(true)
-        {
-            let selected = prompt_gpu_checklist(gpu_options, &[], false)?;
-            *allowed_gpus = Some(selected);
-            changed = true;
-        }
-
-        if max_price_per_hr.is_none() {
-            let value = prompt_f64(
-                &format!("Max price per hour (USD) ({cloud})"),
-                Some(1.0),
-                0.0001,
-            )?;
-            *max_price_per_hr = Some(value);
-            changed = true;
-        }
-    }
-
-    if changed {
-        let path = save_config(config)?;
-        print_notice(&format!(
-            "Updated {key_prefix} search defaults in {}",
-            path.display()
-        ));
-    }
-
-    Ok(())
-}
-
 pub(crate) fn build_search_requirements(
     config: &IceConfig,
     cloud: Cloud,
 ) -> Result<CreateSearchRequirements> {
-    let key_prefix = cloud_search_key_prefix(cloud);
-    let (min_cpus_ref, min_ram_gb_ref, allowed_gpus_ref, max_price_per_hr_ref) =
-        cloud_search_defaults(config, cloud);
-
-    let min_cpus = (*min_cpus_ref).ok_or_else(|| anyhow!("{key_prefix}.min_cpus is not set"))?;
-    let min_ram_gb =
-        (*min_ram_gb_ref).ok_or_else(|| anyhow!("{key_prefix}.min_ram_gb is not set"))?;
-    let allowed_gpus = match cloud {
-        Cloud::VastAi => {
-            let values = allowed_gpus_ref
-                .clone()
-                .ok_or_else(|| anyhow!("{key_prefix}.allowed_gpus is not set"))?;
-            if values.is_empty() {
-                bail!("{key_prefix}.allowed_gpus cannot be empty");
-            }
-            values
-        }
-        Cloud::Gcp | Cloud::Aws => allowed_gpus_ref.clone().unwrap_or_default(),
-        Cloud::Local => Vec::new(),
+    let (cpus, ram, gpus, price) = cloud_search_defaults(config, cloud);
+    let max_price_per_hr = price.ok_or_else(|| crate::automation::error(
+        "missing_configuration", "Supply --max-price-per-hr or save a provider price ceiling with ice config set.",
+        json!({"missing": [format!("{}.max_price_per_hr", cloud_search_key_prefix(cloud))], "required_flags": ["--max-price-per-hr"]})))?;
+    let raw = serde_json::to_value(config)?;
+    let key = match cloud {
+        Cloud::Verda => "verda",
+        Cloud::VastAi => "vast_ai",
+        Cloud::Gcp => "gcp",
+        Cloud::Aws => "aws",
+        Cloud::Local => unreachable!(),
     };
-
-    let max_price_per_hr = (*max_price_per_hr_ref)
-        .ok_or_else(|| anyhow!("{key_prefix}.max_price_per_hr is not set"))?;
-
+    let defaults = &raw["default"][key];
     Ok(CreateSearchRequirements {
-        min_cpus,
-        min_ram_gb,
-        allowed_gpus,
+        min_cpus: cpus.unwrap_or(0),
+        min_ram_gb: ram.unwrap_or(0.0),
+        allowed_gpus: gpus.clone().unwrap_or_default(),
         max_price_per_hr,
+        gpu_count: defaults["gpu_count"].as_u64().map(|v| v as u32),
+        min_gpu_memory_gb: defaults["min_gpu_memory_gb"].as_f64(),
+        disk_gb: defaults["disk_gb"].as_u64().map(|v| v as u32),
+        min_download_mbps: defaults["min_download_mbps"].as_f64(),
+        min_upload_mbps: defaults["min_upload_mbps"].as_f64(),
     })
 }
 
@@ -199,66 +107,37 @@ pub(crate) fn find_cheapest_offer(
     excluded_offer_ids: &HashSet<u64>,
 ) -> Result<VastOffer> {
     let duration_seconds = required_runtime_seconds(hours) as f64;
-    let min_ram_mb = req.min_ram_gb * 1000.0;
-
-    let allowed_gpus = req
-        .allowed_gpus
-        .iter()
-        .map(|name| canonicalize_gpu_name(name).unwrap_or_else(|| name.clone()))
-        .collect::<Vec<_>>();
-
-    let mut query = json!({
-        "verified": {"eq": true},
-        "external": {"eq": false},
-        "rentable": {"eq": true},
-        "rented": {"eq": false},
-        "cpu_cores_effective": {"gte": req.min_cpus as f64},
-        "cpu_ram": {"gte": min_ram_mb},
-        "duration": {"gte": duration_seconds},
-        "gpu_name": {"in": allowed_gpus},
-        "direct_port_count": {"gte": 1},
-        "order": [["dph_total", "asc"], ["duration", "asc"], ["reliability", "desc"]],
-        "type": "on-demand",
-        "limit": VAST_DEFAULT_SEARCH_LIMIT,
-        "allocated_storage": VAST_DEFAULT_DISK_GB,
-    });
-
-    if let Some(machine) = machine_override
-        && !machine.trim().is_empty()
-    {
-        let machine = canonicalize_gpu_name(machine).unwrap_or_else(|| machine.trim().to_owned());
-        query["gpu_name"] = json!({"eq": machine});
-    }
-
+    let query = vast_search_query(req, hours, machine_override);
     let spinner = spinner("Searching vast.ai offers...");
-    let mut offers = client.search_offers(&query)?;
+    let offers = client.search_offers(&query)?;
     spinner.finish_with_message(format!("Found {} matching offers.", offers.len()));
 
+    select_vast_offer(offers, req, duration_seconds, excluded_offer_ids)
+}
+
+fn select_vast_offer(
+    mut offers: Vec<VastOffer>,
+    req: &CreateSearchRequirements,
+    duration_seconds: f64,
+    excluded_offer_ids: &HashSet<u64>,
+) -> Result<VastOffer> {
     offers.retain(|offer| {
-        !excluded_offer_ids.contains(&offer.id)
-            && offer.hourly_price().is_finite()
+        vast_offer_matches(offer, req)
+            && !excluded_offer_ids.contains(&offer.id)
+            && offer
+                .quoted_total_hourly_price()
+                .is_some_and(|price| price <= req.max_price_per_hr)
             && offer_duration_seconds(offer)
                 .map(|duration| duration >= duration_seconds)
                 .unwrap_or(false)
     });
     if offers.is_empty() {
-        let excluded_count = excluded_offer_ids.len();
-        if excluded_count == 0 {
-            bail!(
-                "No offers match the filters (min_cpus={}, min_ram_gb={}, allowed_gpus={}, min_duration_hours={:.2}).",
-                req.min_cpus,
-                req.min_ram_gb,
-                req.allowed_gpus.join(", "),
-                hours
-            );
-        }
-        bail!(
-            "No offers remain after excluding {excluded_count} failed offer(s) (min_cpus={}, min_ram_gb={}, allowed_gpus={}, min_duration_hours={:.2}).",
-            req.min_cpus,
-            req.min_ram_gb,
-            req.allowed_gpus.join(", "),
-            hours
-        );
+        return Err(crate::automation::error(
+            "no_matching_offers",
+            "No Vast offers satisfy the filters, availability and compute-plus-storage price ceiling with a valid on-demand quote.",
+            json!({"excluded_offer_ids": excluded_offer_ids, "max_price_per_hr": req.max_price_per_hr,
+                "cost_scope": "compute_and_allocated_storage", "required_quote": "search.totalHour"}),
+        ));
     }
 
     offers.sort_by(compare_offer_price_then_duration);
@@ -328,14 +207,15 @@ fn estimated_billed_hours(cloud: Cloud, requested_hours: f64) -> f64 {
     match cloud {
         Cloud::VastAi => requested_hours,
         Cloud::Gcp | Cloud::Aws => required_runtime_seconds(requested_hours) as f64 / 3600.0,
-        Cloud::Local => requested_hours,
+        Cloud::Local | Cloud::Verda => requested_hours,
     }
 }
 
 pub(crate) fn apply_vast_autostop_cost_estimate(
     cost: RuntimeCostEstimate,
+    start_unix: u64,
 ) -> Result<RuntimeCostEstimate> {
-    let plan = build_vast_autostop_plan(now_unix_secs(), cost.requested_hours)?;
+    let plan = build_vast_autostop_plan(start_unix, cost.requested_hours)?;
     let total_usd = cost.hourly_usd * plan.runtime_hours;
     Ok(RuntimeCostEstimate {
         requested_hours: cost.requested_hours,
@@ -360,6 +240,17 @@ pub(crate) fn build_vast_autostop_plan(
         .saturating_sub(start_unix)
         .max(min_runtime_secs)
         .max(1);
+
+    // Vast's recorded HOURLY job ran before its start_time in the trial.
+    // A pinned weekly calendar must have no earlier occurrence even if that
+    // boundary is ignored. Do not accept a rental that cannot meet this guard.
+    if runtime_secs >= 7 * 24 * 3600 {
+        return Err(crate::automation::error(
+            "auto_stop_window_unsupported",
+            "Vast auto-stop must fall less than seven days ahead after rounding to a UTC hour; shorten --hours.",
+            json!({"requested_hours": requested_hours, "scheduled_hours": runtime_secs as f64 / 3600.0}),
+        ));
+    }
 
     Ok(VastAutoStopPlan {
         stop_at_unix,
@@ -448,6 +339,7 @@ pub(crate) fn print_offer_summary(
     offer: &VastOffer,
     cost: &RuntimeCostEstimate,
     req: &CreateSearchRequirements,
+    stop_at_unix: u64,
 ) {
     let cpu = offer.cpu_cores_effective.unwrap_or(0.0);
     let ram_gb = offer.cpu_ram.unwrap_or(0.0) / 1000.0;
@@ -461,7 +353,14 @@ pub(crate) fn print_offer_summary(
     println!("Best matching offer:");
     let mut entries = vec![
         ("Offer ID".to_owned(), offer.id.to_string()),
-        ("Price".to_owned(), format!("${:.4}/hr", cost.hourly_usd)),
+        (
+            "Compute + allocated storage".to_owned(),
+            format!("${:.4}/hr", cost.hourly_usd),
+        ),
+        (
+            "Planned stop (UTC)".to_owned(),
+            crate::support::format_unix_utc(stop_at_unix),
+        ),
         ("GPU".to_owned(), format!("{gpu} x{num_gpus}{gpu_relative}")),
         ("CPU".to_owned(), format!("{cpu:.1} vCPU")),
         ("RAM".to_owned(), format!("{ram_gb:.1} GB")),
@@ -482,8 +381,23 @@ pub(crate) fn print_offer_summary(
         ));
     }
     entries.push((
-        "Estimated compute cost".to_owned(),
+        "Estimated cost (excluding bandwidth)".to_owned(),
         format!("${:.4}", cost.total_usd),
+    ));
+    for (name, rate) in [
+        ("Download", offer.inet_down_cost),
+        ("Upload", offer.inet_up_cost),
+    ] {
+        entries.push((
+            format!("{name} bandwidth"),
+            rate.filter(|v| v.is_finite() && *v >= 0.0)
+                .map(|v| format!("${v:.6}/GB extra"))
+                .unwrap_or_else(|| "unknown; billed separately".to_owned()),
+        ));
+    }
+    entries.push((
+        "After stop".to_owned(),
+        "Storage billing continues until deletion".to_owned(),
     ));
     if let Some(location) = offer.geolocation.as_deref() {
         entries.push(("Location".to_owned(), location.to_owned()));
@@ -770,7 +684,7 @@ pub(crate) fn estimated_machine_hourly_price(cloud: Cloud, machine: &str) -> Opt
     match cloud {
         Cloud::Gcp => gcp::cached_machine_hourly_price(machine),
         Cloud::Aws => aws::cached_machine_hourly_price(machine),
-        Cloud::VastAi | Cloud::Local => None,
+        Cloud::VastAi | Cloud::Local | Cloud::Verda => None,
     }
 }
 
@@ -783,7 +697,9 @@ pub(crate) fn find_cheapest_cloud_machine(
     match cloud {
         Cloud::Gcp => gcp::find_cheapest_machine_candidate(config, req, machine_override),
         Cloud::Aws => aws::find_cheapest_machine_candidate(config, req, machine_override),
-        Cloud::VastAi | Cloud::Local => bail!("No machine catalog for cloud `{cloud}`"),
+        Cloud::VastAi | Cloud::Local | Cloud::Verda => {
+            bail!("No machine catalog for cloud `{cloud}`")
+        }
     }
 }
 
@@ -844,5 +760,262 @@ fn format_ram_mb_gb(value: u32) -> String {
         format!("{value:.0}")
     } else {
         format!("{value:.2}")
+    }
+}
+
+fn vast_offer_matches(offer: &VastOffer, req: &CreateSearchRequirements) -> bool {
+    fn minimum(actual: Option<f64>, requested: Option<f64>) -> bool {
+        requested.is_none_or(|minimum| actual.is_some_and(|v| v.is_finite() && v >= minimum))
+    }
+    req.gpu_count
+        .is_none_or(|count| offer.num_gpus == Some(count))
+        && (req.min_gpu_memory_gb.is_none() || offer.num_gpus.is_some_and(|count| count > 0))
+        && minimum(offer.gpu_ram, req.min_gpu_memory_gb.map(|gb| gb * 1000.0))
+        && minimum(offer.inet_down, req.min_download_mbps)
+        && minimum(offer.inet_up, req.min_upload_mbps)
+        && minimum(offer.disk_space, req.disk_gb.map(f64::from))
+        && (req.min_cpus == 0 || minimum(offer.cpu_cores_effective, Some(f64::from(req.min_cpus))))
+        && (req.min_ram_gb == 0.0 || minimum(offer.cpu_ram, Some(req.min_ram_gb * 1000.0)))
+        && (req.allowed_gpus.is_empty()
+            || offer.gpu_name.as_ref().is_some_and(|gpu| {
+                req.allowed_gpus.iter().any(|allowed| {
+                    canonicalize_gpu_name(gpu)
+                        .unwrap_or_else(|| gpu.clone())
+                        .eq_ignore_ascii_case(
+                            &canonicalize_gpu_name(allowed).unwrap_or_else(|| allowed.clone()),
+                        )
+                })
+            }))
+}
+
+fn vast_search_query(
+    req: &CreateSearchRequirements,
+    hours: f64,
+    machine_override: Option<&str>,
+) -> Value {
+    let duration_seconds = required_runtime_seconds(hours) as f64;
+    let min_ram_mb = req.min_ram_gb * 1000.0;
+
+    let allowed_gpus = req
+        .allowed_gpus
+        .iter()
+        .map(|name| canonicalize_gpu_name(name).unwrap_or_else(|| name.clone()))
+        .collect::<Vec<_>>();
+
+    let mut query = json!({
+        "verified": {"eq": true},
+        "external": {"eq": false},
+        "rentable": {"eq": true},
+        "rented": {"eq": false},
+        "cpu_cores_effective": {"gte": req.min_cpus as f64},
+        "cpu_ram": {"gte": min_ram_mb},
+        "duration": {"gte": duration_seconds},
+        "gpu_name": {"in": allowed_gpus},
+        "direct_port_count": {"gte": 1},
+        "order": [["dph_total", "asc"], ["duration", "asc"], ["reliability", "desc"]],
+        "type": "on-demand",
+        "limit": VAST_DEFAULT_SEARCH_LIMIT,
+        "allocated_storage": req.disk_gb.unwrap_or(32),
+        "disk_space": {"gte": req.disk_gb.unwrap_or(32)},
+    });
+
+    if allowed_gpus.is_empty() {
+        query.as_object_mut().unwrap().remove("gpu_name");
+    }
+    if let Some(count) = req.gpu_count {
+        query["num_gpus"] = json!({"eq": count});
+    } else if req.min_gpu_memory_gb.is_some() {
+        query["num_gpus"] = json!({"gte": 1});
+    }
+    if let Some(gb) = req.min_gpu_memory_gb {
+        query["gpu_ram"] = json!({"gte": gb * 1000.0});
+    }
+    if let Some(mbps) = req.min_download_mbps {
+        query["inet_down"] = json!({"gte": mbps});
+    }
+    if let Some(mbps) = req.min_upload_mbps {
+        query["inet_up"] = json!({"gte": mbps});
+    }
+    if let Some(machine) = machine_override
+        && !machine.trim().is_empty()
+    {
+        let machine = canonicalize_gpu_name(machine).unwrap_or_else(|| machine.trim().to_owned());
+        query["gpu_name"] = json!({"eq": machine});
+    }
+
+    query
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    fn requirements() -> CreateSearchRequirements {
+        CreateSearchRequirements {
+            gpu_count: Some(1),
+            min_gpu_memory_gb: Some(24.0),
+            disk_gb: Some(80),
+            min_download_mbps: Some(500.0),
+            min_upload_mbps: Some(100.0),
+            max_price_per_hr: 0.6,
+            ..Default::default()
+        }
+    }
+
+    fn offer() -> Value {
+        json!({"id": 123, "num_gpus": 1, "gpu_ram": 24000, "disk_space": 80,
+            "inet_down": 500, "inet_up": 100, "dph_total": 0.4})
+    }
+
+    #[test]
+    fn selection_ranks_and_limits_the_allocated_storage_quote() {
+        let make = |id, base, total| {
+            serde_json::from_value(json!({
+                "id": id, "dph_total": base, "search": {"totalHour": total}, "duration": 7200
+            }))
+            .unwrap()
+        };
+        let req = CreateSearchRequirements {
+            max_price_per_hr: 0.5,
+            ..Default::default()
+        };
+        let selected = select_vast_offer(
+            vec![make(1, 0.1, 0.7), make(2, 0.3, 0.4), make(3, 0.2, 0.45)],
+            &req,
+            3600.0,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(selected.id, 2);
+        assert_eq!(selected.hourly_price(), 0.4);
+        let err =
+            select_vast_offer(vec![make(1, 0.1, 0.7)], &req, 3600.0, &HashSet::new()).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<crate::automation::AgentError>()
+                .unwrap()
+                .code,
+            "no_matching_offers"
+        );
+    }
+
+    #[test]
+    fn an_unquoted_or_discount_only_offer_cannot_bypass_the_ceiling() {
+        for search in [
+            Value::Null,
+            json!({"discountedTotalPerHour": 0.01}),
+            json!({"totalHour": 0}),
+            json!({"totalHour": -1}),
+        ] {
+            let offer = serde_json::from_value(json!({"id": 1, "dph_total": 0.01,
+                "search": search, "duration": 7200}))
+            .unwrap();
+            assert!(
+                select_vast_offer(
+                    vec![offer],
+                    &CreateSearchRequirements {
+                        max_price_per_hr: 0.5,
+                        ..Default::default()
+                    },
+                    3600.0,
+                    &HashSet::new()
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn offer_availability_must_cover_the_rounded_stop_deadline() {
+        let start = 1_790_571_601; // Just after a UTC hour boundary.
+        let plan = build_vast_autostop_plan(start, 0.25).unwrap();
+        let offer = serde_json::from_value(json!({"id": 1, "duration": 1800,
+            "dph_total": 0.1, "search": {"totalHour": 0.1}}))
+        .unwrap();
+        assert!(
+            select_vast_offer(
+                vec![offer],
+                &CreateSearchRequirements {
+                    max_price_per_hr: 0.5,
+                    ..Default::default()
+                },
+                plan.runtime_hours * 3600.0,
+                &HashSet::new()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn vast_query_uses_per_card_memory_network_units_and_allocated_disk() {
+        let query = vast_search_query(&requirements(), 0.5, None);
+        assert_eq!(query["num_gpus"], json!({"eq":1}));
+        assert_eq!(query["gpu_ram"], json!({"gte":24000.0}));
+        assert_eq!(query["inet_down"], json!({"gte":500.0}));
+        assert_eq!(query["inet_up"], json!({"gte":100.0}));
+        assert_eq!(query["duration"], json!({"gte":1800.0}));
+        assert_eq!(query["allocated_storage"], 80);
+        assert_eq!(query["disk_space"], json!({"gte":80}));
+        assert!(query.get("gpu_name").is_none());
+        let mut config = IceConfig::default();
+        config.default.vast_ai.disk_gb = Some(80);
+        let body = crate::providers::vast::build_create_request(
+            &config,
+            "ice-test",
+            &crate::workload::InstanceWorkload::Shell,
+        )
+        .unwrap();
+        assert_eq!(body["disk"], query["allocated_storage"]);
+    }
+
+    #[test]
+    fn missing_or_insufficient_measurements_never_satisfy_a_filter() {
+        let req = requirements();
+        assert!(vast_offer_matches(
+            &serde_json::from_value(offer()).unwrap(),
+            &req
+        ));
+        for (field, insufficient) in [
+            ("num_gpus", json!(2)),
+            ("gpu_ram", json!(23000)),
+            ("disk_space", json!(79)),
+            ("inet_down", json!(499)),
+            ("inet_up", json!(99)),
+        ] {
+            for value in [Value::Null, insufficient] {
+                let mut row = offer();
+                row[field] = value;
+                assert!(
+                    !vast_offer_matches(&serde_json::from_value(row).unwrap(), &req),
+                    "accepted {field}"
+                );
+            }
+        }
+        let mut row = offer();
+        row["gpu_ram"] = json!(12000);
+        row["gpu_total_ram"] = json!(48000);
+        assert!(!vast_offer_matches(
+            &serde_json::from_value(row).unwrap(),
+            &req
+        ));
+    }
+
+    #[test]
+    fn cpu_only_and_unspecified_gpu_requirements_are_distinct() {
+        let mut req = CreateSearchRequirements {
+            gpu_count: Some(0),
+            ..Default::default()
+        };
+        let query = vast_search_query(&req, 1.0, None);
+        assert_eq!(query["num_gpus"], json!({"eq":0}));
+        assert!(!vast_offer_matches(
+            &serde_json::from_value(offer()).unwrap(),
+            &req
+        ));
+        req.gpu_count = None;
+        assert!(vast_search_query(&req, 1.0, None).get("num_gpus").is_none());
+        assert!(vast_offer_matches(
+            &serde_json::from_value(offer()).unwrap(),
+            &req
+        ));
     }
 }

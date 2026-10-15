@@ -29,5 +29,9 @@ reqwest = { workspace = true, features = ["blocking", "gzip", "json", "rustls"] 
 serde = { workspace = true }
 serde_json = { workspace = true }
 tar = "0.4"
+tempfile = { workspace = true }
 toml = "1"
 webbrowser = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
