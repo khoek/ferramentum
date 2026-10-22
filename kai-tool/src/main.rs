@@ -1,7 +1,6 @@
 mod codex;
 mod credential_provider;
 mod llm_get;
-mod status;
 mod terminal;
 
 use std::ffi::OsString;
@@ -39,8 +38,6 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Show local Kai windows and their latest turn state (Linux and macOS).
-    Status(status::StatusArgs),
     /// Resume a conversation, or open the all-sessions picker.
     Resume {
         #[arg(value_name = "ID")]
@@ -65,13 +62,6 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode> {
     let args = match cli.command {
-        Some(Commands::Status(args)) => {
-            if cli.fast || cli.no_auto_restart || cli.credential_provider.is_some() {
-                bail!("Codex launch options cannot be used with status");
-            }
-            status::run(args)?;
-            return Ok(ExitCode::SUCCESS);
-        }
         Some(Commands::LlmGet(args)) => {
             if cli.fast || cli.no_auto_restart || cli.credential_provider.is_some() {
                 bail!("Codex launch options cannot be used with llm-get");

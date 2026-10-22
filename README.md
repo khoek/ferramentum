@@ -30,7 +30,3 @@ artifacts in `target/kai-standalone` or `target/ice-standalone`; `CARGO_TARGET_D
 can select an existing cache. Without a root lockfile, Cargo resolves compatible
 dependencies. These commands validate the selected CLI, not the entire workspace.
 They use local fixtures and do not rent cloud instances.
-
-Kai's additional desktop checks are documented in its
-[window-status guide](kai-tool/README.md#window-status) and
-[GNOME integration guide](kai-tool/integrations/gnome/README.md).
