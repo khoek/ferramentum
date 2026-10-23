@@ -218,7 +218,7 @@ fn provider_alias_entries(cloud: Cloud) -> &'static [ProviderGpuAliasEntry] {
         Cloud::Aws => &AWS_GPU_ALIASES.aliases,
         Cloud::Gcp => &GCP_GPU_ALIASES.aliases,
         Cloud::VastAi => &VAST_GPU_ALIASES.aliases,
-        Cloud::Local => &[],
+        Cloud::Local | Cloud::Verda => &[],
     }
 }
 
@@ -406,6 +406,7 @@ fn provider_slug(cloud: Cloud) -> Result<&'static str> {
     match cloud {
         Cloud::Aws => Ok("aws"),
         Cloud::Gcp => Ok("gcp"),
+        Cloud::Verda => Ok("verda"),
         Cloud::VastAi => Ok("vast-ai"),
         Cloud::Local => Err(anyhow!("{cloud} does not use provider runtime data")),
     }

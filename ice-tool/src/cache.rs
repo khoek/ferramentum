@@ -131,6 +131,7 @@ where
 
 fn cloud_cache_slug(cloud: Cloud) -> &'static str {
     match cloud {
+        Cloud::Verda => "verda",
         Cloud::VastAi => "vast-ai",
         Cloud::Gcp => "gcp",
         Cloud::Aws => "aws",

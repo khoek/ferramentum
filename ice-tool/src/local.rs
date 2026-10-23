@@ -3,11 +3,10 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use capulus::containers::{ContainerRuntime, DetectionMode};
+use capulus::containers::{ContainerRuntime, ContainerRuntimeKind, DetectionMode};
 use serde_json::Value;
 
 use crate::config_store::ice_root_dir;
@@ -142,9 +141,74 @@ pub(crate) fn local_context() -> LocalContext {
 }
 
 pub(crate) fn detect_local_container_runtime() -> Result<LocalContainerRuntime> {
+    if crate::lifecycle::deadline().is_some() {
+        for sudo in [false, true] {
+            for kind in [ContainerRuntimeKind::Docker, ContainerRuntimeKind::Podman] {
+                crate::lifecycle::remaining_timeout(Duration::from_secs(30))?;
+                let runtime = ContainerRuntime::new(kind, sudo);
+                if run_command_status(runtime.command().arg("version"), "check local runtime")
+                    .is_ok()
+                {
+                    return Ok(LocalContainerRuntime { runtime });
+                }
+            }
+        }
+        bail!("No usable local container runtime found");
+    }
     Ok(LocalContainerRuntime {
         runtime: ContainerRuntime::detect_with_mode(DetectionMode::UserOrSudo)?,
     })
+}
+
+/// Observe the selected resource without allowing changed management labels to
+/// make an existing container look deleted.
+pub(crate) fn local_observe_instance(
+    context: &LocalContext,
+    instance: &LocalInstance,
+) -> Result<Option<LocalInstance>> {
+    if instance.backend == LocalInstanceBackend::Unpack {
+        let current = local_unpack_instance_from_dir(&local_unpack_instance_dir(&instance.name)?)?;
+        anyhow::ensure!(
+            current.as_ref().is_none_or(|i| i.id == instance.id),
+            "Local workload identity changed"
+        );
+        return Ok(current);
+    }
+    let runtime = context.require_runtime()?;
+    let mut command = runtime.command();
+    command.args([
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        &format!("id={}", instance.id),
+        "--format",
+        "{{.ID}}",
+    ]);
+    let ids = run_command_text(&mut command, "observe local container existence")?;
+    let ids: Vec<_> = ids.lines().filter(|id| !id.is_empty()).collect();
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        ids == [instance.id.as_str()],
+        "Unexpected local container identities"
+    );
+    let value = run_command_json(
+        runtime.command().arg("inspect").arg(&instance.id),
+        "observe local container state",
+    )?;
+    let rows = value.as_array().context("Expected local container array")?;
+    anyhow::ensure!(
+        rows.len() == 1 && rows[0]["Id"].as_str() == Some(&instance.id),
+        "Unexpected local container identity"
+    );
+    let mut current = instance.clone();
+    current.state = rows[0]["State"]["Status"]
+        .as_str()
+        .context("Missing local container state")?
+        .to_owned();
+    Ok(Some(current))
 }
 
 fn local_unpack_root_dir() -> Result<PathBuf> {
@@ -408,6 +472,16 @@ fn local_unpack_pid(dir: &Path) -> Result<Option<u32>> {
 }
 
 fn local_pid_is_running(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal zero only checks existence/permission; it sends no signal.
+        (unsafe { libc::kill(pid, 0) }) == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
     Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
@@ -855,16 +929,16 @@ fn local_delete_container_instance(
     runtime: &LocalContainerRuntime,
     instance: &LocalInstance,
 ) -> Result<()> {
+    if !instance.is_stopped() {
+        local_stop_container_instance(runtime, instance)?;
+    }
     let spinner = spinner(&format!(
         "Deleting local container {}...",
         visible_instance_name(&instance.name)
     ));
     let mut command = runtime.command();
     command.arg("rm");
-    if !instance.is_stopped() {
-        command.arg("-f");
-    }
-    command.arg(&instance.name);
+    command.arg(&instance.id);
     run_command_status(&mut command, "delete local container")?;
     spinner.finish_with_message("Deleted.");
     Ok(())
@@ -1055,17 +1129,18 @@ fn local_stop_unpack_instance(instance: &LocalInstance) -> Result<()> {
     {
         let mut command = Command::new("kill");
         command.arg(pid.to_string());
-        let _ = command.status();
+        let _ = run_command_status(&mut command, "stop local unpack process");
         for _ in 0..50 {
             if !local_pid_is_running(pid) {
                 break;
             }
-            thread::sleep(Duration::from_millis(100));
+            let wait = crate::lifecycle::remaining_timeout(Duration::from_millis(100))?;
+            capulus::Cancellation::install()?.sleep(wait)?;
         }
         if local_pid_is_running(pid) {
             let mut force = Command::new("kill");
             force.arg("-9").arg(pid.to_string());
-            let _ = force.status();
+            run_command_status(&mut force, "force stop local unpack process")?;
         }
     }
     spinner.finish_with_message("Stopped.");
@@ -1141,6 +1216,9 @@ fn local_stream_unpack_logs(instance: &LocalInstance, tail: u32, follow: bool) -
     let dir = local_unpack_instance_dir(&instance.name)?;
     let log_path = dir.join(ICE_UNPACK_LOG_FILE);
     let exit_code_path = dir.join(ICE_UNPACK_EXIT_CODE_FILE);
+    if crate::output::streaming_logs() {
+        return json_local_unpack_logs(&log_path, &exit_code_path, tail, follow);
+    }
     if !log_path.is_file() {
         if exit_code_path.is_file() {
             println!(
@@ -1172,6 +1250,53 @@ fn local_stream_unpack_logs(instance: &LocalInstance, tail: u32, follow: bool) -
         );
     }
     Ok(())
+}
+
+fn json_local_unpack_logs(
+    log_path: &Path,
+    exit_code_path: &Path,
+    tail: u32,
+    follow: bool,
+) -> Result<()> {
+    let mut printed_bytes = None;
+    // Keep incomplete UTF-8 between polls so an append cannot split a character
+    // into replacement characters in separate records.
+    let mut decoder = crate::output::LogDecoder::default();
+    loop {
+        // Observe completion before reading, so the final read includes writes
+        // made immediately before the workload recorded its exit status.
+        let exited = exit_code_path.is_file();
+        if log_path.is_file() {
+            let bytes = fs::read(log_path)
+                .with_context(|| format!("Failed to read {}", log_path.display()))?;
+            let reset = printed_bytes.is_some_and(|count| bytes.len() < count);
+            let start = if reset {
+                decoder = crate::output::LogDecoder::default();
+                crate::output::log_text("combined", "", true)?;
+                0
+            } else {
+                printed_bytes.unwrap_or_else(|| tail_start_offset(&bytes, tail))
+            };
+            decoder.feed(&bytes[start..], false, |text| {
+                crate::output::log_text("combined", text, false)
+            })?;
+            printed_bytes = Some(bytes.len());
+        }
+        if !follow || exited {
+            decoder.feed(&[], true, |text| {
+                crate::output::log_text("combined", text, false)
+            })?;
+            if exited {
+                let code = fs::read_to_string(exit_code_path)
+                    .with_context(|| format!("Failed to read {}", exit_code_path.display()))?;
+                crate::output::log_event(serde_json::json!({
+                    "event": "workload_exit", "exit_code": code.trim().parse::<i32>().ok(),
+                }))?;
+            }
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }
 
 fn follow_local_unpack_logs(log_path: &Path, exit_code_path: &Path, tail: u32) -> Result<()> {

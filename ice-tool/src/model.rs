@@ -20,6 +20,10 @@ pub(crate) enum Cloud {
     #[value(name = "local")]
     #[serde(rename = "local")]
     Local,
+
+    #[value(name = "verda")]
+    #[serde(rename = "verda")]
+    Verda,
 }
 
 impl std::fmt::Display for Cloud {
@@ -28,6 +32,7 @@ impl std::fmt::Display for Cloud {
             Self::VastAi => write!(f, "vast.ai"),
             Self::Gcp => write!(f, "gcp"),
             Self::Aws => write!(f, "aws"),
+            Self::Verda => write!(f, "verda"),
             Self::Local => write!(f, "local"),
         }
     }
@@ -53,11 +58,18 @@ pub(crate) struct DefaultConfig {
     pub(crate) gcp: GcpDefaults,
     #[serde(default)]
     pub(crate) aws: AwsDefaults,
+    #[serde(default)]
+    pub(crate) verda: VerdaDefaults,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct VastDefaults {
+    pub(crate) gpu_count: Option<u32>,
+    pub(crate) min_gpu_memory_gb: Option<f64>,
+    pub(crate) disk_gb: Option<u32>,
+    pub(crate) min_download_mbps: Option<f64>,
+    pub(crate) min_upload_mbps: Option<f64>,
     pub(crate) min_cpus: Option<u32>,
     pub(crate) min_ram_gb: Option<f64>,
     pub(crate) allowed_gpus: Option<Vec<String>>,
@@ -67,6 +79,11 @@ pub(crate) struct VastDefaults {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GcpDefaults {
+    pub(crate) gpu_count: Option<u32>,
+    pub(crate) min_gpu_memory_gb: Option<f64>,
+    pub(crate) disk_gb: Option<u32>,
+    pub(crate) min_download_mbps: Option<f64>,
+    pub(crate) min_upload_mbps: Option<f64>,
     pub(crate) min_cpus: Option<u32>,
     pub(crate) min_ram_gb: Option<f64>,
     pub(crate) allowed_gpus: Option<Vec<String>>,
@@ -81,6 +98,11 @@ pub(crate) struct GcpDefaults {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AwsDefaults {
+    pub(crate) gpu_count: Option<u32>,
+    pub(crate) min_gpu_memory_gb: Option<f64>,
+    pub(crate) disk_gb: Option<u32>,
+    pub(crate) min_download_mbps: Option<f64>,
+    pub(crate) min_upload_mbps: Option<f64>,
     pub(crate) min_cpus: Option<u32>,
     pub(crate) min_ram_gb: Option<f64>,
     pub(crate) allowed_gpus: Option<Vec<String>>,
@@ -113,6 +135,8 @@ pub(crate) struct AuthConfig {
     pub(crate) gcp: GcpAuth,
     #[serde(default)]
     pub(crate) aws: AwsAuth,
+    #[serde(default)]
+    pub(crate) verda: VerdaAuth,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -135,8 +159,13 @@ pub(crate) struct AwsAuth {
     pub(crate) secret_access_key: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct CreateSearchRequirements {
+    pub(crate) gpu_count: Option<u32>,
+    pub(crate) min_gpu_memory_gb: Option<f64>,
+    pub(crate) disk_gb: Option<u32>,
+    pub(crate) min_download_mbps: Option<f64>,
+    pub(crate) min_upload_mbps: Option<f64>,
     pub(crate) min_cpus: u32,
     pub(crate) min_ram_gb: f64,
     pub(crate) allowed_gpus: Vec<String>,
@@ -200,4 +229,29 @@ pub(crate) struct CloudMachineCandidate {
     pub(crate) hourly_usd: f64,
     pub(crate) region: String,
     pub(crate) zone: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VerdaDefaults {
+    pub(crate) gpu_count: Option<u32>,
+    pub(crate) min_gpu_memory_gb: Option<f64>,
+    pub(crate) disk_gb: Option<u32>,
+    pub(crate) min_download_mbps: Option<f64>,
+    pub(crate) min_upload_mbps: Option<f64>,
+    pub(crate) min_cpus: Option<u32>,
+    pub(crate) min_ram_gb: Option<f64>,
+    pub(crate) allowed_gpus: Option<Vec<String>>,
+    pub(crate) max_price_per_hr: Option<f64>,
+    pub(crate) location: Option<String>,
+    pub(crate) image: Option<String>,
+    pub(crate) ssh_key_id: Option<String>,
+    pub(crate) ssh_key_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VerdaAuth {
+    pub(crate) client_id: Option<String>,
+    pub(crate) client_secret: Option<String>,
 }

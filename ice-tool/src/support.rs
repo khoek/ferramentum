@@ -21,7 +21,6 @@ pub(crate) const CONFIG_FILE_NAME: &str = "config.toml";
 pub(crate) const ICE_LABEL_PREFIX: &str = "ice-";
 pub(crate) const VAST_DEFAULT_IMAGE: &str = "vastai/base-image:@vastai-automatic-tag";
 pub(crate) const VAST_DEFAULT_DISK_GB: f64 = 32.0;
-pub(crate) const VAST_WAIT_TIMEOUT_SECS: u64 = 900;
 pub(crate) const VAST_POLL_INTERVAL_SECS: u64 = 5;
 pub(crate) const VAST_LOG_READY_TIMEOUT_SECS: u64 = 30;
 pub(crate) const VAST_LOG_READY_POLL_INTERVAL_MILLIS: u64 = 1000;
@@ -297,9 +296,11 @@ pub(crate) fn resolve_cloud(explicit_cloud: Option<Cloud>, config: &IceConfig) -
     if let Some(cloud) = config.default.cloud {
         return Ok(cloud);
     }
-    bail!(
-        "Missing `--cloud CLOUD`, or set a default with e.g. `ice config set default.cloud=vast.ai` (or `gcp`, `aws`, `local`, etc.)."
-    )
+    Err(crate::automation::error(
+        "missing_configuration",
+        "Supply --cloud or set default.cloud with ice config set.",
+        serde_json::json!({"missing": ["default.cloud"], "required_flags": ["--cloud"]}),
+    ))
 }
 
 pub(crate) fn prompt_theme() -> &'static ColorfulTheme {
@@ -307,6 +308,7 @@ pub(crate) fn prompt_theme() -> &'static ColorfulTheme {
 }
 
 pub(crate) fn prompt_confirm(prompt: &str, default: bool) -> Result<bool> {
+    require_interactive(prompt)?;
     capulus::ui::prompt_confirm(prompt, default).context("Failed to read confirmation")
 }
 
@@ -344,28 +346,115 @@ pub(crate) fn prompt_f64(prompt: &str, default: Option<f64>, min_value: f64) -> 
 
 pub(crate) fn ensure_provider_cli_installed(cloud: Cloud) -> Result<()> {
     match cloud {
-        Cloud::VastAi | Cloud::Local => Ok(()),
+        Cloud::VastAi | Cloud::Local | Cloud::Verda => Ok(()),
         Cloud::Gcp => ensure_command_available("gcloud"),
         Cloud::Aws => ensure_command_available("aws"),
     }
 }
 
 pub(crate) fn ensure_command_available(command: &str) -> Result<()> {
-    capulus::process::ensure_command_available(command)
+    if crate::lifecycle::deadline().is_some() {
+        let flag = if std::path::Path::new(command)
+            .file_name()
+            .is_some_and(|name| name == "ssh")
+        {
+            "-V"
+        } else {
+            "--version"
+        };
+        return run_command_output(
+            Command::new(command).arg(flag),
+            "check provider CLI availability",
+        )
+        .map(|_| ());
+    }
+    if std::path::Path::new(command)
+        .file_name()
+        .is_none_or(|name| name != "ssh")
+    {
+        return capulus::process::ensure_command_available(command);
+    }
+    // OpenSSH uses -V and writes its version to stderr; --version exits 255.
+    let output = Command::new(command)
+        .arg("-V")
+        .output()
+        .with_context(|| format!("`{command}` is required but was not found in PATH"))?;
+    if !output.status.success() {
+        bail!(
+            "`{command} -V` exited with status {}",
+            output.status.code().unwrap_or(1)
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod command_availability_tests {
+    use super::ensure_command_available;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fixture(dir: &std::path::Path, name: &str, flag: &str) -> String {
+        let path = dir.join(name);
+        fs::write(&path, format!(
+            "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = {flag} ] || exit 255\nprintf 'version fixture\\n' >&2\n"
+        )).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path.to_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn probes_openssh_version_on_stderr_with_its_supported_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = fixture(dir.path(), "ssh", "-V");
+        ensure_command_available(&ssh).unwrap();
+        // A runnable executable that rejects -V must still fail preflight.
+        fs::write(&ssh, "#!/bin/sh\nexit 255\n").unwrap();
+        let err = ensure_command_available(&ssh).unwrap_err();
+        assert!(err.to_string().contains("-V` exited with status 255"));
+        fs::remove_file(&ssh).unwrap();
+        assert!(ensure_command_available(&ssh).is_err());
+    }
+
+    #[test]
+    fn retains_long_version_flags_for_aws_and_gcloud() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["aws", "gcloud"] {
+            let program = fixture(dir.path(), name, "--version");
+            ensure_command_available(&program).unwrap();
+        }
+    }
 }
 
 pub(crate) fn run_command_output(
     command: &mut Command,
     context: &str,
 ) -> Result<std::process::Output> {
+    crate::automation::prepare_command(command);
+    if crate::lifecycle::deadline().is_some() {
+        return crate::lifecycle::run_output(command, context);
+    }
     capulus::process::run_output(command, context)
 }
 
 pub(crate) fn run_command_json(command: &mut Command, context: &str) -> Result<Value> {
+    crate::automation::prepare_command(command);
+    if crate::lifecycle::deadline().is_some() {
+        return serde_json::from_slice(&run_command_output(command, context)?.stdout)
+            .context("Invalid provider JSON response");
+    }
     capulus::process::run_json_value(command, context)
 }
 
 pub(crate) fn run_command_text(command: &mut Command, context: &str) -> Result<String> {
+    crate::automation::prepare_command(command);
+    if crate::lifecycle::deadline().is_some() {
+        return Ok(
+            String::from_utf8(run_command_output(command, context)?.stdout)?
+                .trim()
+                .to_owned(),
+        );
+    }
     capulus::process::run_text(command, context)
 }
 
@@ -374,10 +463,18 @@ pub(crate) fn run_command_status_with_stdin(
     context: &str,
     stdin_data: &str,
 ) -> Result<()> {
+    crate::automation::prepare_command(command);
     capulus::process::run_status_with_input(command, context, stdin_data.as_bytes())
 }
 
 pub(crate) fn run_command_status(command: &mut Command, context: &str) -> Result<()> {
+    crate::automation::prepare_command(command);
+    if crate::output::streaming_logs() {
+        return crate::output::run_log_command(command, context);
+    }
+    if crate::lifecycle::deadline().is_some() {
+        return run_command_output(command, context).map(|_| ());
+    }
     capulus::process::run_status(command, context)
 }
 
@@ -603,6 +700,7 @@ pub(crate) fn progress_bar(prefix: &str, message: &str, length: u64) -> Progress
 }
 
 pub(crate) fn require_interactive(message: &str) -> Result<()> {
+    crate::automation::require_interactive(message)?;
     capulus::ui::require_interactive(message)
 }
 
