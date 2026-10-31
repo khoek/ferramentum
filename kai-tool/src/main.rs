@@ -2,6 +2,7 @@ mod codex;
 mod credential_provider;
 mod llm_get;
 mod terminal;
+mod zellij;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -20,6 +21,12 @@ const GIT_TERMINAL_PROMPT_ENV: &str = "GIT_TERMINAL_PROMPT";
     infer_subcommands = true
 )]
 struct Cli {
+    #[arg(long, hide = true, global = true)]
+    internal_run: bool,
+
+    #[arg(long, hide = true)]
+    launch_context: Option<PathBuf>,
+
     /// Bash script that supplies credentials to compatible custom Codex builds.
     #[arg(long, value_name = "SCRIPT", global = true)]
     credential_provider: Option<PathBuf>,
@@ -65,6 +72,9 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
+    if let Some(path) = &cli.launch_context {
+        return zellij::run_worker(path);
+    }
     let args = match cli.command {
         Some(Commands::LlmGet(args)) => {
             if cli.fast
@@ -85,6 +95,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
         None => vec![codex::APPROVAL_BYPASS_FLAG.into()],
     };
     let cwd = std::env::current_dir().context("could not read the current directory")?;
+    if !cli.internal_run && zellij::is_interactive() {
+        return zellij::launch(&cwd);
+    }
     let launcher = codex::Launcher::detect()?;
     let service_tier = if cli.fast {
         codex::ServiceTier::Fast

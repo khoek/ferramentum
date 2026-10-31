@@ -30,7 +30,40 @@ session's working directory on resume, and hidden rate-limit model-switch remind
 line shows model/reasoning, run
 state, remaining context, weekly limit, total input/output tokens, and Fast-mode status, in that order.
 
-Install with `cargo install --path kai-tool --locked --force`.
+Interactive launches run in tabs of one persistent Zellij session named `kai`. The original
+terminal shows only its Kai instance, without Zellij bars or navigation shortcuts. Open
+`zellij attach kai` in another terminal for the normal management interface. Closing the original
+terminal leaves Kai running; finishing Kai closes its tab and returns its exit status to the shell.
+Scrolling and terminal sizing retain Zellij's shared-session behavior.
+
+Install the pane-attachment fork before installing Kai:
+
+```sh
+cargo install --git https://github.com/khoek/zellij --branch kai-pane-attach \
+  --locked --no-default-features --features vendored_curl,web_server_capability \
+  --bin zellij --force
+cargo install kai-tool --locked --force
+```
+
+For a local checkout, install Kai with `cargo install --path kai-tool --locked --force`.
+
+Kai checks for `zellij attach --pane` and reports an error if an incompatible binary is installed.
+Piped/non-interactive launches and `llm-get` do not use Zellij. Each interactive launch preserves
+its own arguments, working directory, and environment. Its private temporary launch context is
+removed when the worker starts. Startup is serialized only while creating the session/tab;
+running conversations remain independent.
+
+The managed session uses a generated config in `${XDG_RUNTIME_DIR}/kai` (or a private directory
+under the system temporary directory). It disables startup notices, session mirroring, and
+resurrection; it does not modify the user's Zellij configuration.
+
+Run the terminal integration tests against a built fork:
+
+```sh
+cargo test -p kai-tool --locked
+uv run --with pyte python3 kai-tool/tests/zellij_pty.py \
+  --kai target/debug/kai --zellij /path/to/zellij/target/debug/zellij
+```
 
 ## Credential provider
 
