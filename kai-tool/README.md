@@ -30,7 +30,8 @@ session's working directory on resume, and hidden rate-limit model-switch remind
 line shows model/reasoning, run
 state, remaining context, weekly limit, total input/output tokens, and Fast-mode status, in that order.
 
-Interactive launches run in tabs of one persistent Zellij session named `kai`. The original
+Interactive launches use tabs of one persistent Zellij session named `kai` when the Kai Zellij
+fork is installed. Otherwise they run Codex directly as before. The original
 terminal shows only its Kai instance, without Zellij bars or navigation shortcuts. Open
 `zellij attach kai` in another terminal for the normal management interface. Closing the original
 terminal leaves Kai running; finishing Kai closes its tab and returns its exit status to the shell.
@@ -47,7 +48,9 @@ cargo install kai-tool --locked --force
 
 For a local checkout, install Kai with `cargo install --path kai-tool --locked --force`.
 
-Kai checks for `zellij attach --pane` and reports an error if an incompatible binary is installed.
+Kai uses the Zellij binary on `PATH` only when its version has the custom `-k.<commit>` marker and
+its `attach` command exposes `--pane`. If that fork is absent, stock Zellij is installed, or
+Zellij is unavailable, interactive Kai falls back to direct Codex in the original terminal.
 Piped/non-interactive launches and `llm-get` do not use Zellij. Each interactive launch preserves
 its own arguments, working directory, and environment. Its private temporary launch context is
 removed when the worker starts. Startup is serialized only while creating the session/tab;

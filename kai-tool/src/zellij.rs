@@ -7,6 +7,7 @@ use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use semver::Version;
 use serde::{Deserialize, Serialize};
 
 const SESSION: &str = "kai";
@@ -42,12 +43,17 @@ pub(crate) fn is_interactive() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }
 
-pub(crate) fn launch(cwd: &Path) -> Result<ExitCode> {
+pub(crate) fn detect() -> Option<PathBuf> {
+    let binary = which::which("zellij").ok()?;
+    let output = Command::new(&binary).arg("--version").output().ok()?;
+    output.status.success().then_some(())?;
+    is_custom_version(&output.stdout).then_some(binary)
+}
+
+pub(crate) fn launch(cwd: &Path, binary: PathBuf) -> Result<ExitCode> {
     let runtime = runtime_dir()?;
     let zellij = Zellij {
-        binary: which::which("zellij").context(
-            "interactive Kai requires the khoek/zellij fork with `attach --pane`; see kai-tool/README.md",
-        )?,
+        binary,
         config: runtime.join("zellij.kdl"),
     };
     let help = zellij
@@ -347,4 +353,36 @@ fn exit_code(status: ExitStatus) -> ExitCode {
             .and_then(|code| u8::try_from(code).ok())
             .unwrap_or(1),
     )
+}
+
+fn is_custom_version(stdout: &[u8]) -> bool {
+    let Ok(output) = std::str::from_utf8(stdout) else {
+        return false;
+    };
+    let Some(raw_version) = output.split_ascii_whitespace().next_back() else {
+        return false;
+    };
+    let Ok(version) = Version::parse(raw_version.trim_start_matches('v')) else {
+        return false;
+    };
+    version
+        .pre
+        .as_str()
+        .strip_prefix("k.")
+        .is_some_and(|commit| {
+            commit.len() == 8 && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_custom_version;
+
+    #[test]
+    fn detects_the_kai_zellij_build() {
+        assert!(is_custom_version(b"zellij 0.46.0-k.5931af3d\n"));
+        assert!(!is_custom_version(b"zellij 0.46.0\n"));
+        assert!(!is_custom_version(b"zellij 0.46.0-k.5931af\n"));
+        assert!(!is_custom_version(b"not zellij\n"));
+    }
 }

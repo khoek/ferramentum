@@ -96,7 +96,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
     };
     let cwd = std::env::current_dir().context("could not read the current directory")?;
     if !cli.internal_run && zellij::is_interactive() {
-        return zellij::launch(&cwd);
+        if let Some(binary) = zellij::detect() {
+            return zellij::launch(&cwd, binary);
+        }
     }
     let launcher = codex::Launcher::detect()?;
     let service_tier = if cli.fast {
