@@ -754,12 +754,17 @@ fn run_pty_session(
     if let Some(pid) = child.process_id() {
         apply_oom_score_adj(pid);
     }
+    let observed = Arc::new(Mutex::new(OutputObservation::new()));
+    let relay = spawn_output_relay(reader, Arc::clone(output), Arc::clone(&observed));
     #[cfg(unix)]
     if let Some(startup) = startup.as_mut()
         && let Err(error) = startup.complete(&mut *child)
     {
         child.kill().ok();
         child.wait().ok();
+        relay
+            .join()
+            .map_err(|_| anyhow!("Codex output relay thread panicked"))?;
         return Err(error).context("Codex credential startup barrier failed");
     }
     #[cfg(unix)]
@@ -767,10 +772,11 @@ fn run_pty_session(
     if let Err(error) = input.attach(writer) {
         child.kill().ok();
         child.wait().ok();
+        relay
+            .join()
+            .map_err(|_| anyhow!("Codex output relay thread panicked"))?;
         return Err(error);
     }
-    let observed = Arc::new(Mutex::new(OutputObservation::new()));
-    let relay = spawn_output_relay(reader, Arc::clone(output), Arc::clone(&observed));
     let mut last_size = initial_size;
     let mut last_resize_poll = Instant::now();
 
