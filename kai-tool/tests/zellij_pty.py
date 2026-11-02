@@ -104,7 +104,8 @@ if os.environ.get('KAI_E2E_SUPERVISED') and sys.argv[1] != 'resume':
     handoff.write_text(json.dumps({'format': 'codex+k-input-handoff', 'version': 1,
                                   'thread_id': thread, 'resume_args': ['--model', 'gpt-test']}))
     print('codex+k (' + thread + '): supervised exit ' + json.dumps({
-        'version': 3, 'outcome': 'stream-disconnected', 'handoff_path': str(handoff),
+        'version': 3, 'outcome': os.environ.get('KAI_E2E_OUTCOME', 'stream-disconnected'),
+        'handoff_path': str(handoff),
         'unavailable_until': None}), flush=True)
     raise SystemExit(75)
 (root / (marker + '.json')).write_text(json.dumps({'cwd': os.getcwd(), 'marker': marker, 'args': sys.argv[1:]}))
@@ -248,6 +249,23 @@ raise SystemExit(code)
             "supervisor did not return its exit status",
         )
         self.assertEqual(client.status, 9)
+
+    def test_error_stays_visible_inside_the_pane(self):
+        client = self.spawn(
+            [KAI, "--fast"],
+            "ERROR",
+            {"KAI_E2E_SUPERVISED": "1", "KAI_E2E_OUTCOME": "credential-invalid"},
+        )
+        self.wait(
+            lambda: "automatic credential rotation requires a configured credential provider"
+            in client.text(),
+            "Kai error was not shown in the pane",
+        )
+        self.assertIsNone(client.poll())
+        self.assertEqual(len(self.panes()), 1)
+        client.send(b"\n")
+        self.wait(lambda: client.poll() is not None, "error pane did not close after dismissal")
+        self.assertEqual(client.status, 1)
 
     def test_kai_sessions(self):
         first = self.spawn([KAI, "--fast"], "FIRST")

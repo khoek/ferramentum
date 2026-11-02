@@ -1,7 +1,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -11,6 +11,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 const SESSION: &str = "kai";
+const ERROR_HOLD_ENV: &str = "KAI_ZELLIJ_ERROR_HOLD";
 const CONFIG: &str = "mirror_session false\nshow_startup_tips false\nshow_release_notes false\n\
     session_serialization false\non_force_close \"detach\"\n";
 const PANE_ENV: &[&str] = &[
@@ -41,6 +42,20 @@ struct Pane {
 
 pub(crate) fn is_interactive() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+pub(crate) fn hold_errors(launch_context: bool) -> bool {
+    launch_context || env::var_os(ERROR_HOLD_ENV).is_some()
+}
+
+pub(crate) fn wait_for_error() {
+    if !io::stdin().is_terminal() {
+        return;
+    }
+
+    let _ = crate::terminal::write_stderr_line("Press Enter to close this Kai pane.");
+    let mut input = [0u8; 1];
+    let _ = io::stdin().read(&mut input);
 }
 
 pub(crate) fn detect() -> Option<PathBuf> {
@@ -186,6 +201,9 @@ pub(crate) fn run_worker(path: &Path) -> Result<ExitCode> {
         .current_dir(context.cwd)
         .env_clear()
         .envs(context.environment);
+    // The worker's supervisor may fail after it has consumed the launch context. Mark that
+    // process so the top-level error handler can keep this close-on-exit pane visible.
+    command.env(ERROR_HOLD_ENV, "1");
     for name in PANE_ENV.iter().copied().chain(["TERM"]) {
         if let Some(value) = env::var_os(name) {
             command.env(name, value);

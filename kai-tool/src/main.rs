@@ -59,19 +59,24 @@ enum Commands {
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    let hold_error = zellij::hold_errors(cli.launch_context.is_some());
+    match run(cli, hold_error) {
         Ok(code) => code,
         Err(error) => {
             let message = format!("{error:#}");
             if terminal::write_stderr_line(&message).is_err() {
                 eprintln!("{message}");
             }
+            if !codex::wait_for_held_error(&error) && hold_error {
+                zellij::wait_for_error();
+            }
             ExitCode::FAILURE
         }
     }
 }
 
-fn run(cli: Cli) -> Result<ExitCode> {
+fn run(cli: Cli, hold_errors: bool) -> Result<ExitCode> {
     if let Some(path) = &cli.launch_context {
         return zellij::run_worker(path);
     }
@@ -95,10 +100,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
         None => vec![codex::APPROVAL_BYPASS_FLAG.into()],
     };
     let cwd = std::env::current_dir().context("could not read the current directory")?;
-    if !cli.internal_run && zellij::is_interactive() {
-        if let Some(binary) = zellij::detect() {
-            return zellij::launch(&cwd, binary);
-        }
+    if !cli.internal_run
+        && zellij::is_interactive()
+        && let Some(binary) = zellij::detect()
+    {
+        return zellij::launch(&cwd, binary);
     }
     let launcher = codex::Launcher::detect()?;
     let service_tier = if cli.fast {
@@ -133,6 +139,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 .map(|provider| provider.select(&environment, previous, cli.cred.as_deref()))
                 .transpose()
         },
+        hold_errors,
     )?))
 }
 

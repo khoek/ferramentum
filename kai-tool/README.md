@@ -54,7 +54,8 @@ Zellij is unavailable, interactive Kai falls back to direct Codex in the origina
 Piped/non-interactive launches and `llm-get` do not use Zellij. Each interactive launch preserves
 its own arguments, working directory, and environment. Its private temporary launch context is
 removed when the worker starts. Startup is serialized only while creating the session/tab;
-running conversations remain independent.
+running conversations remain independent. If Kai cannot start or reports an unrecoverable error,
+the pane stays open with the message until you press Enter; successful exits still close their tab.
 
 The managed session uses a generated config in `${XDG_RUNTIME_DIR}/kai` (or a private directory
 under the system temporary directory). It disables startup notices, session mirroring, and

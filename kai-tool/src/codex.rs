@@ -14,9 +14,10 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::{error, fmt};
 
 use anyhow::{Context, Result, anyhow, bail};
 use fs2::FileExt;
@@ -258,6 +259,7 @@ impl Launcher {
         select_credential: impl FnMut(
             Option<(&CredentialPaths, &CredentialFailure)>,
         ) -> Result<Option<SelectedCredential>>,
+        hold_errors: bool,
     ) -> Result<u8> {
         self.run_supervised_with_io(
             initial_args,
@@ -265,7 +267,7 @@ impl Launcher {
             service_tier,
             environment,
             select_credential,
-            SupervisedIo::terminal(),
+            SupervisedIo::terminal(hold_errors),
         )
     }
 
@@ -287,19 +289,25 @@ impl Launcher {
             input,
             output,
             raw_terminal,
+            hold_errors,
         } = io;
         let input = InputRouter::start(input);
-        let mut selected = select_credential(None)?;
+        let mut selected = match select_credential(None) {
+            Ok(selected) => selected,
+            Err(error) => return Err(maybe_hold_error(error, hold_errors, &input)),
+        };
         loop {
             apply_launch_preferences(&mut args);
             let (credential, use_guard) = match selected.take() {
                 Some(SelectedCredential { paths, guard }) => {
-                    validate_managed_launch_args(&args)?;
+                    if let Err(error) = validate_managed_launch_args(&args) {
+                        return Err(maybe_hold_error(error, hold_errors, &input));
+                    }
                     (Some(paths), Some(guard))
                 }
                 None => (None, None),
             };
-            let outcome = run_pty_session(
+            let outcome = match run_pty_session(
                 &self.binary,
                 &args,
                 cwd,
@@ -311,25 +319,52 @@ impl Launcher {
                     raw_terminal,
                     use_guard,
                 },
-            )?;
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => return Err(maybe_hold_error(error, hold_errors, &input)),
+            };
             match outcome {
                 PtyOutcome::Exited(code) => return Ok(code),
                 PtyOutcome::StreamDisconnected(recovery) => {
-                    selected = select_credential(None)?;
+                    selected = match select_credential(None) {
+                        Ok(selected) => selected,
+                        Err(error) => return Err(maybe_hold_error(error, hold_errors, &input)),
+                    };
                     args = recovery_args(recovery);
                 }
                 PtyOutcome::CredentialUnavailable(recovery, failure) => {
-                    let paths = credential.as_ref().context(
+                    let paths = match credential.as_ref().context(
                         "automatic credential rotation requires a configured credential provider",
-                    )?;
-                    selected = select_credential(Some((paths, &failure)))?;
+                    ) {
+                        Ok(paths) => paths,
+                        Err(error) => return Err(maybe_hold_error(error, hold_errors, &input)),
+                    };
+                    selected = match select_credential(Some((paths, &failure))) {
+                        Ok(selected) => selected,
+                        Err(error) => return Err(maybe_hold_error(error, hold_errors, &input)),
+                    };
                     if selected.is_none() {
-                        bail!("credential provider returned no replacement credential");
+                        return Err(maybe_hold_error(
+                            anyhow!("credential provider returned no replacement credential"),
+                            hold_errors,
+                            &input,
+                        ));
                     }
                     args = recovery_args(recovery);
                 }
             }
         }
+    }
+}
+
+fn maybe_hold_error(error: anyhow::Error, hold_errors: bool, input: &InputRouter) -> anyhow::Error {
+    if hold_errors {
+        anyhow::Error::new(HeldError {
+            error,
+            input: input.clone(),
+        })
+    } else {
+        error
     }
 }
 
@@ -835,10 +870,11 @@ struct SupervisedIo {
     input: Box<dyn Read + Send>,
     output: Arc<Mutex<Box<dyn Write + Send>>>,
     raw_terminal: bool,
+    hold_errors: bool,
 }
 
 impl SupervisedIo {
-    fn terminal() -> Self {
+    fn terminal(hold_errors: bool) -> Self {
         let stdin_terminal = io::stdin().is_terminal();
         let stdout_terminal = io::stdout().is_terminal();
         let stderr_terminal = io::stderr().is_terminal();
@@ -860,22 +896,63 @@ impl SupervisedIo {
             input: Box::new(io::stdin()),
             output: Arc::new(Mutex::new(output)),
             raw_terminal: stdin_terminal && output_terminal,
+            hold_errors,
         }
     }
 }
 
+#[derive(Clone)]
 struct InputRouter {
     shared: Arc<SharedInputState>,
 }
 
 struct SharedInputState {
     state: Mutex<InputState>,
+    wake: Condvar,
 }
 
 struct InputState {
     writer: Option<Box<dyn Write + Send>>,
     pending: VecDeque<u8>,
     error: Option<String>,
+    closed: bool,
+}
+
+// Supervised launches already have a reader thread consuming the pane's input. Keep a clone of
+// its queue with an unrecoverable error so the outer error handler can wait without racing it.
+struct HeldError {
+    error: anyhow::Error,
+    input: InputRouter,
+}
+
+impl fmt::Debug for HeldError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HeldError")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for HeldError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if formatter.alternate() {
+            write!(formatter, "{:#}", self.error)
+        } else {
+            self.error.fmt(formatter)
+        }
+    }
+}
+
+impl error::Error for HeldError {}
+
+pub(crate) fn wait_for_held_error(error: &anyhow::Error) -> bool {
+    let Some(error) = error.downcast_ref::<HeldError>() else {
+        return false;
+    };
+    let _ = crate::terminal::write_stderr_line("Press Enter to close this Kai pane.");
+    error.input.wait_for_input();
+    true
 }
 
 impl InputRouter {
@@ -885,7 +962,9 @@ impl InputRouter {
                 writer: None,
                 pending: VecDeque::new(),
                 error: None,
+                closed: false,
             }),
+            wake: Condvar::new(),
         });
         let thread_shared = Arc::clone(&shared);
         thread::spawn(move || {
@@ -893,6 +972,10 @@ impl InputRouter {
             loop {
                 let count = match reader.read(&mut buffer) {
                     Ok(0) => {
+                        if let Ok(mut state) = thread_shared.state.lock() {
+                            state.closed = true;
+                            thread_shared.wake.notify_all();
+                        }
                         return;
                     }
                     Ok(count) => count,
@@ -900,6 +983,8 @@ impl InputRouter {
                     Err(error) => {
                         if let Ok(mut state) = thread_shared.state.lock() {
                             state.error = Some(error.to_string());
+                            state.closed = true;
+                            thread_shared.wake.notify_all();
                         }
                         return;
                     }
@@ -912,10 +997,12 @@ impl InputRouter {
                         && error.kind() != io::ErrorKind::BrokenPipe
                     {
                         state.error = Some(error.to_string());
+                        state.closed = true;
                     }
                 } else {
                     state.pending.extend(&buffer[..count]);
                 }
+                thread_shared.wake.notify_all();
             }
         });
         Self { shared }
@@ -945,6 +1032,8 @@ impl InputRouter {
             .map_err(|_| anyhow!("terminal input router lock was poisoned"))?;
         state.writer = None;
         if let Some(error) = state.error.take() {
+            state.closed = true;
+            self.shared.wake.notify_all();
             bail!("could not forward terminal input to Codex: {error}");
         }
         Ok(())
@@ -958,6 +1047,18 @@ impl InputRouter {
             .map_err(|_| anyhow!("terminal input router lock was poisoned"))?
             .error
             .clone())
+    }
+
+    fn wait_for_input(&self) {
+        let Ok(mut state) = self.shared.state.lock() else {
+            return;
+        };
+        while state.pending.is_empty() && state.error.is_none() && !state.closed {
+            state = match self.shared.wake.wait(state) {
+                Ok(state) => state,
+                Err(error) => error.into_inner(),
+            };
+        }
     }
 }
 
@@ -1819,6 +1920,7 @@ state.write_text("2")
                     input: Box::new(io::empty()),
                     output: Arc::new(Mutex::new(Box::new(SharedWriter(Arc::clone(&captured))))),
                     raw_terminal: false,
+                    hold_errors: false,
                 },
             )
             .unwrap();
