@@ -108,7 +108,7 @@ if os.environ.get('KAI_E2E_SUPERVISED') and sys.argv[1] != 'resume':
         'handoff_path': str(handoff),
         'unavailable_until': None}), flush=True)
     raise SystemExit(75)
-(root / (marker + '.json')).write_text(json.dumps({'cwd': os.getcwd(), 'marker': marker, 'args': sys.argv[1:]}))
+(root / (marker + '.json')).write_text(json.dumps({'cwd': os.getcwd(), 'marker': marker, 'pid': os.getpid(), 'args': sys.argv[1:]}))
 def redraw(*_):
     os.write(1, ('\x1b[2J\x1b[HREADY ' + marker).encode())
     (root / (marker + '.size')).write_text(json.dumps(list(os.get_terminal_size(0))))
@@ -284,6 +284,35 @@ raise SystemExit(code)
         self.assertIn(b"\x1b[106;5u", data)
         os.killpg(client.pid, signal.SIGTERM)
         self.wait(lambda: client.poll() is not None, "application did not exit")
+
+    def test_nohup_survives_terminal_hangup_until_tab_closes(self):
+        client = self.spawn([KAI, "--nohup"], "NOHUP")
+        self.wait(lambda: "READY NOHUP" in client.text(), "nohup application did not start")
+        pane = self.panes()[0]
+        os.killpg(client.pid, signal.SIGHUP)
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            self.pump()
+        self.assertIsNone(client.poll())
+        self.assertTrue(any(p["id"] == pane["id"] for p in self.panes()))
+        self.action("close-tab", "--tab-id", str(pane["tab_id"]))
+        self.wait(lambda: client.poll() is not None, "tab closure did not end nohup attachment")
+        self.assertNotEqual(client.status, 0)
+        codex_pid = json.loads((self.root / "NOHUP.json").read_text())["pid"]
+        self.wait(
+            lambda: not self.process_alive(codex_pid),
+            "closing the tab did not stop the Codex process",
+        )
+
+    @staticmethod
+    def process_alive(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
 
     def test_kai_sessions(self):
         first = self.spawn([KAI, "--fast"], "FIRST")

@@ -16,6 +16,8 @@ Unambiguous command prefixes work, such as `kai r` and `kai llm`.
 `--fast` selects the Fast service tier. Custom builds with a `-k.` prerelease suffix followed
 by exactly eight hexadecimal commit characters (for example, `0.154.0-k.ac192cd7`) are supervised
 automatically. `--no-auto-restart` disables supervision. Kai runs Codex with its approval/sandbox bypass flag.
+In Zellij mode, `--nohup` keeps the launch attached until its tab closes even if the original terminal
+sends `SIGHUP`.
 With a custom Codex build that reports `stream-disconnected` recovery, the terminal error
 `stream disconnected before completion: An error occurred while processing your request.`
 also resumes the conversation after Codex finishes retrying, restoring pending input. If a

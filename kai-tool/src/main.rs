@@ -43,6 +43,10 @@ struct Cli {
     #[arg(long, global = true)]
     no_auto_restart: bool,
 
+    /// Keep a Zellij launch alive after the host terminal sends SIGHUP.
+    #[arg(long, global = true)]
+    nohup: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -86,6 +90,7 @@ fn run(cli: Cli, hold_errors: bool) -> Result<ExitCode> {
                 || cli.no_auto_restart
                 || cli.credential_provider.is_some()
                 || cli.cred.is_some()
+                || cli.nohup
             {
                 bail!("Codex launch options cannot be used with llm-get");
             }
@@ -104,7 +109,7 @@ fn run(cli: Cli, hold_errors: bool) -> Result<ExitCode> {
         && zellij::is_interactive()
         && let Some(binary) = zellij::detect()
     {
-        return zellij::launch(&cwd, binary);
+        return zellij::launch(&cwd, binary, cli.nohup);
     }
     let launcher = codex::Launcher::detect()?;
     let service_tier = if cli.fast {
@@ -169,13 +174,14 @@ mod tests {
             "resume",
             "--fast",
             "--no-auto-restart",
+            "--nohup",
             "--credential-provider",
             "/provider",
             "--cred",
             "reuse",
         ])
         .unwrap();
-        assert!(cli.fast && cli.no_auto_restart);
+        assert!(cli.fast && cli.no_auto_restart && cli.nohup);
         assert_eq!(cli.credential_provider, Some(PathBuf::from("/provider")));
         assert_eq!(cli.cred.as_deref(), Some("reuse"));
     }

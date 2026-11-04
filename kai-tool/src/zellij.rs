@@ -65,7 +65,7 @@ pub(crate) fn detect() -> Option<PathBuf> {
     is_custom_version(&output.stdout).then_some(binary)
 }
 
-pub(crate) fn launch(cwd: &Path, binary: PathBuf) -> Result<ExitCode> {
+pub(crate) fn launch(cwd: &Path, binary: PathBuf, nohup: bool) -> Result<ExitCode> {
     let runtime = runtime_dir()?;
     let zellij = Zellij {
         binary,
@@ -147,6 +147,12 @@ pub(crate) fn launch(cwd: &Path, binary: PathBuf) -> Result<ExitCode> {
         0
     };
 
+    if nohup {
+        // The attachment launcher itself should survive a hangup from the terminal that
+        // started Kai. Install this after the Zellij server and pane command have been created
+        // so the worker keeps the normal SIGHUP behaviour when its tab is closed.
+        ignore_sighup();
+    }
     let prepared = (|| -> Result<u32> {
         let pane = zellij.wait_for_pane(tab)?;
         let label = format!(
@@ -170,9 +176,13 @@ pub(crate) fn launch(cwd: &Path, binary: PathBuf) -> Result<ExitCode> {
         }
     };
 
-    let status = zellij
-        .command()
-        .args(["attach", SESSION, "--pane", &pane.to_string()])
+    let pane = pane.to_string();
+    let mut attach = zellij.command();
+    attach.args(["attach", SESSION, "--pane", &pane]);
+    if nohup {
+        block_sighup(&mut attach)?;
+    }
+    let status = attach
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -184,6 +194,39 @@ pub(crate) fn launch(cwd: &Path, binary: PathBuf) -> Result<ExitCode> {
         zellij.close_tab(tab);
     }
     Ok(exit_code(status?))
+}
+
+fn ignore_sighup() {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+}
+
+fn block_sighup(command: &mut Command) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        // A pane attachment normally belongs to the launcher's terminal session.  Keep its
+        // terminal (and resize/input behavior) but block SIGHUP in the attachment client so a
+        // hangup cannot make it quit. The Zellij server still ends it when the attached tab or
+        // pane is closed.
+        unsafe {
+            command.pre_exec(|| {
+                let mut signals = std::mem::zeroed();
+                if libc::sigemptyset(&mut signals) == -1
+                    || libc::sigaddset(&mut signals, libc::SIGHUP) == -1
+                    || libc::sigprocmask(libc::SIG_BLOCK, &signals, std::ptr::null_mut()) == -1
+                {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn run_worker(path: &Path) -> Result<ExitCode> {
