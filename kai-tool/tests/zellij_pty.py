@@ -114,6 +114,8 @@ def redraw(*_):
     (root / (marker + '.size')).write_text(json.dumps(list(os.get_terminal_size(0))))
 signal.signal(signal.SIGWINCH, redraw)
 redraw()
+if os.environ.get('KAI_E2E_KITTY'):
+    os.write(1, b'\x1b[>1u')
 os.write(1, b'\x1b[?2004h')
 if os.environ.get('KAI_E2E_MOUSE'):
     os.write(1, b'\x1b[?1000h\x1b[?1006h')
@@ -266,6 +268,22 @@ raise SystemExit(code)
         client.send(b"\n")
         self.wait(lambda: client.poll() is not None, "error pane did not close after dismissal")
         self.assertEqual(client.status, 1)
+
+    def test_ctrl_j_survives_kitty_pane_translation(self):
+        client = self.spawn([KAI], "CTRLJ", {"KAI_E2E_KITTY": "1"})
+        self.wait(
+            lambda: "READY CTRLJ" in client.text(),
+            "Kitty-capable application did not start",
+        )
+        client.send(b"\x0a")
+        self.wait(
+            lambda: (self.root / "CTRLJ.input").exists(),
+            "Ctrl-J did not reach the application",
+        )
+        data = (self.root / "CTRLJ.input").read_bytes()
+        self.assertIn(b"\x1b[106;5u", data)
+        os.killpg(client.pid, signal.SIGTERM)
+        self.wait(lambda: client.poll() is not None, "application did not exit")
 
     def test_kai_sessions(self):
         first = self.spawn([KAI, "--fast"], "FIRST")
