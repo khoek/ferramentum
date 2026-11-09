@@ -17,7 +17,10 @@ Unambiguous command prefixes work, such as `kai r` and `kai llm`.
 by exactly eight hexadecimal commit characters (for example, `0.154.0-k.ac192cd7`) are supervised
 automatically. `--no-auto-restart` disables supervision. Kai runs Codex with its approval/sandbox bypass flag.
 In Zellij mode, `--nohup` keeps the launch attached until its tab closes even if the original terminal
-sends `SIGHUP`.
+sends `SIGHUP`. Interactive `kai` and `kai r` launches over SSH offer
+`SSH session detected. Run in nohup mode? [Y/n]` when `--nohup` is absent; Enter selects yes.
+Detection uses nonempty `SSH_TTY`, `SSH_CONNECTION`, or `SSH_CLIENT` environment variables.
+The prompt only appears for Zellij launches with a terminal available for input and output.
 With a custom Codex build that reports `stream-disconnected` recovery, the terminal error
 `stream disconnected before completion: An error occurred while processing your request.`
 also resumes the conversation after Codex finishes retrying, restoring pending input. If a

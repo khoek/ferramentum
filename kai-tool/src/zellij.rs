@@ -7,6 +7,7 @@ use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use dialoguer::Confirm;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,17 @@ pub(crate) fn detect() -> Option<PathBuf> {
 }
 
 pub(crate) fn launch(cwd: &Path, binary: PathBuf, nohup: bool) -> Result<ExitCode> {
+    let nohup = nohup
+        || (io::stderr().is_terminal()
+            && ["SSH_TTY", "SSH_CONNECTION", "SSH_CLIENT"]
+                .into_iter()
+                .any(|name| env::var_os(name).is_some_and(|value| !value.is_empty()))
+            && Confirm::new()
+                .with_prompt("SSH session detected. Run in nohup mode?")
+                .default(true)
+                .wait_for_newline(true)
+                .interact()
+                .context("could not read the nohup selection")?);
     let runtime = runtime_dir()?;
     let zellij = Zellij {
         binary,

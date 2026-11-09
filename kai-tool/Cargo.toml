@@ -20,6 +20,7 @@ capulus = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 crossterm = "0.29"
+dialoguer = { workspace = true }
 fs2 = "0.4"
 hex = { workspace = true }
 libc = { workspace = true }

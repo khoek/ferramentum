@@ -199,6 +199,20 @@ fn assert_launch_preferences(call: &Value) {
 }
 
 #[test]
+fn ssh_environment_does_not_prompt_for_noninteractive_launches() {
+    let fixture = Fixture::new();
+    fixture
+        .command()
+        .env("SSH_CONNECTION", "192.0.2.1 12345 192.0.2.2 22")
+        .env("SSH_TTY", "/dev/pts/1")
+        .args(["r", THREAD_ID])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Run in nohup mode?").not());
+    assert_eq!(fixture.calls("codex-calls").len(), 1);
+}
+
+#[test]
 fn ordinary_exit_keeps_the_selected_credential_without_calling_a_hook() {
     for exit in [0, 12] {
         let fixture = Fixture::new();

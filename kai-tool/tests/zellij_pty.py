@@ -77,6 +77,7 @@ class PaneAttachmentTest(unittest.TestCase):
             key: value
             for key, value in os.environ.items()
             if not key.startswith("ZELLIJ")
+            and key not in ("SSH_TTY", "SSH_CONNECTION", "SSH_CLIENT")
         }
         for key, subdir in [
             ("ZELLIJ_SOCKET_DIR", "sockets"),
@@ -286,8 +287,42 @@ raise SystemExit(code)
         self.wait(lambda: client.poll() is not None, "application did not exit")
 
     def test_nohup_survives_terminal_hangup_until_tab_closes(self):
-        client = self.spawn([KAI, "--nohup"], "NOHUP")
+        client = self.spawn(
+            [KAI, "--nohup"], "NOHUP", {"SSH_CONNECTION": "192.0.2.1 12345 192.0.2.2 22"}
+        )
         self.wait(lambda: "READY NOHUP" in client.text(), "nohup application did not start")
+        self.assertNotIn(b"Run in nohup mode?", client.output)
+        self.assert_nohup_survives_hangup(client, "NOHUP")
+
+    def test_ssh_prompt_defaults_to_nohup(self):
+        client = self.spawn(
+            [KAI], "SSH", {"SSH_CONNECTION": "192.0.2.1 12345 192.0.2.2 22"}
+        )
+        self.wait(lambda: "[Y/n]" in client.text(), "SSH nohup prompt did not appear")
+        self.assertFalse((self.root / "SSH.json").exists())
+        client.send(b"\r")
+        self.wait(lambda: "READY SSH" in client.text(), "default SSH launch did not start")
+        self.assert_nohup_survives_hangup(client, "SSH")
+
+    def test_ssh_resume_can_decline_nohup(self):
+        thread_id = "123e4567-e89b-12d3-a456-426614174000"
+        client = self.spawn([KAI, "r", thread_id], "SSHRESUME", {"SSH_TTY": "/dev/pts/1"})
+        self.wait(lambda: "[Y/n]" in client.text(), "SSH resume prompt did not appear")
+        client.send(b"n\r")
+        self.wait(lambda: "READY SSHRESUME" in client.text(), "SSH resume did not start")
+        call = json.loads((self.root / "SSHRESUME.json").read_text())
+        self.assertEqual(call["args"][:2], ["resume", thread_id])
+        os.killpg(client.pid, signal.SIGHUP)
+        self.wait(lambda: client.poll() is not None, "declined nohup still ignored SIGHUP")
+
+    def test_empty_ssh_markers_do_not_prompt(self):
+        client = self.spawn(
+            [KAI], "LOCAL", {"SSH_TTY": "", "SSH_CONNECTION": "", "SSH_CLIENT": ""}
+        )
+        self.wait(lambda: "READY LOCAL" in client.text(), "empty SSH markers blocked launch")
+        self.assertNotIn(b"Run in nohup mode?", client.output)
+
+    def assert_nohup_survives_hangup(self, client, marker):
         pane = self.panes()[0]
         os.killpg(client.pid, signal.SIGHUP)
         deadline = time.monotonic() + 1
@@ -298,7 +333,7 @@ raise SystemExit(code)
         self.action("close-tab", "--tab-id", str(pane["tab_id"]))
         self.wait(lambda: client.poll() is not None, "tab closure did not end nohup attachment")
         self.assertNotEqual(client.status, 0)
-        codex_pid = json.loads((self.root / "NOHUP.json").read_text())["pid"]
+        codex_pid = json.loads((self.root / (marker + ".json")).read_text())["pid"]
         self.wait(
             lambda: not self.process_alive(codex_pid),
             "closing the tab did not stop the Codex process",
