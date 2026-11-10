@@ -38,10 +38,10 @@ use crate::remote::{RemoteAccess, run_rsync_download, run_rsync_upload, run_rsyn
 use crate::support::{
     ICE_LABEL_PREFIX, ICE_WORKLOAD_CONTAINER_METADATA_KEY, ICE_WORKLOAD_KIND_METADATA_KEY,
     ICE_WORKLOAD_REGISTRY_METADATA_KEY, ICE_WORKLOAD_SOURCE_METADATA_KEY, VAST_POLL_INTERVAL_SECS,
-    VAST_WAIT_TIMEOUT_SECS, build_cloud_instance_name, elapsed_hours_from_rfc3339, elapsed_since,
-    now_unix_secs, prefix_lookup_indices, progress_bar, render_command_line, run_command_json,
-    run_command_output, run_command_status, run_command_text, spinner, truncate_ellipsis,
-    visible_instance_name, write_temp_file,
+    build_cloud_instance_name, elapsed_hours_from_rfc3339, elapsed_since, now_unix_secs,
+    prefix_lookup_indices, progress_bar, render_command_line, run_command_json, run_command_output,
+    run_command_status, run_command_text, spinner, truncate_ellipsis, visible_instance_name,
+    write_temp_file,
 };
 use crate::ui::print_warning;
 use crate::unpack::{
@@ -394,6 +394,16 @@ impl AwsInstance {
 impl CloudInstance for AwsInstance {
     type ListContext = ();
 
+    fn json_summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.instance_id, "name": self.name, "state": self.state,
+            "region": self.region, "machine_type": self.instance_type,
+            "public_ip": self.public_ip, "public_dns": self.public_dns,
+            "launched_at": self.launch_time,
+            "workload": crate::output::workload(self.workload.as_ref()),
+        })
+    }
+
     fn cache_key(&self) -> String {
         format!("{}/{}", self.region, self.instance_id)
     }
@@ -550,6 +560,47 @@ impl CloudProvider for Provider {
             if running { "running" } else { "stopped" },
             timeout,
         )
+    }
+
+    fn observe_instance(
+        config: &Self::ProviderContext<'_>,
+        instance: &Self::Instance,
+    ) -> Result<Option<Self::Instance>> {
+        let mut cmd = command(config, &instance.region);
+        cmd.args([
+            "ec2",
+            "describe-instances",
+            "--filters",
+            &format!("Name=instance-id,Values={}", instance.instance_id),
+            "--region",
+            &instance.region,
+            "--output",
+            "json",
+        ]);
+        let value = run_command_json(&mut cmd, "observe AWS instance state")?;
+        let reservations = value["Reservations"]
+            .as_array()
+            .context("Missing AWS Reservations array")?;
+        let mut current = None;
+        for reservation in reservations {
+            for row in reservation["Instances"]
+                .as_array()
+                .context("Missing AWS Instances array")?
+            {
+                anyhow::ensure!(
+                    row["InstanceId"].as_str() == Some(&instance.instance_id),
+                    "AWS returned a different instance"
+                );
+                anyhow::ensure!(current.is_none(), "AWS returned duplicate instances");
+                let mut observed = instance.clone();
+                observed.state = row["State"]["Name"]
+                    .as_str()
+                    .context("Missing AWS instance state")?
+                    .to_owned();
+                current = Some(observed);
+            }
+        }
+        Ok(current)
     }
 
     fn delete_instance(
@@ -2309,6 +2360,9 @@ fn select_cheapest_machine_candidate(
         {
             continue;
         }
+        if req.gpu_count == Some(0) && entry.has_accelerators {
+            continue;
+        }
         if entry.vcpus < req.min_cpus || f64::from(entry.ram_mb) + 0.000_001 < min_ram_mb {
             continue;
         }
@@ -2337,15 +2391,19 @@ fn select_cheapest_machine_candidate(
     let mut candidates = matches_by_region_machine.into_values().collect::<Vec<_>>();
 
     if candidates.is_empty() {
-        bail!(
-            "No aws machine type matches filters (min_cpus={}, min_ram_gb={}, allowed_gpus=[{}]){}.",
-            req.min_cpus,
-            req.min_ram_gb,
-            req.allowed_gpus.join(", "),
-            override_name
-                .map(|name| format!(", machine={name}"))
-                .unwrap_or_default()
-        );
+        return Err(crate::automation::error(
+            "no_matching_offers",
+            format!(
+                "No aws machine type matches filters (min_cpus={}, min_ram_gb={}, allowed_gpus=[{}]){}.",
+                req.min_cpus,
+                req.min_ram_gb,
+                req.allowed_gpus.join(", "),
+                override_name
+                    .map(|name| format!(", machine={name}"))
+                    .unwrap_or_default()
+            ),
+            serde_json::json!({}),
+        ));
     }
 
     candidates.sort_by(|left, right| {
@@ -2921,7 +2979,13 @@ pub(crate) fn wait_for_state(
     let start = SystemTime::now();
     loop {
         if elapsed_since(start)? > timeout {
-            bail!("Timed out waiting for aws instance {instance_id} to reach `{desired_state}`");
+            return Err(crate::automation::error(
+                "startup_timeout",
+                format!(
+                    "Timed out waiting for aws instance {instance_id} to reach `{desired_state}`"
+                ),
+                serde_json::json!({"instance_id": instance_id.to_string(), "timeout_seconds": timeout.as_secs()}),
+            ));
         }
         let instance = describe_instance(config, instance_id, region)?;
         if instance.state.eq_ignore_ascii_case(desired_state) {
@@ -2954,7 +3018,7 @@ fn build_shell_connect_command(config: &IceConfig, instance: &AwsInstance) -> Re
     let host = ssh_host(instance)?;
     Ok(render_command_line(
         "ssh",
-        [
+        crate::automation::ssh_options().into_iter().chain([
             "-i".to_owned(),
             key_path.display().to_string(),
             "-o".to_owned(),
@@ -2962,7 +3026,7 @@ fn build_shell_connect_command(config: &IceConfig, instance: &AwsInstance) -> Re
             "-t".to_owned(),
             format!("{user}@{host}"),
             shell_remote_command(instance)?,
-        ],
+        ]),
     ))
 }
 
@@ -3120,12 +3184,16 @@ pub(crate) fn create_instance(
         .and_then(|instance| instance.get("InstanceId"))
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("AWS create response missing instance ID"))?;
+    crate::automation::recovery(
+        "waiting_for_startup",
+        serde_json::json!({"instance_id": instance_id, "region": region}),
+    );
     wait_for_state(
         config,
         instance_id,
         &region,
         "running",
-        Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
+        crate::automation::startup_timeout(),
     )
 }
 
@@ -3463,6 +3531,7 @@ fn run_ssh_command(
     let user = ssh_user(config);
     let host = ssh_host(instance)?;
     let mut command = Command::new("ssh");
+    command.args(crate::automation::ssh_options());
     command
         .arg("-i")
         .arg(key_path)
@@ -3485,10 +3554,14 @@ fn wait_for_ssh_ready(config: &IceConfig, instance: &AwsInstance, timeout: Durat
     loop {
         if elapsed_since(start)? > timeout {
             spinner.finish_and_clear();
-            bail!(
-                "Timed out waiting for SSH readiness on aws instance `{}`.",
-                instance.instance_id
-            );
+            return Err(crate::automation::error(
+                "startup_timeout",
+                format!(
+                    "Timed out waiting for SSH readiness on aws instance `{}`.",
+                    instance.instance_id
+                ),
+                serde_json::json!({"instance_id": instance.instance_id, "timeout_seconds": timeout.as_secs()}),
+            ));
         }
         if run_ssh_command(config, instance, &probe, false).is_ok() {
             spinner.finish_with_message(format!(
@@ -3705,6 +3778,7 @@ mod tests {
             min_ram_gb: 1.0,
             allowed_gpus: Vec::new(),
             max_price_per_hr: 10.0,
+            ..Default::default()
         };
         let catalog = vec![
             test_catalog_entry(
@@ -3751,6 +3825,7 @@ mod tests {
             min_ram_gb: 1.0,
             allowed_gpus: vec!["A10".to_owned()],
             max_price_per_hr: 10.0,
+            ..Default::default()
         };
         let catalog = vec![
             test_catalog_entry(
@@ -3796,6 +3871,7 @@ mod tests {
             min_ram_gb: 1.0,
             allowed_gpus: Vec::new(),
             max_price_per_hr: 10.0,
+            ..Default::default()
         };
         let catalog = vec![
             test_catalog_entry(

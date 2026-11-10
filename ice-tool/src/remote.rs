@@ -155,6 +155,7 @@ fn looks_like_ssh_public_key(line: &str) -> bool {
 
 fn ssh_transport(access: &RemoteAccess<'_>) -> String {
     let mut parts = vec!["ssh".to_owned()];
+    parts.extend(crate::automation::ssh_options());
     if let Some(identity) = access.identity_file {
         parts.push("-i".to_owned());
         parts.push(shell_quote_single(&identity.display().to_string()));

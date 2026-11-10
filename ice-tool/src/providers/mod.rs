@@ -9,7 +9,7 @@ use crate::cache::CloudCacheModel;
 use crate::cli::{CreateArgs, LogsArgs, PullArgs, PushArgs, ShellArgs};
 use crate::listing::ListedInstance;
 use crate::model::{Cloud, CloudMachineCandidate, IceConfig};
-use crate::support::{VAST_WAIT_TIMEOUT_SECS, ensure_provider_cli_installed, prompt_confirm};
+use crate::support::{ensure_provider_cli_installed, prompt_confirm};
 use crate::ui::print_stage;
 use crate::unpack::{
     materialize_unpack_bundle, unpack_logs_remote_command, unpack_start_remote_command,
@@ -21,6 +21,7 @@ pub(crate) mod catalog;
 pub(crate) mod gcp;
 pub(crate) mod local;
 pub(crate) mod vast;
+pub(crate) mod verda;
 
 pub(crate) fn load_cached_arc<T, F>(
     cache: &LazyLock<Mutex<Option<Arc<T>>>>,
@@ -68,6 +69,9 @@ where
 pub(crate) trait CloudInstance {
     type ListContext;
 
+    /// Stable data fields only: no display formatting, configuration or credentials.
+    fn json_summary(&self) -> serde_json::Value;
+
     fn cache_key(&self) -> String;
     fn display_name(&self) -> String;
     fn state_value(&self) -> &str;
@@ -91,6 +95,8 @@ pub(crate) trait CloudProvider: Sized {
         on_progress: &mut dyn FnMut(String),
     ) -> Result<Vec<Self::Instance>>;
     fn sort_instances(instances: &mut [Self::Instance]);
+    /// Resolve from a fresh provider observation. A cached identifier may locate
+    /// the resource, but cached state must never satisfy a lifecycle operation.
     fn resolve_instance(
         context: &Self::ProviderContext<'_>,
         identifier: &str,
@@ -106,6 +112,12 @@ pub(crate) trait CloudProvider: Sized {
         running: bool,
         timeout: Duration,
     ) -> Result<Self::Instance>;
+    /// Fresh exact-identity observation; None must mean confirmed absence.
+    fn observe_instance(
+        context: &Self::ProviderContext<'_>,
+        instance: &Self::Instance,
+    ) -> Result<Option<Self::Instance>>;
+
     fn delete_instance(
         context: &Self::ProviderContext<'_>,
         instance: &Self::Instance,
@@ -227,11 +239,7 @@ pub(crate) trait RemoteSshProvider: RemoteCloudProvider {
         let remote_dir = Self::remote_unpack_dir(instance);
         let result = (|| {
             print_stage("Waiting for SSH access");
-            Self::wait_for_ssh_ready(
-                config,
-                instance,
-                Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
-            )?;
+            Self::wait_for_ssh_ready(config, instance, crate::automation::startup_timeout())?;
             print_stage("Uploading unpack bundle");
             Self::upload_unpack_bundle(config, instance, &bundle.root, &remote_dir)?;
             print_stage("Starting unpack workload");
@@ -273,6 +281,7 @@ impl<T: RemoteSshProvider> CommandProvider for T {
         let context = T::context(config)?;
         let mut instance = T::resolve_instance(&context, &args.instance)?;
         if instance.is_stopped() {
+            crate::automation::require_running(instance.display_name())?;
             if !prompt_confirm("Instance is stopped. Start it before opening shell?", true)? {
                 bail!("Aborted: instance is stopped.");
             }
@@ -281,16 +290,16 @@ impl<T: RemoteSshProvider> CommandProvider for T {
                 &context,
                 &instance,
                 true,
-                Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
+                crate::automation::startup_timeout(),
             )?;
         }
-        T::wait_for_ssh_ready(
-            config,
-            &instance,
-            Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
-        )?;
+        T::wait_for_ssh_ready(config, &instance, crate::automation::startup_timeout())?;
         if args.print_creds {
-            println!("{}", T::shell_connect_command(config, &instance)?);
+            let command = T::shell_connect_command(config, &instance)?;
+            if crate::output::is_json() {
+                return crate::output::connection(T::CLOUD, instance.json_summary(), &command);
+            }
+            println!("{command}");
             return Ok(());
         }
         T::open_instance_shell(config, &instance)

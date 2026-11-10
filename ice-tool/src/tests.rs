@@ -67,6 +67,8 @@ fn test_vast_instance(end_date: Option<f64>) -> VastInstance {
         end_date,
         ssh_host: None,
         ssh_port: None,
+        public_ipaddr: None,
+        ports: serde_json::Value::Null,
         workload: None,
     }
 }
@@ -244,7 +246,8 @@ fn vast_autostop_plan_rounds_up_to_hour_boundary() {
 #[test]
 fn vast_autostop_cost_estimate_respects_plan_runtime() {
     let base = estimate_runtime_cost(Cloud::VastAi, 0.5, 0.25).expect("base estimate should work");
-    let adjusted = apply_vast_autostop_cost_estimate(base).expect("adjusted estimate");
+    let adjusted =
+        apply_vast_autostop_cost_estimate(base, 1_790_559_480).expect("adjusted estimate");
     assert!(adjusted.billed_hours >= adjusted.requested_hours);
     assert!((adjusted.total_usd - (adjusted.hourly_usd * adjusted.billed_hours)).abs() < 1e-9);
 }
@@ -293,6 +296,7 @@ fn gcp_create_summary_includes_project_before_region_and_zone() {
         min_ram_gb: 1.0,
         allowed_gpus: Vec::new(),
         max_price_per_hr: 1.0,
+        ..Default::default()
     };
 
     let lines = crate::app::machine_candidate_summary_display_lines(
@@ -339,6 +343,7 @@ fn gcp_catalog_selection_prefers_cpu_only_when_gpu_filter_is_empty() {
         min_ram_gb: 1.0,
         allowed_gpus: Vec::new(),
         max_price_per_hr: 1.0,
+        ..Default::default()
     };
     let catalog = vec![
         GcpMachineCatalogEntry {
@@ -385,6 +390,7 @@ fn gcp_catalog_selection_honors_gpu_filter() {
         min_ram_gb: 1.0,
         allowed_gpus: vec!["L4".to_owned()],
         max_price_per_hr: 1.0,
+        ..Default::default()
     };
     let catalog = vec![
         GcpMachineCatalogEntry {
@@ -431,6 +437,7 @@ fn gcp_catalog_selection_treats_614mb_as_point_six_gb() {
         min_ram_gb: 0.6,
         allowed_gpus: Vec::new(),
         max_price_per_hr: 1.0,
+        ..Default::default()
     };
     let catalog = vec![
         GcpMachineCatalogEntry {
@@ -504,6 +511,7 @@ fn vast_job_termination_unix_recognizes_stop_and_delete_actions() {
         request_method: Some("PUT".to_owned()),
         request_body: Some(json!({"state":"stopped"})),
         start_time: Some(1_700_000_000.0),
+        ..Default::default()
     };
     let delete_job = VastScheduledJob {
         instance_id: Some(42),
@@ -511,6 +519,7 @@ fn vast_job_termination_unix_recognizes_stop_and_delete_actions() {
         request_method: Some("DELETE".to_owned()),
         request_body: None,
         start_time: Some(1_700_000_100.0),
+        ..Default::default()
     };
     let irrelevant_job = VastScheduledJob {
         instance_id: Some(42),
@@ -518,6 +527,7 @@ fn vast_job_termination_unix_recognizes_stop_and_delete_actions() {
         request_method: Some("PUT".to_owned()),
         request_body: Some(json!({"state":"running"})),
         start_time: Some(1_700_000_200.0),
+        ..Default::default()
     };
 
     assert_eq!(job_termination_unix(&stop_job), Some(1_700_000_000.0));
@@ -535,6 +545,7 @@ fn nearest_vast_scheduled_termination_picks_earliest_future_job() {
             request_method: Some("PUT".to_owned()),
             request_body: Some(json!({"state":"stopped"})),
             start_time: Some(now + 7_200.0),
+            ..Default::default()
         },
         VastScheduledJob {
             instance_id: Some(42),
@@ -542,6 +553,7 @@ fn nearest_vast_scheduled_termination_picks_earliest_future_job() {
             request_method: Some("DELETE".to_owned()),
             request_body: None,
             start_time: Some(now + 3_600.0),
+            ..Default::default()
         },
         VastScheduledJob {
             instance_id: Some(42),
@@ -549,6 +561,7 @@ fn nearest_vast_scheduled_termination_picks_earliest_future_job() {
             request_method: Some("DELETE".to_owned()),
             request_body: None,
             start_time: Some(now - 60.0),
+            ..Default::default()
         },
     ];
 

@@ -1,0 +1,133 @@
+{
+  "source": "Verda catalog snapshot, 2026-10-01; public machine/image/pricing fields and reported availability only",
+  "catalog": {
+    "machines": [
+      {
+        "cpu": {
+          "number_of_cores": 20
+        },
+        "currency": "usd",
+        "description": "Dedicated Hardware Instance",
+        "gpu": {
+          "number_of_gpus": 2
+        },
+        "gpu_memory": {
+          "size_in_gigabytes": 96
+        },
+        "instance_type": "2RTX6000ADA.20V",
+        "manufacturer": "NVIDIA",
+        "memory": {
+          "size_in_gigabytes": 120
+        },
+        "model": "RTX 6000 Ada",
+        "name": "RTX 6000 Ada 48GB",
+        "price_per_hour": "2.344",
+        "supported_os": [
+          "24.04.base",
+          "24.04.cuda12.9",
+          "24.04.cuda12.9.docker",
+          "24.04.cuda13.0",
+          "24.04.cuda13.0.docker",
+          "24.04.cuda13.0.verda-gpuburn",
+          "24.04.cuda13.0.verda-gpureset",
+          "24.04.cuda13.1",
+          "24.04.cuda13.2",
+          "24.04.cuda13.2.docker",
+          "26.04.base",
+          "26.04.cuda12.9",
+          "26.04.cuda12.9.docker",
+          "26.04.cuda13.0",
+          "26.04.cuda13.0.docker",
+          "26.04.cuda13.1",
+          "26.04.cuda13.1.docker",
+          "26.04.cuda13.1.kubernetes-1.35.4",
+          "26.04.cuda13.2",
+          "26.04.cuda13.2.docker",
+          "jupyter",
+          "jupyter.cuda.12.8",
+          "ubuntu-22.04",
+          "ubuntu-22.04-cuda-12.0",
+          "ubuntu-22.04-cuda-12.0-docker",
+          "ubuntu-22.04-cuda-12.1",
+          "ubuntu-22.04-cuda-12.1-docker",
+          "ubuntu-22.04-cuda-12.3",
+          "ubuntu-22.04-cuda-12.3-docker",
+          "ubuntu-22.04-cuda-12.4",
+          "ubuntu-22.04-cuda-12.4-cluster",
+          "ubuntu-22.04-cuda-12.4-docker",
+          "ubuntu-22.04-cuda-12.8-cluster",
+          "ubuntu-22.04-cuda-12.8-open",
+          "ubuntu-22.04-cuda-12.8-open-docker",
+          "ubuntu-24.04",
+          "ubuntu-24.04-cuda-12.6",
+          "ubuntu-24.04-cuda-12.6-docker",
+          "ubuntu-24.04-cuda-12.8-open",
+          "ubuntu-24.04-cuda-12.8-open-docker",
+          "ubuntu-26.04"
+        ]
+      }
+    ],
+    "images": [
+      {
+        "category": "confidentialComputing",
+        "id": "4545c57a-6c83-4b2c-a04d-842c3246031c",
+        "image_type": "26.04.cuda13.2.cc",
+        "is_cluster": false,
+        "name": "Ubuntu 26.04 + CUDA 13.2 Open CC (driver 595)"
+      },
+      {
+        "category": "kubernetes",
+        "id": "90008499-c10a-45a7-9e88-9c225f188c75",
+        "image_type": "26.04.cuda13.2.kubernetes-1.35.8",
+        "is_cluster": false,
+        "name": "Ubuntu 26.04 + CUDA 13.2 Open + Kubernetes 1.35.8"
+      },
+      {
+        "category": "docker",
+        "id": "603f7d69-882c-4000-9c25-7843ae307ff6",
+        "image_type": "26.04.cuda13.2.docker",
+        "is_cluster": false,
+        "name": "Ubuntu 26.04 + CUDA 13.2 Open + Docker"
+      },
+      {
+        "category": "ubuntu",
+        "id": "e25c357f-01f7-497d-a3fa-36c9c4e27403",
+        "image_type": "26.04.cuda13.2",
+        "is_cluster": false,
+        "name": "Ubuntu 26.04 + CUDA 13.2 Open"
+      },
+      {
+        "category": "ubuntu",
+        "id": "efeebdc5-47f2-4e4c-879e-cfbbc16fc8da",
+        "image_type": "24.04.cuda12.9",
+        "is_cluster": false,
+        "name": "Ubuntu 24.04 + CUDA 12.9 Open"
+      }
+    ],
+    "availability": [
+      {
+        "location_code": "FIN-01",
+        "availabilities": []
+      },
+      {
+        "location_code": "FIN-02",
+        "availabilities": []
+      },
+      {
+        "location_code": "FIN-03",
+        "availabilities": [
+          "2RTX6000ADA.20V"
+        ]
+      }
+    ],
+    "volume_types": [
+      {
+        "price": {
+          "currency": "usd",
+          "price_per_month_per_gb": 0.2
+        },
+        "type": "NVMe"
+      }
+    ]
+  }
+}
